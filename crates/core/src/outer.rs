@@ -90,6 +90,13 @@ pub struct ForthVM {
     // Dot (print number) function -- kept for potential future use
     #[allow(dead_code)]
     dot_func: Func,
+    // Shared HERE value for host functions (synced with user_here)
+    here_cell: Option<Arc<Mutex<u32>>>,
+    // User data allocation pointer in WASM linear memory.
+    // Variables and user data are allocated here (not in dictionary internal memory).
+    user_here: u32,
+    // Shared BASE value for host functions
+    base_cell: Arc<Mutex<u32>>,
 }
 
 impl ForthVM {
@@ -176,6 +183,10 @@ impl ForthVM {
             next_table_index: 0,
             emit_func,
             dot_func,
+            here_cell: None,
+            // User data starts at 64K in WASM memory, well clear of all system regions
+            user_here: 0x10000,
+            base_cell: Arc::new(Mutex::new(10)),
         };
 
         vm.register_primitives()?;
@@ -288,6 +299,28 @@ impl ForthVM {
             return self.finish_colon_def();
         }
 
+        // Words that must be handled in the outer interpreter because they
+        // modify Rust-side VM state that host functions cannot access.
+        match token_upper.as_str() {
+            "IMMEDIATE" => {
+                self.dictionary
+                    .toggle_immediate()
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                return Ok(());
+            }
+            "DECIMAL" => {
+                self.base = 10;
+                *self.base_cell.lock().unwrap() = 10;
+                return Ok(());
+            }
+            "HEX" => {
+                self.base = 16;
+                *self.base_cell.lock().unwrap() = 16;
+                return Ok(());
+            }
+            _ => {}
+        }
+
         if self.state != 0 {
             // Compile mode
             self.compile_token(token)?;
@@ -319,6 +352,21 @@ impl ForthVM {
             // Line comment -- skip rest of input
             self.input_pos = self.input_buffer.len();
             return Ok(());
+        }
+
+        // -- Defining words (special tokens handled in interpret mode) --
+        match token_upper.as_str() {
+            "VARIABLE" => return self.define_variable(),
+            "CONSTANT" => return self.define_constant(),
+            "CREATE" => return self.define_create(),
+            "DOES>" => anyhow::bail!("DOES> not yet implemented"),
+            "'" => return self.interpret_tick(),
+            "[CHAR]" => {
+                // In interpret mode, CHAR is the standard word
+                return self.interpret_char();
+            }
+            "CHAR" => return self.interpret_char(),
+            _ => {}
         }
 
         // Look up in dictionary
@@ -411,6 +459,35 @@ impl ForthVM {
                         self.push_ir(IrOp::Call(word_id));
                     } else {
                         anyhow::bail!("POSTPONE: unknown word: {}", next);
+                    }
+                }
+                return Ok(());
+            }
+            "[CHAR]" => {
+                // compile-time: read next token, push first char as literal
+                if let Some(next) = self.next_token()
+                    && let Some(ch) = next.chars().next()
+                {
+                    self.push_ir(IrOp::PushI32(ch as i32));
+                }
+                return Ok(());
+            }
+            "CHAR" => {
+                // In compile mode, CHAR reads next word and compiles its first char
+                if let Some(next) = self.next_token()
+                    && let Some(ch) = next.chars().next()
+                {
+                    self.push_ir(IrOp::PushI32(ch as i32));
+                }
+                return Ok(());
+            }
+            "[']" => {
+                // compile-time: read next token, look up, compile as literal
+                if let Some(next) = self.next_token() {
+                    if let Some((_addr, word_id, _imm)) = self.dictionary.find(&next) {
+                        self.push_ir(IrOp::PushI32(word_id.0 as i32));
+                    } else {
+                        anyhow::bail!("['] unknown word: {}", next);
                     }
                 }
                 return Ok(());
@@ -642,6 +719,7 @@ impl ForthVM {
         // Reveal the word
         self.dictionary.reveal();
         self.state = 0;
+        self.sync_here_cell();
 
         Ok(())
     }
@@ -908,6 +986,72 @@ impl ForthVM {
         self.register_primitive("2*", false, vec![IrOp::PushI32(1), IrOp::Lshift])?;
         self.register_primitive("2/", false, vec![IrOp::PushI32(1), IrOp::Rshift])?;
 
+        // -- Priority 1: Loop support --
+        // I -- push loop index (top of return stack)
+        self.register_primitive("I", false, vec![IrOp::RFetch])?;
+        // J -- outer loop counter (third item on return stack)
+        self.register_j()?;
+        // UNLOOP -- remove loop parameters from return stack
+        self.register_primitive(
+            "UNLOOP",
+            false,
+            vec![IrOp::FromR, IrOp::Drop, IrOp::FromR, IrOp::Drop],
+        )?;
+        // LEAVE -- set index to limit so loop exits
+        self.register_leave()?;
+
+        // -- Priority 2: Defining words handled in interpret_token --
+        // (VARIABLE, CONSTANT, CREATE are special tokens)
+
+        // -- Priority 3: Memory/system words --
+        self.register_here()?;
+        self.register_allot()?;
+        self.register_comma()?;
+        self.register_c_comma()?;
+        self.register_primitive("CELLS", false, vec![IrOp::PushI32(4), IrOp::Mul])?;
+        self.register_primitive("CELL+", false, vec![IrOp::PushI32(4), IrOp::Add])?;
+        // CHARS is a no-op (byte addressed)
+        self.register_primitive("CHARS", false, vec![])?;
+        self.register_primitive("CHAR+", false, vec![IrOp::PushI32(1), IrOp::Add])?;
+        self.register_align()?;
+        self.register_aligned()?;
+        self.register_move()?;
+        self.register_fill()?;
+
+        // -- Priority 4: Stack/arithmetic --
+        self.register_primitive("2DUP", false, vec![IrOp::Over, IrOp::Over])?;
+        self.register_primitive("2DROP", false, vec![IrOp::Drop, IrOp::Drop])?;
+        self.register_primitive(
+            "2SWAP",
+            false,
+            vec![
+                IrOp::Rot, IrOp::ToR, IrOp::Rot, IrOp::FromR,
+            ],
+        )?;
+        self.register_2over()?;
+        self.register_qdup()?;
+        self.register_pick()?;
+        self.register_min()?;
+        self.register_max()?;
+        self.register_within()?;
+
+        // -- Priority 5: Comparison --
+        self.register_primitive("0<>", false, vec![IrOp::ZeroEq, IrOp::ZeroEq])?;
+        self.register_primitive("0>", false, vec![IrOp::PushI32(0), IrOp::Gt])?;
+
+        // -- Priority 6: System/compiler --
+        self.register_primitive("EXECUTE", false, vec![IrOp::Execute])?;
+        self.register_immediate_word()?;
+        self.register_decimal()?;
+        self.register_hex()?;
+        self.register_type_word()?;
+        self.register_spaces()?;
+        self.register_tick()?;
+        self.register_to_body()?;
+        self.register_environment_q()?;
+        self.register_source()?;
+        self.register_abort()?;
+
         // -- I/O: . (dot) needs host function because it does number-to-string --
         // We'll compile a word that pops and calls a host function.
         // The simplest approach: make DOT a host function that reads the stack
@@ -928,7 +1072,7 @@ impl ForthVM {
         let memory = self.memory;
         let dsp = self.dsp;
         let output = Arc::clone(&self.output);
-        let base_val = self.base;
+        let base_cell = Arc::clone(&self.base_cell);
 
         let func = Func::new(
             &mut self.store,
@@ -942,6 +1086,7 @@ impl ForthVM {
                 // Increment dsp (pop)
                 dsp.set(&mut caller, Val::I32((sp + CELL_SIZE) as i32))?;
                 // Format number
+                let base_val = *base_cell.lock().unwrap();
                 let s = if base_val == 16 {
                     if value < 0 {
                         format!("-{:X} ", -(value as i64))
@@ -1016,6 +1161,829 @@ impl ForthVM {
         );
 
         self.register_host_primitive("DEPTH", false, func)?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Priority 1: Loop support host functions
+    // -----------------------------------------------------------------------
+
+    /// Register J (outer loop counter) as a host function.
+    /// During nested DO loops the return stack looks like:
+    ///   ... outer_limit outer_index inner_limit inner_index  (inner_index on top)
+    /// J reads the outer index = rsp + 8 (skip inner index and inner limit).
+    fn register_j(&mut self) -> anyhow::Result<()> {
+        let memory = self.memory;
+        let dsp = self.dsp;
+        let rsp = self.rsp;
+
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                let rsp_val = rsp.get(&mut caller).unwrap_i32() as u32;
+                // rsp points to inner_index, rsp+4 = inner_limit, rsp+8 = outer_index
+                let addr = (rsp_val + 8) as usize;
+                let data = memory.data(&caller);
+                let b: [u8; 4] = data[addr..addr + 4].try_into().unwrap();
+                let value = i32::from_le_bytes(b);
+                // Push onto data stack
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let new_sp = sp - CELL_SIZE;
+                let data = memory.data_mut(&mut caller);
+                let bytes = value.to_le_bytes();
+                data[new_sp as usize..new_sp as usize + 4].copy_from_slice(&bytes);
+                dsp.set(&mut caller, Val::I32(new_sp as i32))?;
+                Ok(())
+            },
+        );
+
+        self.register_host_primitive("J", false, func)?;
+        Ok(())
+    }
+
+    /// Register LEAVE as a host function.
+    /// Sets the loop index equal to the limit so the loop exits on next iteration.
+    fn register_leave(&mut self) -> anyhow::Result<()> {
+        let memory = self.memory;
+        let rsp = self.rsp;
+
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                let rsp_val = rsp.get(&mut caller).unwrap_i32() as u32;
+                // rsp points to index, rsp+4 = limit
+                let limit_addr = (rsp_val + 4) as usize;
+                let data = memory.data(&caller);
+                let b: [u8; 4] = data[limit_addr..limit_addr + 4].try_into().unwrap();
+                let limit = i32::from_le_bytes(b);
+                // Set index = limit
+                let index_addr = rsp_val as usize;
+                let data = memory.data_mut(&mut caller);
+                let bytes = limit.to_le_bytes();
+                data[index_addr..index_addr + 4].copy_from_slice(&bytes);
+                Ok(())
+            },
+        );
+
+        self.register_host_primitive("LEAVE", false, func)?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Priority 2: Defining words
+    // -----------------------------------------------------------------------
+
+    /// VARIABLE <name> -- create a variable with one cell of storage.
+    fn define_variable(&mut self) -> anyhow::Result<()> {
+        let name = self
+            .next_token()
+            .ok_or_else(|| anyhow::anyhow!("VARIABLE: expected name"))?;
+
+        // Create a dictionary entry; the word will push its parameter field address.
+        let word_id = self
+            .dictionary
+            .create(&name, false)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+        // Allocate one cell in WASM memory for the variable's storage
+        self.refresh_user_here();
+        let var_addr = self.user_here;
+        self.user_here += CELL_SIZE;
+
+        // Initialize the cell to 0 in WASM memory
+        let data = self.memory.data_mut(&mut self.store);
+        data[var_addr as usize..var_addr as usize + 4].copy_from_slice(&0i32.to_le_bytes());
+
+        // Compile a tiny word that pushes the variable's address
+        let ir_body = vec![IrOp::PushI32(var_addr as i32)];
+        let config = CodegenConfig {
+            base_fn_index: word_id.0,
+            table_size: self.table_size(),
+        };
+        let compiled = compile_word(&name, &ir_body, &config)
+            .map_err(|e| anyhow::anyhow!("codegen error for VARIABLE {}: {}", name, e))?;
+
+        self.instantiate_and_install(&compiled, word_id)?;
+        self.dictionary.reveal();
+        self.next_table_index = self.next_table_index.max(word_id.0 + 1);
+        self.sync_here_cell();
+
+        Ok(())
+    }
+
+    /// CONSTANT <name> -- create a constant.
+    fn define_constant(&mut self) -> anyhow::Result<()> {
+        let value = self.pop_data_stack()?;
+        let name = self
+            .next_token()
+            .ok_or_else(|| anyhow::anyhow!("CONSTANT: expected name"))?;
+
+        let word_id = self
+            .dictionary
+            .create(&name, false)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+        // Compile a word that pushes the constant value
+        let ir_body = vec![IrOp::PushI32(value)];
+        let config = CodegenConfig {
+            base_fn_index: word_id.0,
+            table_size: self.table_size(),
+        };
+        let compiled = compile_word(&name, &ir_body, &config)
+            .map_err(|e| anyhow::anyhow!("codegen error for CONSTANT {}: {}", name, e))?;
+
+        self.instantiate_and_install(&compiled, word_id)?;
+        self.dictionary.reveal();
+        self.next_table_index = self.next_table_index.max(word_id.0 + 1);
+        self.sync_here_cell();
+
+        Ok(())
+    }
+
+    /// CREATE <name> -- create a word that pushes its parameter field address.
+    /// The address points into WASM linear memory where user data can be stored.
+    fn define_create(&mut self) -> anyhow::Result<()> {
+        let name = self
+            .next_token()
+            .ok_or_else(|| anyhow::anyhow!("CREATE: expected name"))?;
+
+        let word_id = self
+            .dictionary
+            .create(&name, false)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+        // The parameter field address is the current user_here
+        self.refresh_user_here();
+        let pfa = self.user_here;
+
+        // Compile a word that pushes the pfa
+        let ir_body = vec![IrOp::PushI32(pfa as i32)];
+        let config = CodegenConfig {
+            base_fn_index: word_id.0,
+            table_size: self.table_size(),
+        };
+        let compiled = compile_word(&name, &ir_body, &config)
+            .map_err(|e| anyhow::anyhow!("codegen error for CREATE {}: {}", name, e))?;
+
+        self.instantiate_and_install(&compiled, word_id)?;
+        self.dictionary.reveal();
+        self.next_table_index = self.next_table_index.max(word_id.0 + 1);
+        self.sync_here_cell();
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Priority 3: Memory/system host functions
+    // -----------------------------------------------------------------------
+
+    /// HERE -- push the current user data pointer.
+    fn register_here(&mut self) -> anyhow::Result<()> {
+        let memory = self.memory;
+        let dsp = self.dsp;
+
+        // Use a shared cell that tracks user_here.
+        let here_cell = Arc::new(Mutex::new(self.user_here));
+        self.here_cell = Some(Arc::clone(&here_cell));
+
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                let here_val = *here_cell.lock().unwrap();
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let new_sp = sp - CELL_SIZE;
+                let data = memory.data_mut(&mut caller);
+                let bytes = (here_val as i32).to_le_bytes();
+                data[new_sp as usize..new_sp as usize + 4].copy_from_slice(&bytes);
+                dsp.set(&mut caller, Val::I32(new_sp as i32))?;
+                Ok(())
+            },
+        );
+
+        self.register_host_primitive("HERE", false, func)?;
+        Ok(())
+    }
+
+    /// Keep the here_cell in sync with user_here.
+    fn sync_here_cell(&self) {
+        if let Some(ref cell) = self.here_cell {
+            *cell.lock().unwrap() = self.user_here;
+        }
+    }
+
+    /// Update user_here from the shared cell and then write back.
+    fn refresh_user_here(&mut self) {
+        if let Some(ref cell) = self.here_cell {
+            self.user_here = *cell.lock().unwrap();
+        }
+    }
+
+    /// ALLOT -- ( n -- ) advance HERE by n bytes.
+    fn register_allot(&mut self) -> anyhow::Result<()> {
+        let memory = self.memory;
+        let dsp = self.dsp;
+        let here_cell = self.here_cell.clone();
+
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                // Pop n from data stack
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let data = memory.data(&caller);
+                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
+                let n = i32::from_le_bytes(b);
+                dsp.set(&mut caller, Val::I32((sp + CELL_SIZE) as i32))?;
+                // Advance HERE
+                if let Some(ref cell) = here_cell {
+                    let mut h = cell.lock().unwrap();
+                    *h = (*h as i32 + n) as u32;
+                }
+                Ok(())
+            },
+        );
+
+        self.register_host_primitive("ALLOT", false, func)?;
+        Ok(())
+    }
+
+    /// , (comma) -- ( x -- ) store x at HERE, advance HERE by cell.
+    fn register_comma(&mut self) -> anyhow::Result<()> {
+        let memory = self.memory;
+        let dsp = self.dsp;
+        let here_cell = self.here_cell.clone();
+
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                // Pop value from data stack
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let data = memory.data(&caller);
+                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
+                let value = i32::from_le_bytes(b);
+                dsp.set(&mut caller, Val::I32((sp + CELL_SIZE) as i32))?;
+                // Store at HERE and advance
+                if let Some(ref cell) = here_cell {
+                    let mut h = cell.lock().unwrap();
+                    let addr = *h as usize;
+                    let data = memory.data_mut(&mut caller);
+                    let bytes = value.to_le_bytes();
+                    data[addr..addr + 4].copy_from_slice(&bytes);
+                    *h += CELL_SIZE;
+                }
+                Ok(())
+            },
+        );
+
+        self.register_host_primitive(",", false, func)?;
+        Ok(())
+    }
+
+    /// C, -- ( char -- ) store byte at HERE, advance HERE by 1.
+    fn register_c_comma(&mut self) -> anyhow::Result<()> {
+        let memory = self.memory;
+        let dsp = self.dsp;
+        let here_cell = self.here_cell.clone();
+
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let data = memory.data(&caller);
+                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
+                let value = i32::from_le_bytes(b) as u8;
+                dsp.set(&mut caller, Val::I32((sp + CELL_SIZE) as i32))?;
+                if let Some(ref cell) = here_cell {
+                    let mut h = cell.lock().unwrap();
+                    let addr = *h as usize;
+                    let data = memory.data_mut(&mut caller);
+                    data[addr] = value;
+                    *h += 1;
+                }
+                Ok(())
+            },
+        );
+
+        self.register_host_primitive("C,", false, func)?;
+        Ok(())
+    }
+
+    /// ALIGN -- align HERE to cell boundary.
+    fn register_align(&mut self) -> anyhow::Result<()> {
+        let here_cell = self.here_cell.clone();
+
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |_caller, _params, _results| {
+                if let Some(ref cell) = here_cell {
+                    let mut h = cell.lock().unwrap();
+                    *h = (*h + 3) & !3;
+                }
+                Ok(())
+            },
+        );
+
+        self.register_host_primitive("ALIGN", false, func)?;
+        Ok(())
+    }
+
+    /// ALIGNED -- ( addr -- aligned-addr ) align address to cell boundary.
+    fn register_aligned(&mut self) -> anyhow::Result<()> {
+        // Can be done purely in IR: (addr + 3) AND NOT(3)
+        // addr 3 + 3 INVERT AND
+        self.register_primitive(
+            "ALIGNED",
+            false,
+            vec![
+                IrOp::PushI32(3),
+                IrOp::Add,
+                IrOp::PushI32(!3),
+                IrOp::And,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// MOVE -- ( src dst n -- ) memory move.
+    fn register_move(&mut self) -> anyhow::Result<()> {
+        let memory = self.memory;
+        let dsp = self.dsp;
+
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let data = memory.data(&caller);
+                // Pop n
+                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
+                let n = i32::from_le_bytes(b) as usize;
+                // Pop dst
+                let b: [u8; 4] = data[(sp + 4) as usize..(sp + 8) as usize]
+                    .try_into()
+                    .unwrap();
+                let dst = i32::from_le_bytes(b) as usize;
+                // Pop src
+                let b: [u8; 4] = data[(sp + 8) as usize..(sp + 12) as usize]
+                    .try_into()
+                    .unwrap();
+                let src = i32::from_le_bytes(b) as usize;
+                dsp.set(&mut caller, Val::I32((sp + 12) as i32))?;
+                // Perform copy (handle overlapping regions)
+                let data = memory.data_mut(&mut caller);
+                if src < dst && src + n > dst {
+                    // Overlapping, copy backwards
+                    for i in (0..n).rev() {
+                        data[dst + i] = data[src + i];
+                    }
+                } else {
+                    for i in 0..n {
+                        data[dst + i] = data[src + i];
+                    }
+                }
+                Ok(())
+            },
+        );
+
+        self.register_host_primitive("MOVE", false, func)?;
+        Ok(())
+    }
+
+    /// FILL -- ( addr n char -- ) fill memory.
+    fn register_fill(&mut self) -> anyhow::Result<()> {
+        let memory = self.memory;
+        let dsp = self.dsp;
+
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let data = memory.data(&caller);
+                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
+                let ch = i32::from_le_bytes(b) as u8;
+                let b: [u8; 4] = data[(sp + 4) as usize..(sp + 8) as usize]
+                    .try_into()
+                    .unwrap();
+                let n = i32::from_le_bytes(b) as usize;
+                let b: [u8; 4] = data[(sp + 8) as usize..(sp + 12) as usize]
+                    .try_into()
+                    .unwrap();
+                let addr = i32::from_le_bytes(b) as usize;
+                dsp.set(&mut caller, Val::I32((sp + 12) as i32))?;
+                let data = memory.data_mut(&mut caller);
+                for i in 0..n {
+                    data[addr + i] = ch;
+                }
+                Ok(())
+            },
+        );
+
+        self.register_host_primitive("FILL", false, func)?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Priority 4: Stack/arithmetic host functions
+    // -----------------------------------------------------------------------
+
+    /// 2OVER -- ( a b c d -- a b c d a b ) copy second pair over top pair.
+    fn register_2over(&mut self) -> anyhow::Result<()> {
+        let memory = self.memory;
+        let dsp = self.dsp;
+
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let data = memory.data(&caller);
+                // Stack (top first): d at sp, c at sp+4, b at sp+8, a at sp+12
+                // We want to copy a and b on top
+                let b: [u8; 4] = data[(sp + 8) as usize..(sp + 12) as usize]
+                    .try_into()
+                    .unwrap();
+                let val_b = i32::from_le_bytes(b);
+                let b: [u8; 4] = data[(sp + 12) as usize..(sp + 16) as usize]
+                    .try_into()
+                    .unwrap();
+                let val_a = i32::from_le_bytes(b);
+                // Push a then b (a goes deeper, b on top)
+                let new_sp = sp - 8;
+                let data = memory.data_mut(&mut caller);
+                // Write a at new_sp+4 (deeper), b at new_sp (top)
+                data[(new_sp + 4) as usize..(new_sp + 8) as usize]
+                    .copy_from_slice(&val_a.to_le_bytes());
+                data[new_sp as usize..(new_sp + 4) as usize]
+                    .copy_from_slice(&val_b.to_le_bytes());
+                dsp.set(&mut caller, Val::I32(new_sp as i32))?;
+                Ok(())
+            },
+        );
+
+        self.register_host_primitive("2OVER", false, func)?;
+        Ok(())
+    }
+
+    /// ?DUP -- ( x -- 0 | x x ) duplicate if non-zero.
+    fn register_qdup(&mut self) -> anyhow::Result<()> {
+        self.register_primitive(
+            "?DUP",
+            false,
+            vec![
+                IrOp::Dup,
+                IrOp::If {
+                    then_body: vec![IrOp::Dup],
+                    else_body: None,
+                },
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// PICK -- ( xn ... x0 n -- xn ... x0 xn ) pick nth item.
+    fn register_pick(&mut self) -> anyhow::Result<()> {
+        let memory = self.memory;
+        let dsp = self.dsp;
+
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let data = memory.data(&caller);
+                // Read n from TOS
+                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
+                let n = i32::from_le_bytes(b) as u32;
+                // Read the nth item below TOS: at sp + (n+1)*CELL_SIZE
+                let pick_addr = (sp + (n + 1) * CELL_SIZE) as usize;
+                let b: [u8; 4] = data[pick_addr..pick_addr + 4].try_into().unwrap();
+                let value = i32::from_le_bytes(b);
+                // Replace TOS with picked value
+                let data = memory.data_mut(&mut caller);
+                let bytes = value.to_le_bytes();
+                data[sp as usize..sp as usize + 4].copy_from_slice(&bytes);
+                Ok(())
+            },
+        );
+
+        self.register_host_primitive("PICK", false, func)?;
+        Ok(())
+    }
+
+    /// MIN -- ( a b -- min )
+    fn register_min(&mut self) -> anyhow::Result<()> {
+        // 2DUP > IF SWAP THEN DROP
+        self.register_primitive(
+            "MIN",
+            false,
+            vec![
+                IrOp::Over,
+                IrOp::Over,
+                IrOp::Gt,
+                IrOp::If {
+                    then_body: vec![IrOp::Swap],
+                    else_body: None,
+                },
+                IrOp::Drop,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// MAX -- ( a b -- max )
+    fn register_max(&mut self) -> anyhow::Result<()> {
+        // 2DUP < IF SWAP THEN DROP
+        self.register_primitive(
+            "MAX",
+            false,
+            vec![
+                IrOp::Over,
+                IrOp::Over,
+                IrOp::Lt,
+                IrOp::If {
+                    then_body: vec![IrOp::Swap],
+                    else_body: None,
+                },
+                IrOp::Drop,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// WITHIN -- ( n lo hi -- flag )
+    fn register_within(&mut self) -> anyhow::Result<()> {
+        let memory = self.memory;
+        let dsp = self.dsp;
+
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let data = memory.data(&caller);
+                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
+                let hi = i32::from_le_bytes(b);
+                let b: [u8; 4] = data[(sp + 4) as usize..(sp + 8) as usize]
+                    .try_into()
+                    .unwrap();
+                let lo = i32::from_le_bytes(b);
+                let b: [u8; 4] = data[(sp + 8) as usize..(sp + 12) as usize]
+                    .try_into()
+                    .unwrap();
+                let n = i32::from_le_bytes(b);
+                // WITHIN: true if lo <= n < hi (unsigned subtraction trick)
+                let result = ((n.wrapping_sub(lo)) as u32) < ((hi.wrapping_sub(lo)) as u32);
+                let flag: i32 = if result { -1 } else { 0 };
+                // Pop 3, push 1: net = sp + 8
+                let new_sp = sp + 8;
+                let data = memory.data_mut(&mut caller);
+                let bytes = flag.to_le_bytes();
+                data[new_sp as usize..new_sp as usize + 4].copy_from_slice(&bytes);
+                dsp.set(&mut caller, Val::I32(new_sp as i32))?;
+                Ok(())
+            },
+        );
+
+        self.register_host_primitive("WITHIN", false, func)?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Priority 6: System/compiler host functions
+    // -----------------------------------------------------------------------
+
+    /// IMMEDIATE -- toggle immediate flag on the most recent word.
+    fn register_immediate_word(&mut self) -> anyhow::Result<()> {
+        // IMMEDIATE needs to call dictionary.toggle_immediate().
+        // Since the host function can't access self.dictionary directly,
+        // we use the WASM memory to track this... actually, we handle IMMEDIATE
+        // as a special token in interpret_token instead.
+        //
+        // But we still want it in the dictionary so it can be found.
+        // Let's make it a no-op host function and handle it in interpret_token.
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |_caller, _params, _results| Ok(()),
+        );
+
+        self.register_host_primitive("IMMEDIATE", false, func)?;
+        Ok(())
+    }
+
+    /// DECIMAL -- set BASE to 10.
+    fn register_decimal(&mut self) -> anyhow::Result<()> {
+        // Similar to IMMEDIATE, we handle in interpret_token.
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |_caller, _params, _results| Ok(()),
+        );
+
+        self.register_host_primitive("DECIMAL", false, func)?;
+        Ok(())
+    }
+
+    /// HEX -- set BASE to 16.
+    fn register_hex(&mut self) -> anyhow::Result<()> {
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |_caller, _params, _results| Ok(()),
+        );
+
+        self.register_host_primitive("HEX", false, func)?;
+        Ok(())
+    }
+
+    /// TYPE -- ( c-addr u -- ) output a string from memory.
+    fn register_type_word(&mut self) -> anyhow::Result<()> {
+        let memory = self.memory;
+        let dsp = self.dsp;
+        let output = Arc::clone(&self.output);
+
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let data = memory.data(&caller);
+                // Pop u (length)
+                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
+                let len = i32::from_le_bytes(b) as usize;
+                // Pop c-addr
+                let b: [u8; 4] = data[(sp + 4) as usize..(sp + 8) as usize]
+                    .try_into()
+                    .unwrap();
+                let addr = i32::from_le_bytes(b) as usize;
+                dsp.set(&mut caller, Val::I32((sp + 8) as i32))?;
+                // Read string from memory and output
+                let data = memory.data(&caller);
+                let s = String::from_utf8_lossy(&data[addr..addr + len]).to_string();
+                output.lock().unwrap().push_str(&s);
+                Ok(())
+            },
+        );
+
+        self.register_host_primitive("TYPE", false, func)?;
+        Ok(())
+    }
+
+    /// SPACES -- ( n -- ) output n spaces.
+    fn register_spaces(&mut self) -> anyhow::Result<()> {
+        let memory = self.memory;
+        let dsp = self.dsp;
+        let output = Arc::clone(&self.output);
+
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let data = memory.data(&caller);
+                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
+                let n = i32::from_le_bytes(b);
+                dsp.set(&mut caller, Val::I32((sp + CELL_SIZE) as i32))?;
+                if n > 0 {
+                    let spaces = " ".repeat(n as usize);
+                    output.lock().unwrap().push_str(&spaces);
+                }
+                Ok(())
+            },
+        );
+
+        self.register_host_primitive("SPACES", false, func)?;
+        Ok(())
+    }
+
+    /// ' (tick) in interpret mode -- push the xt (function table index) of the next word.
+    fn register_tick(&mut self) -> anyhow::Result<()> {
+        // Tick is handled as a special token in interpret_token_immediate.
+        // But we still register it so it's in the dictionary for FIND etc.
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |_caller, _params, _results| Ok(()),
+        );
+
+        self.register_host_primitive("'", false, func)?;
+        Ok(())
+    }
+
+    /// Interpret-mode tick: read next word, look it up, push its xt.
+    fn interpret_tick(&mut self) -> anyhow::Result<()> {
+        let name = self
+            .next_token()
+            .ok_or_else(|| anyhow::anyhow!("': expected word name"))?;
+        if let Some((_addr, word_id, _imm)) = self.dictionary.find(&name) {
+            self.push_data_stack(word_id.0 as i32)?;
+        } else {
+            anyhow::bail!("': unknown word: {}", name);
+        }
+        Ok(())
+    }
+
+    /// Interpret-mode CHAR: read next word, push first character.
+    fn interpret_char(&mut self) -> anyhow::Result<()> {
+        let name = self
+            .next_token()
+            .ok_or_else(|| anyhow::anyhow!("CHAR: expected word"))?;
+        if let Some(ch) = name.chars().next() {
+            self.push_data_stack(ch as i32)?;
+        }
+        Ok(())
+    }
+
+    /// >BODY -- ( xt -- addr ) given xt, return parameter field address.
+    fn register_to_body(&mut self) -> anyhow::Result<()> {
+        // For our system, >BODY is tricky since we'd need to map xt back to
+        // a dictionary entry. For now, a stub that's unused in simple programs.
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |_caller, _params, _results| Ok(()),
+        );
+
+        self.register_host_primitive(">BODY", false, func)?;
+        Ok(())
+    }
+
+    /// ENVIRONMENT? -- ( c-addr u -- false ) query system parameters.
+    fn register_environment_q(&mut self) -> anyhow::Result<()> {
+        let memory = self.memory;
+        let dsp = self.dsp;
+
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                // Pop two args (c-addr u), push FALSE
+                let new_sp = sp + 4; // net: pop 2, push 1 = sp + 4
+                let data = memory.data_mut(&mut caller);
+                let bytes = 0i32.to_le_bytes();
+                data[new_sp as usize..new_sp as usize + 4].copy_from_slice(&bytes);
+                dsp.set(&mut caller, Val::I32(new_sp as i32))?;
+                Ok(())
+            },
+        );
+
+        self.register_host_primitive("ENVIRONMENT?", false, func)?;
+        Ok(())
+    }
+
+    /// SOURCE -- ( -- c-addr u ) push address and length of input buffer.
+    fn register_source(&mut self) -> anyhow::Result<()> {
+        // SOURCE is complex because the input buffer is in Rust-side state.
+        // For now, return 0 0 as a stub.
+        let memory = self.memory;
+        let dsp = self.dsp;
+
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let new_sp = sp - 8; // push 2 values
+                let data = memory.data_mut(&mut caller);
+                // c-addr = 0
+                data[new_sp as usize..new_sp as usize + 4].copy_from_slice(&0i32.to_le_bytes());
+                // u = 0
+                data[(new_sp + 4) as usize..(new_sp + 8) as usize]
+                    .copy_from_slice(&0i32.to_le_bytes());
+                dsp.set(&mut caller, Val::I32(new_sp as i32))?;
+                Ok(())
+            },
+        );
+
+        self.register_host_primitive("SOURCE", false, func)?;
+        Ok(())
+    }
+
+    /// ABORT -- clear stacks and throw error.
+    fn register_abort(&mut self) -> anyhow::Result<()> {
+        let dsp = self.dsp;
+        let rsp = self.rsp;
+
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                // Reset stack pointers
+                dsp.set(&mut caller, Val::I32(DATA_STACK_TOP as i32))?;
+                rsp.set(&mut caller, Val::I32(RETURN_STACK_TOP as i32))?;
+                Err(wasmtime::Error::msg("ABORT"))
+            },
+        );
+
+        self.register_host_primitive("ABORT", false, func)?;
         Ok(())
     }
 }
@@ -1338,5 +2306,309 @@ mod tests {
         let _ = vm.take_output();
         vm.evaluate("7 SQUARE .").unwrap();
         assert_eq!(vm.take_output(), "49 ");
+    }
+
+    // ===================================================================
+    // New words: Priority 1 - Loop support
+    // ===================================================================
+
+    #[test]
+    fn test_i_in_do_loop() {
+        // : TEST 5 0 DO I . LOOP ; TEST
+        assert_eq!(
+            eval_output(": TEST 5 0 DO I . LOOP ; TEST"),
+            "0 1 2 3 4 "
+        );
+    }
+
+    #[test]
+    fn test_j_in_nested_do_loop() {
+        // Nested loops: outer 0..2, inner 0..3
+        assert_eq!(
+            eval_output(": TEST 3 0 DO 2 0 DO J . LOOP LOOP ; TEST"),
+            "0 0 1 1 2 2 "
+        );
+    }
+
+    #[test]
+    fn test_unloop() {
+        // UNLOOP removes loop params, EXIT leaves the word
+        assert_eq!(
+            eval_output(": TEST 5 0 DO I DUP 3 = IF . UNLOOP EXIT THEN DROP LOOP ; TEST"),
+            "3 "
+        );
+    }
+
+    #[test]
+    fn test_leave() {
+        // LEAVE sets index=limit so the loop exits on next iteration.
+        // Note: LEAVE does not skip the rest of the current iteration's body.
+        // So we print first, then check for the exit condition.
+        assert_eq!(
+            eval_output(": TEST 10 0 DO I . I 3 = IF LEAVE THEN LOOP ; TEST"),
+            "0 1 2 3 "
+        );
+    }
+
+    // ===================================================================
+    // New words: Priority 2 - Defining words
+    // ===================================================================
+
+    #[test]
+    fn test_variable() {
+        assert_eq!(eval_output("VARIABLE X 42 X ! X @ ."), "42 ");
+    }
+
+    #[test]
+    fn test_variable_default_zero() {
+        assert_eq!(eval_output("VARIABLE X X @ ."), "0 ");
+    }
+
+    #[test]
+    fn test_variable_multiple() {
+        assert_eq!(
+            eval_output("VARIABLE A VARIABLE B 10 A ! 20 B ! A @ B @ + ."),
+            "30 "
+        );
+    }
+
+    #[test]
+    fn test_constant() {
+        assert_eq!(eval_output("10 CONSTANT TEN TEN ."), "10 ");
+    }
+
+    #[test]
+    fn test_constant_negative() {
+        assert_eq!(eval_output("-42 CONSTANT NEG NEG ."), "-42 ");
+    }
+
+    #[test]
+    fn test_create() {
+        // CREATE makes a word that pushes its parameter field address
+        // We can store a value there and fetch it
+        let mut vm = ForthVM::new().unwrap();
+        vm.evaluate("CREATE FOO").unwrap();
+        // FOO pushes an address; we can read/write that location
+        vm.evaluate("FOO").unwrap();
+        let stack = vm.data_stack();
+        assert!(!stack.is_empty());
+        // The address should be a valid memory address
+        assert!(stack[0] > 0);
+    }
+
+    // ===================================================================
+    // New words: Priority 3 - Memory/system words
+    // ===================================================================
+
+    #[test]
+    fn test_cells() {
+        assert_eq!(eval_stack("3 CELLS"), vec![12]);
+    }
+
+    #[test]
+    fn test_cell_plus() {
+        assert_eq!(eval_stack("100 CELL+"), vec![104]);
+    }
+
+    #[test]
+    fn test_chars_noop() {
+        assert_eq!(eval_stack("5 CHARS"), vec![5]);
+    }
+
+    #[test]
+    fn test_char_plus() {
+        assert_eq!(eval_stack("100 CHAR+"), vec![101]);
+    }
+
+    #[test]
+    fn test_here() {
+        // HERE should push a valid address
+        let stack = eval_stack("HERE");
+        assert_eq!(stack.len(), 1);
+        assert!(stack[0] > 0);
+    }
+
+    #[test]
+    fn test_aligned() {
+        assert_eq!(eval_stack("0 ALIGNED"), vec![0]);
+        assert_eq!(eval_stack("1 ALIGNED"), vec![4]);
+        assert_eq!(eval_stack("4 ALIGNED"), vec![4]);
+        assert_eq!(eval_stack("5 ALIGNED"), vec![8]);
+    }
+
+    // ===================================================================
+    // New words: Priority 4 - Stack/arithmetic
+    // ===================================================================
+
+    #[test]
+    fn test_2dup() {
+        assert_eq!(eval_stack("1 2 2DUP"), vec![2, 1, 2, 1]);
+    }
+
+    #[test]
+    fn test_2drop() {
+        assert_eq!(eval_stack("1 2 3 4 2DROP"), vec![2, 1]);
+    }
+
+    #[test]
+    fn test_2swap() {
+        // ( 1 2 3 4 -- 3 4 1 2 )
+        assert_eq!(eval_stack("1 2 3 4 2SWAP"), vec![2, 1, 4, 3]);
+    }
+
+    #[test]
+    fn test_2over() {
+        // ( 1 2 3 4 -- 1 2 3 4 1 2 )
+        assert_eq!(eval_stack("1 2 3 4 2OVER"), vec![2, 1, 4, 3, 2, 1]);
+    }
+
+    #[test]
+    fn test_qdup_nonzero() {
+        assert_eq!(eval_stack("5 ?DUP"), vec![5, 5]);
+    }
+
+    #[test]
+    fn test_qdup_zero() {
+        assert_eq!(eval_stack("0 ?DUP"), vec![0]);
+    }
+
+    #[test]
+    fn test_min() {
+        assert_eq!(eval_stack("3 5 MIN"), vec![3]);
+        assert_eq!(eval_stack("5 3 MIN"), vec![3]);
+        assert_eq!(eval_stack("-1 1 MIN"), vec![-1]);
+    }
+
+    #[test]
+    fn test_max() {
+        assert_eq!(eval_stack("3 5 MAX"), vec![5]);
+        assert_eq!(eval_stack("5 3 MAX"), vec![5]);
+        assert_eq!(eval_stack("-1 1 MAX"), vec![1]);
+    }
+
+    #[test]
+    fn test_pick() {
+        // 0 PICK = DUP
+        assert_eq!(eval_stack("1 2 3 0 PICK"), vec![3, 3, 2, 1]);
+        // 1 PICK = OVER
+        assert_eq!(eval_stack("1 2 3 1 PICK"), vec![2, 3, 2, 1]);
+        // 2 PICK
+        assert_eq!(eval_stack("1 2 3 2 PICK"), vec![1, 3, 2, 1]);
+    }
+
+    // ===================================================================
+    // New words: Priority 5 - Comparison
+    // ===================================================================
+
+    #[test]
+    fn test_0_not_equal() {
+        assert_eq!(eval_stack("5 0<>"), vec![-1]);
+        assert_eq!(eval_stack("0 0<>"), vec![0]);
+    }
+
+    #[test]
+    fn test_0_greater() {
+        assert_eq!(eval_stack("5 0>"), vec![-1]);
+        assert_eq!(eval_stack("0 0>"), vec![0]);
+        assert_eq!(eval_stack("-1 0>"), vec![0]);
+    }
+
+    // ===================================================================
+    // New words: Priority 6 - System/compiler
+    // ===================================================================
+
+    #[test]
+    fn test_execute() {
+        // ' word EXECUTE should execute the word
+        assert_eq!(eval_output("42 ' . EXECUTE"), "42 ");
+    }
+
+    #[test]
+    fn test_execute_in_colon() {
+        assert_eq!(
+            eval_output(": TEST ['] . EXECUTE ; 99 TEST"),
+            "99 "
+        );
+    }
+
+    #[test]
+    fn test_hex_decimal() {
+        assert_eq!(eval_output("HEX FF DECIMAL ."), "255 ");
+    }
+
+    #[test]
+    fn test_hex_output() {
+        assert_eq!(eval_output("HEX FF ."), "FF ");
+    }
+
+    #[test]
+    fn test_decimal_default() {
+        assert_eq!(eval_output("255 ."), "255 ");
+    }
+
+    #[test]
+    fn test_immediate() {
+        // Define a word, then mark it IMMEDIATE
+        let mut vm = ForthVM::new().unwrap();
+        vm.evaluate(": MYWORD 42 ; IMMEDIATE").unwrap();
+        // MYWORD is now immediate; when used in compile mode it executes
+        vm.evaluate(": TEST MYWORD . ; TEST").unwrap();
+        // During compilation of TEST, MYWORD executes immediately pushing 42,
+        // then . prints it. After TEST is defined, running TEST does nothing
+        // because MYWORD already ran during compilation.
+        let out = vm.take_output();
+        assert_eq!(out, "42 ");
+    }
+
+    #[test]
+    fn test_char_word() {
+        assert_eq!(eval_stack("CHAR A"), vec![65]);
+        assert_eq!(eval_stack("CHAR Z"), vec![90]);
+    }
+
+    #[test]
+    fn test_bracket_char() {
+        assert_eq!(
+            eval_output(": TEST [CHAR] A EMIT ; TEST"),
+            "A"
+        );
+    }
+
+    #[test]
+    fn test_spaces() {
+        assert_eq!(eval_output("3 SPACES"), "   ");
+    }
+
+    #[test]
+    fn test_constant_in_colon_def() {
+        assert_eq!(
+            eval_output("10 CONSTANT TEN : TEST TEN . ; TEST"),
+            "10 "
+        );
+    }
+
+    #[test]
+    fn test_variable_in_colon_def() {
+        assert_eq!(
+            eval_output("VARIABLE X 42 X ! : TEST X @ . ; TEST"),
+            "42 "
+        );
+    }
+
+    #[test]
+    fn test_within() {
+        assert_eq!(eval_stack("5 0 10 WITHIN"), vec![-1]);
+        assert_eq!(eval_stack("0 0 10 WITHIN"), vec![-1]);
+        assert_eq!(eval_stack("10 0 10 WITHIN"), vec![0]);
+        assert_eq!(eval_stack("-1 0 10 WITHIN"), vec![0]);
+    }
+
+    #[test]
+    fn test_do_loop_with_i_and_step() {
+        // +LOOP with step of 2
+        assert_eq!(
+            eval_output(": TEST 10 0 DO I . 2 +LOOP ; TEST"),
+            "0 2 4 6 8 "
+        );
     }
 }
