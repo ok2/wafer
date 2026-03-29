@@ -53,5 +53,5 @@ Handle in `interpret_token_immediate()` or `compile_token()` as a special case.
 1. Correctness first, performance second
 2. Maximize Forth, minimize Rust (self-hosting goal -- not yet started)
 3. Test-driven: if it's not tested, it doesn't work
-4. Never break existing tests
-5. No Co-Authored-By or AI attribution in commits
+4. Every word set at 100% compliance before moving to the next
+5. Never break existing tests

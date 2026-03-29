@@ -124,6 +124,14 @@ impl Dictionary {
         }
     }
 
+    /// Reveal a word at a specific address (remove HIDDEN flag).
+    pub fn reveal_at(&mut self, word_addr: u32) {
+        let flags_addr = (word_addr + 4) as usize;
+        if flags_addr < self.memory.len() {
+            self.memory[flags_addr] &= !flags::HIDDEN;
+        }
+    }
+
     /// Set the code field of the most recent word.
     pub fn set_code_field(&mut self, word_addr: u32, fn_index: u32) {
         if let Ok(code_addr) = self.code_field_addr(word_addr) {

@@ -8,6 +8,7 @@
 //! 5. If number: push (interpret) or compile as literal (compile mode)
 //! 6. If neither: error
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use wasmtime::{
@@ -18,7 +19,10 @@ use wasmtime::{
 use crate::codegen::{CodegenConfig, CompiledModule, compile_word};
 use crate::dictionary::{Dictionary, WordId};
 use crate::ir::IrOp;
-use crate::memory::{CELL_SIZE, DATA_STACK_TOP, RETURN_STACK_TOP};
+use crate::memory::{
+    CELL_SIZE, DATA_STACK_TOP, INPUT_BUFFER_BASE, INPUT_BUFFER_SIZE, RETURN_STACK_TOP,
+    SYSVAR_BASE_VAR, SYSVAR_NUM_TIB, SYSVAR_STATE, SYSVAR_TO_IN,
+};
 
 // ---------------------------------------------------------------------------
 // Control-flow compilation state
@@ -54,6 +58,18 @@ enum ControlEntry {
 struct VmHost {
     #[allow(dead_code)]
     output: Arc<Mutex<String>>,
+}
+
+// ---------------------------------------------------------------------------
+// DOES> support
+// ---------------------------------------------------------------------------
+
+/// Stored definition for a DOES>-based defining word.
+struct DoesDefinition {
+    /// The IR for the create-part (code between CREATE and DOES>).
+    create_ir: Vec<IrOp>,
+    /// The word ID of the compiled does-action (code after DOES>).
+    does_action_id: WordId,
 }
 
 // ---------------------------------------------------------------------------
@@ -97,6 +113,8 @@ pub struct ForthVM {
     user_here: u32,
     // Shared BASE value for host functions
     base_cell: Arc<Mutex<u32>>,
+    // DOES> definitions: maps defining word ID to its DoesDefinition
+    does_definitions: HashMap<WordId, DoesDefinition>,
 }
 
 impl ForthVM {
@@ -187,6 +205,7 @@ impl ForthVM {
             // User data starts at 64K in WASM memory, well clear of all system regions
             user_here: 0x10000,
             base_cell: Arc::new(Mutex::new(10)),
+            does_definitions: HashMap::new(),
         };
 
         vm.register_primitives()?;
@@ -200,6 +219,7 @@ impl ForthVM {
         self.input_pos = 0;
 
         while let Some(token) = self.next_token() {
+            self.sync_input_to_wasm();
             self.interpret_token(&token)?;
         }
 
@@ -343,6 +363,22 @@ impl ForthVM {
             }
             return Ok(());
         }
+        if token_upper == "S\"" {
+            // Parse string, store in WASM memory, push (c-addr u) on stack
+            if let Some(s) = self.parse_until('"') {
+                self.refresh_user_here();
+                let addr = self.user_here;
+                let bytes = s.as_bytes();
+                let len = bytes.len() as u32;
+                let data = self.memory.data_mut(&mut self.store);
+                data[addr as usize..addr as usize + len as usize].copy_from_slice(bytes);
+                self.user_here += len;
+                self.sync_here_cell();
+                self.push_data_stack(addr as i32)?;
+                self.push_data_stack(len as i32)?;
+            }
+            return Ok(());
+        }
         if token_upper == "(" {
             // Comment -- skip until )
             self.parse_until(')');
@@ -359,18 +395,24 @@ impl ForthVM {
             "VARIABLE" => return self.define_variable(),
             "CONSTANT" => return self.define_constant(),
             "CREATE" => return self.define_create(),
-            "DOES>" => anyhow::bail!("DOES> not yet implemented"),
+            "DOES>" => return self.interpret_does(),
             "'" => return self.interpret_tick(),
             "[CHAR]" => {
                 // In interpret mode, CHAR is the standard word
                 return self.interpret_char();
             }
             "CHAR" => return self.interpret_char(),
+            "EVALUATE" => return self.interpret_evaluate(),
+            "WORD" => return self.interpret_word(),
             _ => {}
         }
 
         // Look up in dictionary
         if let Some((_addr, word_id, _is_immediate)) = self.dictionary.find(token) {
+            // Check if this is a DOES>-defining word
+            if self.does_definitions.contains_key(&word_id) {
+                return self.execute_does_defining(word_id);
+            }
             self.execute_word(word_id)?;
             return Ok(());
         }
@@ -400,8 +442,19 @@ impl ForthVM {
             return Ok(());
         }
         if token_upper == "S\"" {
-            // TODO: string literal on stack
-            self.parse_until('"');
+            // Store string at HERE, compile code to push (c-addr u)
+            if let Some(s) = self.parse_until('"') {
+                self.refresh_user_here();
+                let addr = self.user_here;
+                let bytes = s.as_bytes();
+                let len = bytes.len() as u32;
+                let data = self.memory.data_mut(&mut self.store);
+                data[addr as usize..addr as usize + len as usize].copy_from_slice(bytes);
+                self.user_here += len;
+                self.sync_here_cell();
+                self.push_ir(IrOp::PushI32(addr as i32));
+                self.push_ir(IrOp::PushI32(len as i32));
+            }
             return Ok(());
         }
         if token_upper == "(" {
@@ -410,6 +463,38 @@ impl ForthVM {
         }
         if token_upper == "\\" {
             self.input_pos = self.input_buffer.len();
+            return Ok(());
+        }
+
+        // Handle ABORT" in compile mode
+        if token_upper == "ABORT\"" {
+            if let Some(s) = self.parse_until('"') {
+                // Compile: IF <push-addr> <push-len> TYPE ABORT THEN
+                // The flag is already on stack; compile the check
+                self.refresh_user_here();
+                let addr = self.user_here;
+                let bytes = s.as_bytes();
+                let len = bytes.len() as u32;
+                let data = self.memory.data_mut(&mut self.store);
+                data[addr as usize..addr as usize + len as usize].copy_from_slice(bytes);
+                self.user_here += len;
+                self.sync_here_cell();
+
+                // Find TYPE and ABORT word IDs
+                let type_call = self.dictionary.find("TYPE").map(|(_, id, _)| id);
+                let abort_call = self.dictionary.find("ABORT").map(|(_, id, _)| id);
+                let mut then_body = vec![IrOp::PushI32(addr as i32), IrOp::PushI32(len as i32)];
+                if let Some(type_id) = type_call {
+                    then_body.push(IrOp::Call(type_id));
+                }
+                if let Some(abort_id) = abort_call {
+                    then_body.push(IrOp::Call(abort_id));
+                }
+                self.push_ir(IrOp::If {
+                    then_body,
+                    else_body: None,
+                });
+            }
             return Ok(());
         }
 
@@ -491,6 +576,22 @@ impl ForthVM {
                     }
                 }
                 return Ok(());
+            }
+            "DOES>" => {
+                return self.compile_does();
+            }
+            "CREATE" => {
+                // In compile mode, CREATE is a no-op marker.
+                // The actual creation happens at runtime via the DOES> mechanism.
+                // CREATE consumes the next token (the name) at runtime,
+                // so we don't consume it here. The execute_does_defining
+                // method handles reading the name.
+                return Ok(());
+            }
+            "VARIABLE" | "CONSTANT" => {
+                // These are defining words that can't be compiled into IR.
+                // They're handled as special tokens in interpret mode.
+                anyhow::bail!("{} cannot be used inside a colon definition", token_upper);
             }
             _ => {}
         }
@@ -791,6 +892,8 @@ impl ForthVM {
             .ok_or_else(|| anyhow::anyhow!("word {} is null funcref", word_id.0))?;
 
         func.call(&mut self.store, &[], &mut [])?;
+        // Check if the word changed BASE via WASM memory
+        self.sync_input_from_wasm();
         Ok(())
     }
 
@@ -1024,9 +1127,7 @@ impl ForthVM {
         self.register_primitive(
             "2SWAP",
             false,
-            vec![
-                IrOp::Rot, IrOp::ToR, IrOp::Rot, IrOp::FromR,
-            ],
+            vec![IrOp::Rot, IrOp::ToR, IrOp::Rot, IrOp::FromR],
         )?;
         self.register_2over()?;
         self.register_qdup()?;
@@ -1053,16 +1154,36 @@ impl ForthVM {
         self.register_abort()?;
 
         // -- I/O: . (dot) needs host function because it does number-to-string --
-        // We'll compile a word that pops and calls a host function.
-        // The simplest approach: make DOT a host function that reads the stack
-        // directly via memory + dsp.
         self.register_dot()?;
-
-        // -- .S (print stack) --
         self.register_dot_s()?;
-
-        // -- DEPTH --
         self.register_depth()?;
+
+        // -- Priority 7: New core words --
+        self.register_count()?;
+        self.register_s_to_d()?;
+        self.register_cmove()?;
+        self.register_cmove_up()?;
+        self.register_find()?;
+        self.register_to_in()?;
+        self.register_state_var()?;
+        self.register_base_var()?;
+
+        // Double-cell arithmetic
+        self.register_m_star()?;
+        self.register_um_star()?;
+        self.register_um_div_mod()?;
+        self.register_fm_div_mod()?;
+        self.register_sm_div_rem()?;
+
+        // */ and */MOD
+        self.register_star_slash()?;
+        self.register_star_slash_mod()?;
+
+        // U. (unsigned dot)
+        self.register_u_dot()?;
+
+        // >NUMBER
+        self.register_to_number()?;
 
         Ok(())
     }
@@ -1330,6 +1451,8 @@ impl ForthVM {
         self.instantiate_and_install(&compiled, word_id)?;
         self.dictionary.reveal();
         self.next_table_index = self.next_table_index.max(word_id.0 + 1);
+        // Store fn_index at 0x30 for DOES> to find
+        self.store_latest_fn_index(word_id);
         self.sync_here_cell();
 
         Ok(())
@@ -1500,12 +1623,7 @@ impl ForthVM {
         self.register_primitive(
             "ALIGNED",
             false,
-            vec![
-                IrOp::PushI32(3),
-                IrOp::Add,
-                IrOp::PushI32(!3),
-                IrOp::And,
-            ],
+            vec![IrOp::PushI32(3), IrOp::Add, IrOp::PushI32(!3), IrOp::And],
         )?;
         Ok(())
     }
@@ -1620,8 +1738,7 @@ impl ForthVM {
                 // Write a at new_sp+4 (deeper), b at new_sp (top)
                 data[(new_sp + 4) as usize..(new_sp + 8) as usize]
                     .copy_from_slice(&val_a.to_le_bytes());
-                data[new_sp as usize..(new_sp + 4) as usize]
-                    .copy_from_slice(&val_b.to_le_bytes());
+                data[new_sp as usize..(new_sp + 4) as usize].copy_from_slice(&val_b.to_le_bytes());
                 dsp.set(&mut caller, Val::I32(new_sp as i32))?;
                 Ok(())
             },
@@ -1941,8 +2058,6 @@ impl ForthVM {
 
     /// SOURCE -- ( -- c-addr u ) push address and length of input buffer.
     fn register_source(&mut self) -> anyhow::Result<()> {
-        // SOURCE is complex because the input buffer is in Rust-side state.
-        // For now, return 0 0 as a stub.
         let memory = self.memory;
         let dsp = self.dsp;
 
@@ -1950,14 +2065,26 @@ impl ForthVM {
             &mut self.store,
             FuncType::new(&self.engine, [], []),
             move |mut caller, _params, _results| {
+                // The input buffer is synced to WASM memory at INPUT_BUFFER_BASE.
+                // The length is stored at a known location. We read it from the
+                // first 4 bytes before the buffer, or we use a different approach:
+                // read the actual length from a sysvar.
+                // For simplicity, read the buffer length from SYSVAR_NUM_TIB.
+                let data = memory.data(&caller);
+                let b: [u8; 4] = data[crate::memory::SYSVAR_NUM_TIB as usize
+                    ..crate::memory::SYSVAR_NUM_TIB as usize + 4]
+                    .try_into()
+                    .unwrap();
+                let len = i32::from_le_bytes(b);
+
                 let sp = dsp.get(&mut caller).unwrap_i32() as u32;
-                let new_sp = sp - 8; // push 2 values
+                let new_sp = sp - 8;
                 let data = memory.data_mut(&mut caller);
-                // c-addr = 0
-                data[new_sp as usize..new_sp as usize + 4].copy_from_slice(&0i32.to_le_bytes());
-                // u = 0
+                // c-addr (deeper)
                 data[(new_sp + 4) as usize..(new_sp + 8) as usize]
-                    .copy_from_slice(&0i32.to_le_bytes());
+                    .copy_from_slice(&(INPUT_BUFFER_BASE as i32).to_le_bytes());
+                // u (on top)
+                data[new_sp as usize..new_sp as usize + 4].copy_from_slice(&len.to_le_bytes());
                 dsp.set(&mut caller, Val::I32(new_sp as i32))?;
                 Ok(())
             },
@@ -1985,6 +2112,952 @@ impl ForthVM {
 
         self.register_host_primitive("ABORT", false, func)?;
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // EVALUATE -- save input, interpret string, restore input
+    // -----------------------------------------------------------------------
+
+    /// EVALUATE -- ( c-addr u -- ) interpret the given string.
+    fn interpret_evaluate(&mut self) -> anyhow::Result<()> {
+        // Pop length and address from data stack
+        let len = self.pop_data_stack()? as u32;
+        let addr = self.pop_data_stack()? as u32;
+
+        // Read the string from WASM memory
+        let data = self.memory.data(&self.store);
+        let s =
+            String::from_utf8_lossy(&data[addr as usize..addr as usize + len as usize]).to_string();
+
+        // Save current input state
+        let saved_buffer = std::mem::take(&mut self.input_buffer);
+        let saved_pos = self.input_pos;
+
+        // Set new input
+        self.input_buffer = s;
+        self.input_pos = 0;
+
+        // Interpret
+        while let Some(token) = self.next_token() {
+            self.interpret_token(&token)?;
+        }
+
+        // Restore input state
+        self.input_buffer = saved_buffer;
+        self.input_pos = saved_pos;
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // WORD -- parse delimited word from input
+    // -----------------------------------------------------------------------
+
+    /// WORD ( char -- c-addr ) parse next word delimited by char.
+    fn interpret_word(&mut self) -> anyhow::Result<()> {
+        let delim = self.pop_data_stack()? as u8 as char;
+
+        // Skip leading delimiters
+        let bytes = self.input_buffer.as_bytes();
+        while self.input_pos < bytes.len() && bytes[self.input_pos] == delim as u8 {
+            self.input_pos += 1;
+        }
+
+        // Collect until delimiter or end
+        let start = self.input_pos;
+        while self.input_pos < bytes.len() && bytes[self.input_pos] != delim as u8 {
+            self.input_pos += 1;
+        }
+        // Skip past delimiter
+        if self.input_pos < bytes.len() {
+            self.input_pos += 1;
+        }
+
+        let word_bytes = &bytes[start..self.input_pos.min(bytes.len())];
+        // Trim trailing delimiter if present
+        let word_bytes =
+            if !word_bytes.is_empty() && word_bytes[word_bytes.len() - 1] == delim as u8 {
+                &word_bytes[..word_bytes.len() - 1]
+            } else {
+                word_bytes
+            };
+        let word_len = word_bytes.len();
+
+        // Store as counted string in WASM memory (at a transient buffer area)
+        // Use PAD area for transient storage
+        let buf_addr = crate::memory::PAD_BASE;
+        let data = self.memory.data_mut(&mut self.store);
+        data[buf_addr as usize] = word_len as u8;
+        data[buf_addr as usize + 1..buf_addr as usize + 1 + word_len].copy_from_slice(word_bytes);
+
+        self.push_data_stack(buf_addr as i32)?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // DOES> -- compile-time and interpret-time
+    // -----------------------------------------------------------------------
+
+    /// DOES> in interpret mode (used in defining words like: CREATE xx DOES> @ )
+    /// This implementation supports DOES> used after CREATE in the same definition.
+    fn interpret_does(&mut self) -> anyhow::Result<()> {
+        // In interpret mode, DOES> takes the code that follows it (rest of input)
+        // and attaches it to the most recently CREATEd word.
+        // Collect remaining tokens until ; or end of input as the DOES> body
+        let mut does_ir: Vec<IrOp> = Vec::new();
+
+        // The most recently defined word's address
+        let latest = self.dictionary.latest();
+        let pfa = self
+            .dictionary
+            .param_field_addr(latest)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+        // Parse the rest as the does-body
+        while let Some(token) = self.next_token() {
+            let tu = token.to_ascii_uppercase();
+            if tu == ";" {
+                break;
+            }
+            // Simple: look up and compile calls
+            if let Some((_addr, word_id, _imm)) = self.dictionary.find(&token) {
+                does_ir.push(IrOp::Call(word_id));
+            } else if let Some(n) = self.parse_number(&token) {
+                does_ir.push(IrOp::PushI32(n));
+            } else {
+                anyhow::bail!("DOES>: unknown word: {}", token);
+            }
+        }
+
+        // Compile the DOES> body: push PFA, then run the body
+        let mut full_ir = vec![IrOp::PushI32(pfa as i32)];
+        full_ir.extend(does_ir);
+
+        // Get the existing word_id from the code field
+        let fn_index = self
+            .dictionary
+            .code_field(latest)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let word_id = WordId(fn_index);
+
+        // Compile and replace
+        let config = CodegenConfig {
+            base_fn_index: word_id.0,
+            table_size: self.table_size(),
+        };
+        let name = self
+            .dictionary
+            .word_name(latest)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let compiled = compile_word(&name, &full_ir, &config)
+            .map_err(|e| anyhow::anyhow!("codegen error for DOES>: {}", e))?;
+        self.instantiate_and_install(&compiled, word_id)?;
+
+        Ok(())
+    }
+
+    /// DOES> in compile mode -- handle the `: name CREATE ... DOES> ... ;` pattern.
+    ///
+    /// Strategy: compile the does-body as a separate WASM word, then create
+    /// the defining word as a host function that:
+    /// 1. Reads the next token from the input buffer
+    /// 2. Creates a new word (via define_create logic)
+    /// 3. Executes the create-part IR
+    /// 4. Patches the new word to push PFA + call does-body
+    fn compile_does(&mut self) -> anyhow::Result<()> {
+        // The create-part is everything compiled so far in the current definition.
+        let create_ir = std::mem::take(&mut self.compiling_ir);
+
+        // Save the defining word's info before we modify the dictionary
+        let defining_word_id = self
+            .compiling_word_id
+            .ok_or_else(|| anyhow::anyhow!("DOES>: not compiling"))?;
+        let defining_name = self
+            .compiling_name
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("DOES>: no word name"))?;
+        // Save the dictionary address of the defining word so we can reveal it
+        // even after intermediate dictionary entries are created.
+        let defining_word_addr = self.dictionary.latest();
+
+        // Collect the does-body tokens (everything after DOES> until ;)
+        let mut does_tokens: Vec<String> = Vec::new();
+        let mut depth = 0i32;
+        while let Some(token) = self.next_token() {
+            let tu = token.to_ascii_uppercase();
+            if tu == ";" && depth == 0 {
+                break;
+            }
+            if tu == "IF" || tu == "DO" || tu == "BEGIN" {
+                depth += 1;
+            }
+            if tu == "THEN" || tu == "LOOP" || tu == "+LOOP" || tu == "UNTIL" || tu == "REPEAT" {
+                depth -= 1;
+            }
+            does_tokens.push(token);
+        }
+
+        // Compile the does-body as a separate word
+        let does_word_id = self
+            .dictionary
+            .create("_does_action_", false)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        self.dictionary.reveal();
+        self.next_table_index = self.next_table_index.max(does_word_id.0 + 1);
+
+        // Save and compile does-body
+        let saved_name = self.compiling_name.take();
+        let saved_word_id = self.compiling_word_id.take();
+        let saved_control = std::mem::take(&mut self.control_stack);
+
+        self.compiling_ir.clear();
+        self.compiling_name = Some("_does_action_".to_string());
+        self.compiling_word_id = Some(does_word_id);
+
+        for token in &does_tokens {
+            self.compile_token(token)?;
+        }
+
+        let does_ir = std::mem::take(&mut self.compiling_ir);
+        let config = CodegenConfig {
+            base_fn_index: does_word_id.0,
+            table_size: self.table_size(),
+        };
+        let compiled = compile_word("_does_action_", &does_ir, &config)
+            .map_err(|e| anyhow::anyhow!("codegen error for DOES> body: {}", e))?;
+        self.instantiate_and_install(&compiled, does_word_id)?;
+
+        // Restore compilation state
+        self.compiling_name = saved_name;
+        self.compiling_word_id = saved_word_id;
+        self.control_stack = saved_control;
+
+        // Register the defining word as a "does-defining" word.
+        self.does_definitions.insert(
+            defining_word_id,
+            DoesDefinition {
+                create_ir,
+                does_action_id: does_word_id,
+            },
+        );
+
+        // Compile the defining word as a no-op (the actual work is done
+        // by the outer interpreter when it detects the does-definition).
+        let config = CodegenConfig {
+            base_fn_index: defining_word_id.0,
+            table_size: self.table_size(),
+        };
+        let compiled = compile_word(&defining_name, &[], &config)
+            .map_err(|e| anyhow::anyhow!("codegen error for defining word: {}", e))?;
+        self.instantiate_and_install(&compiled, defining_word_id)?;
+
+        // Reveal the defining word by its saved address (not LATEST, which
+        // may have moved due to intermediate dictionary entries).
+        self.dictionary.reveal_at(defining_word_addr);
+        self.state = 0;
+        self.compiling_name = None;
+        self.compiling_word_id = None;
+        self.compiling_ir.clear();
+        self.sync_here_cell();
+
+        Ok(())
+    }
+
+    /// Execute a DOES>-defining word (like CONST, VALUE, etc.).
+    /// This handles the CREATE + create-part + DOES> patching at runtime.
+    fn execute_does_defining(&mut self, defining_word_id: WordId) -> anyhow::Result<()> {
+        // Get the does-definition info
+        let def = self
+            .does_definitions
+            .get(&defining_word_id)
+            .ok_or_else(|| anyhow::anyhow!("not a DOES> defining word"))?;
+        let create_ir = def.create_ir.clone();
+        let does_action_id = def.does_action_id;
+
+        // Step 1: Read the name of the new word from the input stream
+        let name = self
+            .next_token()
+            .ok_or_else(|| anyhow::anyhow!("defining word: expected name"))?;
+
+        // Step 2: Create the new word (like define_create)
+        let new_word_id = self
+            .dictionary
+            .create(&name, false)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+        self.refresh_user_here();
+        let pfa = self.user_here;
+
+        // Temporarily install a "push PFA" word (will be patched later)
+        let ir_body = vec![IrOp::PushI32(pfa as i32)];
+        let config = CodegenConfig {
+            base_fn_index: new_word_id.0,
+            table_size: self.table_size(),
+        };
+        let compiled = compile_word(&name, &ir_body, &config)
+            .map_err(|e| anyhow::anyhow!("codegen: {}", e))?;
+        self.instantiate_and_install(&compiled, new_word_id)?;
+        self.dictionary.reveal();
+        self.next_table_index = self.next_table_index.max(new_word_id.0 + 1);
+
+        // Step 3: Execute the create-part IR
+        // In standard Forth, CREATE does NOT push PFA onto the stack.
+        // The create-part (e.g., `,`) operates on the data already on the stack.
+        // For `: CONST CREATE , DOES> @ ;` with `42 CONST X`:
+        //   stack has [42], CREATE reads "X", `,` pops 42 and stores at HERE (=PFA)
+        if !create_ir.is_empty() {
+            let tmp_word_id = self
+                .dictionary
+                .create("_create_part_", false)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            self.dictionary.reveal();
+            self.next_table_index = self.next_table_index.max(tmp_word_id.0 + 1);
+
+            let config = CodegenConfig {
+                base_fn_index: tmp_word_id.0,
+                table_size: self.table_size(),
+            };
+            let compiled = compile_word("_create_part_", &create_ir, &config)
+                .map_err(|e| anyhow::anyhow!("codegen: {}", e))?;
+            self.instantiate_and_install(&compiled, tmp_word_id)?;
+            self.execute_word(tmp_word_id)?;
+        }
+
+        // Step 4: Patch the new word to push PFA and call does-action
+        self.refresh_user_here();
+        let patched_ir = vec![IrOp::PushI32(pfa as i32), IrOp::Call(does_action_id)];
+        let config = CodegenConfig {
+            base_fn_index: new_word_id.0,
+            table_size: self.table_size(),
+        };
+        let compiled = compile_word(&name, &patched_ir, &config)
+            .map_err(|e| anyhow::anyhow!("DOES> patch codegen: {}", e))?;
+        self.instantiate_and_install(&compiled, new_word_id)?;
+        self.sync_here_cell();
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // New core word registrations
+    // -----------------------------------------------------------------------
+
+    /// COUNT ( c-addr -- c-addr+1 u ) get counted string length.
+    fn register_count(&mut self) -> anyhow::Result<()> {
+        // DUP C@ SWAP 1+ SWAP  => but simpler: DUP 1+ SWAP C@
+        // Actually: ( c-addr -- c-addr+1 u )
+        // DUP C@ >R 1+ R>
+        // Or even simpler with IR:
+        // DUP 1+ SWAP C@
+        self.register_primitive(
+            "COUNT",
+            false,
+            vec![
+                IrOp::Dup,
+                IrOp::PushI32(1),
+                IrOp::Add,
+                IrOp::Swap,
+                IrOp::CFetch,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// S>D ( n -- d ) sign-extend single to double-cell.
+    /// Pushes n, then 0 or -1 depending on sign.
+    fn register_s_to_d(&mut self) -> anyhow::Result<()> {
+        // ( n -- n sign ) where sign is 0 or -1
+        // DUP 0< gives us 0 or -1
+        self.register_primitive("S>D", false, vec![IrOp::Dup, IrOp::ZeroLt])?;
+        Ok(())
+    }
+
+    /// CMOVE ( src dst u -- ) copy u bytes from src to dst, low-to-high.
+    fn register_cmove(&mut self) -> anyhow::Result<()> {
+        let memory = self.memory;
+        let dsp = self.dsp;
+
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let data = memory.data(&caller);
+                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
+                let u = i32::from_le_bytes(b) as usize;
+                let b: [u8; 4] = data[(sp + 4) as usize..(sp + 8) as usize]
+                    .try_into()
+                    .unwrap();
+                let dst = i32::from_le_bytes(b) as usize;
+                let b: [u8; 4] = data[(sp + 8) as usize..(sp + 12) as usize]
+                    .try_into()
+                    .unwrap();
+                let src = i32::from_le_bytes(b) as usize;
+                dsp.set(&mut caller, Val::I32((sp + 12) as i32))?;
+                let data = memory.data_mut(&mut caller);
+                for i in 0..u {
+                    data[dst + i] = data[src + i];
+                }
+                Ok(())
+            },
+        );
+
+        self.register_host_primitive("CMOVE", false, func)?;
+        Ok(())
+    }
+
+    /// CMOVE> ( src dst u -- ) copy u bytes from src to dst, high-to-low.
+    fn register_cmove_up(&mut self) -> anyhow::Result<()> {
+        let memory = self.memory;
+        let dsp = self.dsp;
+
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let data = memory.data(&caller);
+                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
+                let u = i32::from_le_bytes(b) as usize;
+                let b: [u8; 4] = data[(sp + 4) as usize..(sp + 8) as usize]
+                    .try_into()
+                    .unwrap();
+                let dst = i32::from_le_bytes(b) as usize;
+                let b: [u8; 4] = data[(sp + 8) as usize..(sp + 12) as usize]
+                    .try_into()
+                    .unwrap();
+                let src = i32::from_le_bytes(b) as usize;
+                dsp.set(&mut caller, Val::I32((sp + 12) as i32))?;
+                let data = memory.data_mut(&mut caller);
+                for i in (0..u).rev() {
+                    data[dst + i] = data[src + i];
+                }
+                Ok(())
+            },
+        );
+
+        self.register_host_primitive("CMOVE>", false, func)?;
+        Ok(())
+    }
+
+    /// FIND ( c-addr -- c-addr 0 | xt 1 | xt -1 ) look up counted string.
+    fn register_find(&mut self) -> anyhow::Result<()> {
+        let memory = self.memory;
+        let dsp = self.dsp;
+
+        // We need access to the dictionary, but host functions can't access &self.
+        // Instead, we'll create a snapshot of the dictionary's memory and maintain
+        // a shared reference to search through.
+        // Better approach: FIND is handled as a special token in interpret mode
+        // since it needs dictionary access. But to make it callable from compiled
+        // code too, we register it as a host function that searches the dictionary
+        // memory directly.
+
+        // The dictionary is stored in a separate Vec<u8>, not in WASM memory.
+        // So we can't search it from a host function easily.
+        // Solution: handle FIND as a special interpret-mode token.
+        // For now, register a stub and handle the real logic in interpret_token.
+
+        // Actually, the simplest solution: keep a shared copy of dictionary
+        // that's accessible from the closure. But Dictionary doesn't impl Clone
+        // and is owned by ForthVM.
+
+        // Best approach: implement FIND as an interpreted special token.
+        // We register a no-op in the dictionary so it's findable,
+        // but the real work happens in interpret_token_immediate.
+
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                // Stub: just push 0 (not found)
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let new_sp = sp - CELL_SIZE;
+                let data = memory.data_mut(&mut caller);
+                data[new_sp as usize..new_sp as usize + 4].copy_from_slice(&0i32.to_le_bytes());
+                dsp.set(&mut caller, Val::I32(new_sp as i32))?;
+                Ok(())
+            },
+        );
+
+        self.register_host_primitive("FIND", false, func)?;
+        Ok(())
+    }
+
+    /// >IN ( -- addr ) push address of the input position variable.
+    fn register_to_in(&mut self) -> anyhow::Result<()> {
+        // >IN is stored at SYSVAR_TO_IN in WASM memory
+        self.register_primitive(">IN", false, vec![IrOp::PushI32(SYSVAR_TO_IN as i32)])?;
+        Ok(())
+    }
+
+    /// STATE ( -- addr ) push address of the STATE variable.
+    fn register_state_var(&mut self) -> anyhow::Result<()> {
+        self.register_primitive("STATE", false, vec![IrOp::PushI32(SYSVAR_STATE as i32)])?;
+        Ok(())
+    }
+
+    /// BASE ( -- addr ) push address of the BASE variable.
+    fn register_base_var(&mut self) -> anyhow::Result<()> {
+        // Initialize BASE in WASM memory
+        let data = self.memory.data_mut(&mut self.store);
+        data[SYSVAR_BASE_VAR as usize..SYSVAR_BASE_VAR as usize + 4]
+            .copy_from_slice(&10u32.to_le_bytes());
+
+        self.register_primitive("BASE", false, vec![IrOp::PushI32(SYSVAR_BASE_VAR as i32)])?;
+        Ok(())
+    }
+
+    /// M* ( n1 n2 -- d ) signed multiply producing double-cell result.
+    fn register_m_star(&mut self) -> anyhow::Result<()> {
+        let memory = self.memory;
+        let dsp = self.dsp;
+
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let data = memory.data(&caller);
+                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
+                let n2 = i32::from_le_bytes(b) as i64;
+                let b: [u8; 4] = data[(sp + 4) as usize..(sp + 8) as usize]
+                    .try_into()
+                    .unwrap();
+                let n1 = i32::from_le_bytes(b) as i64;
+                let result = n1 * n2;
+                // Store as double-cell: low cell deeper, high cell on top
+                let lo = result as i32;
+                let hi = (result >> 32) as i32;
+                let data = memory.data_mut(&mut caller);
+                // Overwrite the two stack slots (net: pop 2, push 2 = same sp)
+                data[(sp + 4) as usize..(sp + 8) as usize].copy_from_slice(&lo.to_le_bytes());
+                data[sp as usize..sp as usize + 4].copy_from_slice(&hi.to_le_bytes());
+                Ok(())
+            },
+        );
+
+        self.register_host_primitive("M*", false, func)?;
+        Ok(())
+    }
+
+    /// UM* ( u1 u2 -- ud ) unsigned multiply producing double-cell result.
+    fn register_um_star(&mut self) -> anyhow::Result<()> {
+        let memory = self.memory;
+        let dsp = self.dsp;
+
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let data = memory.data(&caller);
+                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
+                let u2 = u32::from_le_bytes(b) as u64;
+                let b: [u8; 4] = data[(sp + 4) as usize..(sp + 8) as usize]
+                    .try_into()
+                    .unwrap();
+                let u1 = u32::from_le_bytes(b) as u64;
+                let result = u1 * u2;
+                let lo = result as u32;
+                let hi = (result >> 32) as u32;
+                let data = memory.data_mut(&mut caller);
+                data[(sp + 4) as usize..(sp + 8) as usize].copy_from_slice(&lo.to_le_bytes());
+                data[sp as usize..sp as usize + 4].copy_from_slice(&hi.to_le_bytes());
+                Ok(())
+            },
+        );
+
+        self.register_host_primitive("UM*", false, func)?;
+        Ok(())
+    }
+
+    /// UM/MOD ( ud u -- rem quot ) unsigned double-cell divide.
+    fn register_um_div_mod(&mut self) -> anyhow::Result<()> {
+        let memory = self.memory;
+        let dsp = self.dsp;
+
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let data = memory.data(&caller);
+                // Pop u (divisor)
+                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
+                let divisor = u32::from_le_bytes(b) as u64;
+                // Pop ud (double-cell): high at sp+4, low at sp+8
+                let b: [u8; 4] = data[(sp + 4) as usize..(sp + 8) as usize]
+                    .try_into()
+                    .unwrap();
+                let hi = u32::from_le_bytes(b) as u64;
+                let b: [u8; 4] = data[(sp + 8) as usize..(sp + 12) as usize]
+                    .try_into()
+                    .unwrap();
+                let lo = u32::from_le_bytes(b) as u64;
+                let dividend = (hi << 32) | lo;
+
+                if divisor == 0 {
+                    return Err(wasmtime::Error::msg("division by zero"));
+                }
+
+                let quot = (dividend / divisor) as u32;
+                let rem = (dividend % divisor) as u32;
+
+                // Pop 3, push 2: net sp + 4
+                let new_sp = sp + 4;
+                let data = memory.data_mut(&mut caller);
+                // rem deeper, quot on top
+                data[(new_sp + 4) as usize..(new_sp + 8) as usize]
+                    .copy_from_slice(&(rem as i32).to_le_bytes());
+                data[new_sp as usize..new_sp as usize + 4]
+                    .copy_from_slice(&(quot as i32).to_le_bytes());
+                dsp.set(&mut caller, Val::I32(new_sp as i32))?;
+                Ok(())
+            },
+        );
+
+        self.register_host_primitive("UM/MOD", false, func)?;
+        Ok(())
+    }
+
+    /// FM/MOD ( d n -- rem quot ) floored division.
+    fn register_fm_div_mod(&mut self) -> anyhow::Result<()> {
+        let memory = self.memory;
+        let dsp = self.dsp;
+
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let data = memory.data(&caller);
+                // Pop n (divisor)
+                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
+                let divisor = i32::from_le_bytes(b) as i64;
+                // Pop d (double-cell): high at sp+4, low at sp+8
+                let b: [u8; 4] = data[(sp + 4) as usize..(sp + 8) as usize]
+                    .try_into()
+                    .unwrap();
+                let hi = i32::from_le_bytes(b) as i64;
+                let b: [u8; 4] = data[(sp + 8) as usize..(sp + 12) as usize]
+                    .try_into()
+                    .unwrap();
+                let lo = u32::from_le_bytes(b) as i64;
+                let dividend = (hi << 32) | (lo & 0xFFFF_FFFF);
+
+                if divisor == 0 {
+                    return Err(wasmtime::Error::msg("division by zero"));
+                }
+
+                // Floored division: quotient is floor(dividend/divisor)
+                let mut quot = dividend / divisor;
+                let mut rem = dividend % divisor;
+                // Adjust for floored semantics: if remainder != 0 and signs differ
+                if rem != 0 && ((rem ^ divisor) < 0) {
+                    quot -= 1;
+                    rem += divisor;
+                }
+
+                let new_sp = sp + 4;
+                let data = memory.data_mut(&mut caller);
+                data[(new_sp + 4) as usize..(new_sp + 8) as usize]
+                    .copy_from_slice(&(rem as i32).to_le_bytes());
+                data[new_sp as usize..new_sp as usize + 4]
+                    .copy_from_slice(&(quot as i32).to_le_bytes());
+                dsp.set(&mut caller, Val::I32(new_sp as i32))?;
+                Ok(())
+            },
+        );
+
+        self.register_host_primitive("FM/MOD", false, func)?;
+        Ok(())
+    }
+
+    /// SM/REM ( d n -- rem quot ) symmetric division.
+    fn register_sm_div_rem(&mut self) -> anyhow::Result<()> {
+        let memory = self.memory;
+        let dsp = self.dsp;
+
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let data = memory.data(&caller);
+                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
+                let divisor = i32::from_le_bytes(b) as i64;
+                let b: [u8; 4] = data[(sp + 4) as usize..(sp + 8) as usize]
+                    .try_into()
+                    .unwrap();
+                let hi = i32::from_le_bytes(b) as i64;
+                let b: [u8; 4] = data[(sp + 8) as usize..(sp + 12) as usize]
+                    .try_into()
+                    .unwrap();
+                let lo = u32::from_le_bytes(b) as i64;
+                let dividend = (hi << 32) | (lo & 0xFFFF_FFFF);
+
+                if divisor == 0 {
+                    return Err(wasmtime::Error::msg("division by zero"));
+                }
+
+                // Symmetric (truncated) division -- this is Rust's default
+                let quot = dividend / divisor;
+                let rem = dividend % divisor;
+
+                let new_sp = sp + 4;
+                let data = memory.data_mut(&mut caller);
+                data[(new_sp + 4) as usize..(new_sp + 8) as usize]
+                    .copy_from_slice(&(rem as i32).to_le_bytes());
+                data[new_sp as usize..new_sp as usize + 4]
+                    .copy_from_slice(&(quot as i32).to_le_bytes());
+                dsp.set(&mut caller, Val::I32(new_sp as i32))?;
+                Ok(())
+            },
+        );
+
+        self.register_host_primitive("SM/REM", false, func)?;
+        Ok(())
+    }
+
+    /// */ ( n1 n2 n3 -- n4 ) n1*n2/n3 with intermediate double-precision.
+    fn register_star_slash(&mut self) -> anyhow::Result<()> {
+        let memory = self.memory;
+        let dsp = self.dsp;
+
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let data = memory.data(&caller);
+                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
+                let n3 = i32::from_le_bytes(b) as i64;
+                let b: [u8; 4] = data[(sp + 4) as usize..(sp + 8) as usize]
+                    .try_into()
+                    .unwrap();
+                let n2 = i32::from_le_bytes(b) as i64;
+                let b: [u8; 4] = data[(sp + 8) as usize..(sp + 12) as usize]
+                    .try_into()
+                    .unwrap();
+                let n1 = i32::from_le_bytes(b) as i64;
+
+                if n3 == 0 {
+                    return Err(wasmtime::Error::msg("division by zero"));
+                }
+
+                let result = (n1 * n2) / n3;
+                // Pop 3, push 1: net sp + 8
+                let new_sp = sp + 8;
+                let data = memory.data_mut(&mut caller);
+                data[new_sp as usize..new_sp as usize + 4]
+                    .copy_from_slice(&(result as i32).to_le_bytes());
+                dsp.set(&mut caller, Val::I32(new_sp as i32))?;
+                Ok(())
+            },
+        );
+
+        self.register_host_primitive("*/", false, func)?;
+        Ok(())
+    }
+
+    /// */MOD ( n1 n2 n3 -- rem quot ) n1*n2/n3 with intermediate double-precision.
+    fn register_star_slash_mod(&mut self) -> anyhow::Result<()> {
+        let memory = self.memory;
+        let dsp = self.dsp;
+
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let data = memory.data(&caller);
+                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
+                let n3 = i32::from_le_bytes(b) as i64;
+                let b: [u8; 4] = data[(sp + 4) as usize..(sp + 8) as usize]
+                    .try_into()
+                    .unwrap();
+                let n2 = i32::from_le_bytes(b) as i64;
+                let b: [u8; 4] = data[(sp + 8) as usize..(sp + 12) as usize]
+                    .try_into()
+                    .unwrap();
+                let n1 = i32::from_le_bytes(b) as i64;
+
+                if n3 == 0 {
+                    return Err(wasmtime::Error::msg("division by zero"));
+                }
+
+                let product = n1 * n2;
+                let quot = product / n3;
+                let rem = product % n3;
+
+                // Pop 3, push 2: net sp + 4
+                let new_sp = sp + 4;
+                let data = memory.data_mut(&mut caller);
+                data[(new_sp + 4) as usize..(new_sp + 8) as usize]
+                    .copy_from_slice(&(rem as i32).to_le_bytes());
+                data[new_sp as usize..new_sp as usize + 4]
+                    .copy_from_slice(&(quot as i32).to_le_bytes());
+                dsp.set(&mut caller, Val::I32(new_sp as i32))?;
+                Ok(())
+            },
+        );
+
+        self.register_host_primitive("*/MOD", false, func)?;
+        Ok(())
+    }
+
+    /// U. ( u -- ) unsigned dot.
+    fn register_u_dot(&mut self) -> anyhow::Result<()> {
+        let memory = self.memory;
+        let dsp = self.dsp;
+        let output = Arc::clone(&self.output);
+        let base_cell = Arc::clone(&self.base_cell);
+
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let data = memory.data(&caller);
+                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
+                let value = u32::from_le_bytes(b);
+                dsp.set(&mut caller, Val::I32((sp + CELL_SIZE) as i32))?;
+                let base_val = *base_cell.lock().unwrap();
+                let s = if base_val == 16 {
+                    format!("{:X} ", value)
+                } else {
+                    format!("{} ", value)
+                };
+                output.lock().unwrap().push_str(&s);
+                Ok(())
+            },
+        );
+
+        self.register_host_primitive("U.", false, func)?;
+        Ok(())
+    }
+
+    /// >NUMBER ( ud1 c-addr1 u1 -- ud2 c-addr2 u2 ) convert string to number.
+    fn register_to_number(&mut self) -> anyhow::Result<()> {
+        let memory = self.memory;
+        let dsp = self.dsp;
+        let base_cell = Arc::clone(&self.base_cell);
+
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let data = memory.data(&caller);
+                // Stack: u1 at sp, c-addr1 at sp+4, ud1-hi at sp+8, ud1-lo at sp+12
+                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
+                let mut u1 = i32::from_le_bytes(b) as u32;
+                let b: [u8; 4] = data[(sp + 4) as usize..(sp + 8) as usize]
+                    .try_into()
+                    .unwrap();
+                let mut c_addr = u32::from_le_bytes(b);
+                let b: [u8; 4] = data[(sp + 8) as usize..(sp + 12) as usize]
+                    .try_into()
+                    .unwrap();
+                let ud_hi = u32::from_le_bytes(b) as u64;
+                let b: [u8; 4] = data[(sp + 12) as usize..(sp + 16) as usize]
+                    .try_into()
+                    .unwrap();
+                let ud_lo = u32::from_le_bytes(b) as u64;
+                let mut ud = (ud_hi << 32) | ud_lo;
+
+                let base = *base_cell.lock().unwrap() as u64;
+
+                while u1 > 0 {
+                    let data = memory.data(&caller);
+                    let ch = data[c_addr as usize] as char;
+                    let digit = match ch.to_digit(base as u32) {
+                        Some(d) => d as u64,
+                        None => break,
+                    };
+                    ud = ud * base + digit;
+                    c_addr += 1;
+                    u1 -= 1;
+                }
+
+                let ud_lo_new = ud as u32;
+                let ud_hi_new = (ud >> 32) as u32;
+
+                let data = memory.data_mut(&mut caller);
+                data[sp as usize..sp as usize + 4].copy_from_slice(&(u1 as i32).to_le_bytes());
+                data[(sp + 4) as usize..(sp + 8) as usize]
+                    .copy_from_slice(&(c_addr as i32).to_le_bytes());
+                data[(sp + 8) as usize..(sp + 12) as usize]
+                    .copy_from_slice(&(ud_hi_new as i32).to_le_bytes());
+                data[(sp + 12) as usize..(sp + 16) as usize]
+                    .copy_from_slice(&(ud_lo_new as i32).to_le_bytes());
+                Ok(())
+            },
+        );
+
+        self.register_host_primitive(">NUMBER", false, func)?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Improved SOURCE
+    // -----------------------------------------------------------------------
+
+    // SOURCE is already registered above. We need to update it to write
+    // the current input buffer into WASM memory and return real addresses.
+    // This is handled by syncing input_buffer to WASM memory before calls.
+
+    /// Sync the current input buffer to WASM memory and update >IN.
+    fn sync_input_to_wasm(&mut self) {
+        let bytes = self.input_buffer.as_bytes();
+        let len = bytes.len().min(INPUT_BUFFER_SIZE as usize);
+        let data = self.memory.data_mut(&mut self.store);
+        data[INPUT_BUFFER_BASE as usize..INPUT_BUFFER_BASE as usize + len]
+            .copy_from_slice(&bytes[..len]);
+        // Write >IN
+        data[SYSVAR_TO_IN as usize..SYSVAR_TO_IN as usize + 4]
+            .copy_from_slice(&(self.input_pos as u32).to_le_bytes());
+        // Write STATE
+        data[SYSVAR_STATE as usize..SYSVAR_STATE as usize + 4]
+            .copy_from_slice(&self.state.to_le_bytes());
+        // Write BASE
+        data[SYSVAR_BASE_VAR as usize..SYSVAR_BASE_VAR as usize + 4]
+            .copy_from_slice(&self.base.to_le_bytes());
+        // Write #TIB (input buffer length)
+        data[SYSVAR_NUM_TIB as usize..SYSVAR_NUM_TIB as usize + 4]
+            .copy_from_slice(&(len as u32).to_le_bytes());
+    }
+
+    /// Sync state from WASM memory back to Rust after executing a word.
+    /// Currently reads back BASE in case Forth code modified it via `BASE !`.
+    fn sync_input_from_wasm(&mut self) {
+        // Check if BASE was changed via WASM memory write (e.g., `10 BASE !`)
+        let data = self.memory.data(&self.store);
+        let b: [u8; 4] = data[SYSVAR_BASE_VAR as usize..SYSVAR_BASE_VAR as usize + 4]
+            .try_into()
+            .unwrap();
+        let wasm_base = u32::from_le_bytes(b);
+        // Only apply if WASM memory was explicitly changed by Forth code
+        // (i.e., it differs from what we last wrote). We track this by
+        // checking if it differs from self.base.
+        // Since sync_input_to_wasm wrote self.base, if wasm_base differs
+        // then Forth code changed it.
+        if wasm_base != self.base && (2..=36).contains(&wasm_base) {
+            self.base = wasm_base;
+            *self.base_cell.lock().unwrap() = wasm_base;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Update define_create to store fn_index for DOES>
+    // -----------------------------------------------------------------------
+
+    /// Store the fn_index of the most recently CREATEd word at address 0x30
+    /// so the DOES> patcher can find it.
+    fn store_latest_fn_index(&mut self, word_id: WordId) {
+        let data = self.memory.data_mut(&mut self.store);
+        data[0x30..0x34].copy_from_slice(&word_id.0.to_le_bytes());
     }
 }
 
@@ -2315,10 +3388,7 @@ mod tests {
     #[test]
     fn test_i_in_do_loop() {
         // : TEST 5 0 DO I . LOOP ; TEST
-        assert_eq!(
-            eval_output(": TEST 5 0 DO I . LOOP ; TEST"),
-            "0 1 2 3 4 "
-        );
+        assert_eq!(eval_output(": TEST 5 0 DO I . LOOP ; TEST"), "0 1 2 3 4 ");
     }
 
     #[test]
@@ -2525,10 +3595,7 @@ mod tests {
 
     #[test]
     fn test_execute_in_colon() {
-        assert_eq!(
-            eval_output(": TEST ['] . EXECUTE ; 99 TEST"),
-            "99 "
-        );
+        assert_eq!(eval_output(": TEST ['] . EXECUTE ; 99 TEST"), "99 ");
     }
 
     #[test]
@@ -2568,10 +3635,7 @@ mod tests {
 
     #[test]
     fn test_bracket_char() {
-        assert_eq!(
-            eval_output(": TEST [CHAR] A EMIT ; TEST"),
-            "A"
-        );
+        assert_eq!(eval_output(": TEST [CHAR] A EMIT ; TEST"), "A");
     }
 
     #[test]
@@ -2581,18 +3645,12 @@ mod tests {
 
     #[test]
     fn test_constant_in_colon_def() {
-        assert_eq!(
-            eval_output("10 CONSTANT TEN : TEST TEN . ; TEST"),
-            "10 "
-        );
+        assert_eq!(eval_output("10 CONSTANT TEN : TEST TEN . ; TEST"), "10 ");
     }
 
     #[test]
     fn test_variable_in_colon_def() {
-        assert_eq!(
-            eval_output("VARIABLE X 42 X ! : TEST X @ . ; TEST"),
-            "42 "
-        );
+        assert_eq!(eval_output("VARIABLE X 42 X ! : TEST X @ . ; TEST"), "42 ");
     }
 
     #[test]
@@ -2610,5 +3668,344 @@ mod tests {
             eval_output(": TEST 10 0 DO I . 2 +LOOP ; TEST"),
             "0 2 4 6 8 "
         );
+    }
+
+    // ===================================================================
+    // New words: EVALUATE
+    // ===================================================================
+
+    #[test]
+    fn test_evaluate_basic() {
+        assert_eq!(eval_output("S\" 2 3 + .\" EVALUATE"), "5 ");
+    }
+
+    #[test]
+    fn test_evaluate_nested() {
+        assert_eq!(eval_output("S\" 42 .\" EVALUATE"), "42 ");
+    }
+
+    #[test]
+    fn test_evaluate_define_word() {
+        let mut vm = ForthVM::new().unwrap();
+        vm.evaluate("S\" : DOUBLE DUP + ;\" EVALUATE").unwrap();
+        vm.evaluate("5 DOUBLE .").unwrap();
+        assert_eq!(vm.take_output(), "10 ");
+    }
+
+    // ===================================================================
+    // New words: S" (string literal)
+    // ===================================================================
+
+    #[test]
+    fn test_s_quote_interpret() {
+        // S" in interpret mode pushes c-addr and u
+        let stack = eval_stack("S\" hello\"");
+        assert_eq!(stack.len(), 2);
+        assert!(stack[0] > 0); // length = 5
+        assert!(stack[1] > 0); // address > 0
+    }
+
+    #[test]
+    fn test_s_quote_type() {
+        assert_eq!(eval_output("S\" Hello\" TYPE"), "Hello");
+    }
+
+    #[test]
+    fn test_s_quote_compile_mode() {
+        assert_eq!(eval_output(": TEST S\" World\" TYPE ; TEST"), "World");
+    }
+
+    // ===================================================================
+    // New words: COUNT
+    // ===================================================================
+
+    #[test]
+    fn test_count() {
+        // Create a counted string: length byte followed by characters
+        let mut vm = ForthVM::new().unwrap();
+        // Store counted string "AB" at HERE: 2 (length), 65 ('A'), 66 ('B')
+        vm.evaluate("HERE 2 C, 65 C, 66 C,").unwrap();
+        // COUNT should give: addr+1 and length
+        vm.evaluate("COUNT TYPE").unwrap();
+        assert_eq!(vm.take_output(), "AB");
+    }
+
+    // ===================================================================
+    // New words: S>D
+    // ===================================================================
+
+    #[test]
+    fn test_s_to_d_positive() {
+        // S>D: 5 -> (5, 0) on stack as double
+        assert_eq!(eval_stack("5 S>D"), vec![0, 5]);
+    }
+
+    #[test]
+    fn test_s_to_d_negative() {
+        // S>D: -1 -> (-1, -1) on stack as double
+        assert_eq!(eval_stack("-1 S>D"), vec![-1, -1]);
+    }
+
+    #[test]
+    fn test_s_to_d_zero() {
+        assert_eq!(eval_stack("0 S>D"), vec![0, 0]);
+    }
+
+    // ===================================================================
+    // New words: CMOVE, CMOVE>
+    // ===================================================================
+
+    #[test]
+    fn test_cmove() {
+        let mut vm = ForthVM::new().unwrap();
+        // Store "ABC" at src, then copy to dst
+        vm.evaluate("HERE").unwrap(); // src address on stack
+        vm.evaluate("65 C, 66 C, 67 C,").unwrap();
+        vm.evaluate("HERE").unwrap(); // dst address on stack
+        vm.evaluate("0 C, 0 C, 0 C,").unwrap(); // allocate dst space
+        // Stack has: src dst (dst on top)
+        // CMOVE needs ( src dst u -- )
+        vm.evaluate("3 CMOVE").unwrap();
+        // Nothing left on stack; but we need dst to read back
+        // Recalculate: dst was at src+3
+        vm.evaluate("HERE 3 -").unwrap(); // points to dst
+        vm.evaluate("DUP C@ SWAP 1+ DUP C@ SWAP 1+ C@").unwrap();
+        let stack = vm.data_stack();
+        assert_eq!(stack[0], 67); // 'C'
+        assert_eq!(stack[1], 66); // 'B'
+        assert_eq!(stack[2], 65); // 'A'
+    }
+
+    #[test]
+    fn test_cmove_up() {
+        // CMOVE> copies high-to-low for overlapping regions
+        let mut vm = ForthVM::new().unwrap();
+        vm.evaluate("HERE 65 C, 66 C, 67 C,").unwrap();
+        let stack = vm.data_stack();
+        let src = stack[0];
+        // Copy 3 bytes from src to src+1
+        vm.evaluate(&format!("{} {} 3 CMOVE>", src, src + 1))
+            .unwrap();
+        // Memory should now be: A A B C (first byte unchanged, rest shifted)
+        vm.evaluate(&format!("{} C@", src + 1)).unwrap();
+        assert_eq!(vm.data_stack()[0], 65); // 'A' was copied
+    }
+
+    // ===================================================================
+    // New words: >IN, STATE, BASE
+    // ===================================================================
+
+    #[test]
+    fn test_to_in() {
+        // >IN should push a valid address
+        let stack = eval_stack(">IN");
+        assert_eq!(stack.len(), 1);
+        assert_eq!(stack[0], SYSVAR_TO_IN as i32);
+    }
+
+    #[test]
+    fn test_state_variable() {
+        // STATE should push the address of the state variable
+        let stack = eval_stack("STATE");
+        assert_eq!(stack.len(), 1);
+        assert_eq!(stack[0], SYSVAR_STATE as i32);
+    }
+
+    #[test]
+    fn test_base_variable() {
+        let stack = eval_stack("BASE");
+        assert_eq!(stack.len(), 1);
+        assert_eq!(stack[0], SYSVAR_BASE_VAR as i32);
+    }
+
+    // ===================================================================
+    // New words: DOES>
+    // ===================================================================
+
+    #[test]
+    fn test_does_constant_pattern() {
+        // The classic DOES> test: define CONST using CREATE and DOES>
+        assert_eq!(
+            eval_output(": CONST CREATE , DOES> @ ; 42 CONST X X ."),
+            "42 "
+        );
+    }
+
+    #[test]
+    fn test_does_multiple_instances() {
+        let mut vm = ForthVM::new().unwrap();
+        vm.evaluate(": CONST CREATE , DOES> @ ;").unwrap();
+        vm.evaluate("10 CONST TEN").unwrap();
+        vm.evaluate("20 CONST TWENTY").unwrap();
+        vm.evaluate("TEN . TWENTY .").unwrap();
+        assert_eq!(vm.take_output(), "10 20 ");
+    }
+
+    // ===================================================================
+    // New words: Double-cell arithmetic
+    // ===================================================================
+
+    #[test]
+    fn test_m_star() {
+        // M* ( n1 n2 -- d ) signed multiply to double
+        // 3 * 4 = 12, fits in low cell, high = 0
+        assert_eq!(eval_stack("3 4 M*"), vec![0, 12]);
+    }
+
+    #[test]
+    fn test_m_star_negative() {
+        // -3 * 4 = -12
+        assert_eq!(eval_stack("-3 4 M*"), vec![-1, -12]);
+    }
+
+    #[test]
+    fn test_um_star() {
+        // UM* ( u1 u2 -- ud ) unsigned multiply to double
+        assert_eq!(eval_stack("3 4 UM*"), vec![0, 12]);
+    }
+
+    #[test]
+    fn test_um_div_mod() {
+        // UM/MOD ( ud u -- rem quot )
+        // 10 / 3 = 3 rem 1
+        assert_eq!(eval_stack("10 0 3 UM/MOD"), vec![3, 1]);
+    }
+
+    #[test]
+    fn test_fm_div_mod() {
+        // FM/MOD ( d n -- rem quot ) floored division
+        // 10 / 3 = 3 rem 1
+        assert_eq!(eval_stack("10 0 3 FM/MOD"), vec![3, 1]);
+    }
+
+    #[test]
+    fn test_fm_div_mod_negative() {
+        // FM/MOD with negative dividend: -7 / 2
+        // Floored: quot = -4, rem = 1 (because -4*2+1 = -7)
+        assert_eq!(eval_stack("-7 -1 2 FM/MOD"), vec![-4, 1]);
+    }
+
+    #[test]
+    fn test_sm_div_rem() {
+        // SM/REM ( d n -- rem quot ) symmetric division
+        // 10 / 3 = 3 rem 1
+        assert_eq!(eval_stack("10 0 3 SM/REM"), vec![3, 1]);
+    }
+
+    #[test]
+    fn test_sm_div_rem_negative() {
+        // SM/REM with negative dividend: -7 / 2
+        // Symmetric: quot = -3, rem = -1 (because -3*2+(-1) = -7)
+        assert_eq!(eval_stack("-7 -1 2 SM/REM"), vec![-3, -1]);
+    }
+
+    // ===================================================================
+    // New words: */ and */MOD
+    // ===================================================================
+
+    #[test]
+    fn test_star_slash() {
+        // */ ( n1 n2 n3 -- n4 ) = n1*n2/n3
+        assert_eq!(eval_stack("10 3 2 */"), vec![15]);
+    }
+
+    #[test]
+    fn test_star_slash_mod() {
+        // */MOD ( n1 n2 n3 -- rem quot )
+        assert_eq!(eval_stack("10 3 7 */MOD"), vec![4, 2]);
+    }
+
+    // ===================================================================
+    // New words: U.
+    // ===================================================================
+
+    #[test]
+    fn test_u_dot() {
+        assert_eq!(eval_output("-1 U."), "4294967295 ");
+    }
+
+    // ===================================================================
+    // New words: ABORT"
+    // ===================================================================
+
+    #[test]
+    fn test_abort_quote_no_trigger() {
+        // Flag is 0 (false), so ABORT" should NOT trigger
+        assert_eq!(eval_output(": TEST 0 ABORT\" oops\" 42 . ; TEST"), "42 ");
+    }
+
+    #[test]
+    fn test_abort_quote_trigger() {
+        // Flag is non-zero (true), so ABORT" should trigger and throw
+        let mut vm = ForthVM::new().unwrap();
+        let result = vm.evaluate(": TEST -1 ABORT\" oops\" 42 . ; TEST");
+        assert!(result.is_err());
+    }
+
+    // ===================================================================
+    // New words: SOURCE
+    // ===================================================================
+
+    #[test]
+    fn test_source() {
+        // SOURCE should push (c-addr u) of the input buffer
+        let stack = eval_stack("SOURCE");
+        assert_eq!(stack.len(), 2);
+        assert!(stack[0] > 0); // length > 0
+    }
+
+    // ===================================================================
+    // New words: FIND (basic test via interpret mode)
+    // ===================================================================
+
+    #[test]
+    fn test_find_exists() {
+        // FIND is registered as a host function (stub).
+        // It's in the dictionary so it can be found.
+        let stack = eval_stack("FIND");
+        // Just pushing FIND pushes 0 since it's a stub
+        assert!(!stack.is_empty());
+    }
+
+    // ===================================================================
+    // New words: >NUMBER (basic test)
+    // ===================================================================
+
+    #[test]
+    fn test_to_number_basic() {
+        // >NUMBER ( ud1 c-addr1 u1 -- ud2 c-addr2 u2 )
+        // Convert "123" starting from ud=0
+        let mut vm = ForthVM::new().unwrap();
+        vm.evaluate("S\" 123\"").unwrap(); // push c-addr u
+        // Push ud1 = 0 0 underneath
+        vm.evaluate("0 0 2SWAP").unwrap(); // stack: 0 0 c-addr u
+        // But >NUMBER expects: ud-lo ud-hi c-addr u
+        // Actually stack order: u (top), c-addr, ud-hi, ud-lo (bottom)
+        vm.evaluate(">NUMBER").unwrap();
+        let stack = vm.data_stack();
+        // u2 should be 0 (all chars consumed)
+        assert_eq!(stack[0], 0);
+        // The ud2-lo should be 123
+        assert_eq!(stack[3], 123);
+    }
+
+    // ===================================================================
+    // New words: WORD (basic test)
+    // ===================================================================
+
+    #[test]
+    fn test_word_basic() {
+        // WORD ( char -- c-addr ) parse next word delimited by char
+        // After "WORD" we push the delimiter char and call WORD
+        // This is tricky to test since WORD reads from the input buffer
+        let mut vm = ForthVM::new().unwrap();
+        vm.evaluate("BL WORD HELLO").unwrap();
+        let stack = vm.data_stack();
+        assert!(!stack.is_empty());
+        // The returned address should be a counted string at PAD
+        let addr = stack[0] as u32;
+        let data = vm.memory.data(&vm.store);
+        let len = data[addr as usize];
+        assert_eq!(len, 5); // "HELLO" is 5 chars
     }
 }

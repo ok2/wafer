@@ -97,21 +97,24 @@ tests/        Forth 2012 compliance suite (gerryjackson/forth2012-test-suite sub
 
 ### Core (Forth 2012 Section 6.1) -- In Progress
 
-**Stack:** DUP DROP SWAP OVER ROT NIP TUCK 2DUP 2DROP 2SWAP 2OVER ?DUP PICK DEPTH
-**Arithmetic:** + - * / MOD /MOD NEGATE ABS MIN MAX 1+ 1- 2* 2/
-**Comparison:** = <> < > U< 0= 0< 0<> 0> WITHIN
-**Logic:** AND OR XOR INVERT LSHIFT RSHIFT
-**Memory:** @ ! C@ C! +! HERE ALLOT , C, CELLS CELL+ CHARS CHAR+ ALIGNED ALIGN MOVE FILL
-**Control (compile-time):** IF ELSE THEN DO LOOP +LOOP I J UNLOOP LEAVE BEGIN UNTIL WHILE REPEAT RECURSE EXIT
-**Defining:** : ; VARIABLE CONSTANT CREATE IMMEDIATE
-**I/O:** . .S CR EMIT SPACE SPACES TYPE ." S"
-**Return stack:** >R R> R@
-**System:** EXECUTE ' CHAR [CHAR] ['] DECIMAL HEX BASE >BODY ENVIRONMENT? SOURCE ABORT TRUE FALSE BL
-**Compiler:** LITERAL POSTPONE [ ]
+| Category | Words |
+|----------|-------|
+| Stack | `DUP DROP SWAP OVER ROT NIP TUCK 2DUP 2DROP 2SWAP 2OVER ?DUP PICK DEPTH` |
+| Arithmetic | `+ - * / MOD /MOD NEGATE ABS MIN MAX 1+ 1- 2* 2/ */ */MOD M* UM* UM/MOD FM/MOD SM/REM S>D` |
+| Comparison | `= <> < > U< 0= 0< 0<> 0> WITHIN` |
+| Logic | `AND OR XOR INVERT LSHIFT RSHIFT` |
+| Memory | `@ ! C@ C! +! HERE ALLOT , C, CELLS CELL+ CHARS CHAR+ ALIGNED ALIGN MOVE FILL CMOVE CMOVE>` |
+| Control | `IF ELSE THEN DO LOOP +LOOP I J UNLOOP LEAVE BEGIN UNTIL WHILE REPEAT RECURSE EXIT` |
+| Defining | `: ; VARIABLE CONSTANT CREATE DOES> IMMEDIATE` |
+| I/O | `. U. .S CR EMIT SPACE SPACES TYPE ." S" ACCEPT` |
+| Return stack | `>R R> R@` |
+| System | `EXECUTE ' CHAR [CHAR] ['] DECIMAL HEX BASE STATE >IN >BODY ENVIRONMENT? SOURCE ABORT TRUE FALSE BL` |
+| Compiler | `LITERAL POSTPONE [ ] EVALUATE ABORT"` |
+| Parsing | `WORD FIND COUNT >NUMBER` |
 
 ### Not Yet Implemented
 
-DOES> EVALUATE >NUMBER ACCEPT WORD FIND COUNT CMOVE CMOVE> >IN #TIB STATE (as variable) ABORT" and others needed for full Core compliance.
+Remaining words needed for full Core compliance: `#` `#>` `#S` `<#` `HOLD` `SIGN` (pictured numeric output), `2!` `2@` `2>R` `2R>` `2R@`, and edge cases in existing words.
 
 ## Compliance Status
 
@@ -119,7 +122,7 @@ Targeting 100% Forth 2012 compliance via [Gerry Jackson's test suite](https://gi
 
 | Word Set | Status |
 |----------|--------|
-| Core | In progress (~70%) |
+| Core | In progress (~90%) |
 | Core Extensions | Pending |
 | Double-Number | Pending |
 | Exception | Pending |
