@@ -1,0 +1,9 @@
+[package]
+name = "wafer-web"
+description = "WAFER: WebAssembly Forth Engine in Rust - browser bindings"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+wafer-core = { path = "../core" }

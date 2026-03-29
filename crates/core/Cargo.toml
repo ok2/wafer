@@ -1,0 +1,17 @@
+[package]
+name = "wafer-core"
+description = "WAFER: WebAssembly Forth Engine in Rust - core compiler and runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+wasm-encoder = { workspace = true }
+wasmparser = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+insta = { workspace = true }
+wasmtime = { workspace = true }

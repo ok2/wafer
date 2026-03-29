@@ -1,0 +1,159 @@
+//! Intermediate representation for WAFER's compilation pipeline.
+//!
+//! The IR sits between parsing/compilation and WASM codegen.
+//! Optimization passes transform IR before it reaches codegen.
+
+use crate::dictionary::WordId;
+
+/// A single IR operation.
+#[derive(Debug, Clone, PartialEq)]
+pub enum IrOp {
+    // -- Literals --
+    /// Push a 32-bit integer constant.
+    PushI32(i32),
+    /// Push a 64-bit integer constant (double-cell).
+    PushI64(i64),
+    /// Push a 64-bit float constant.
+    PushF64(f64),
+
+    // -- Stack manipulation --
+    Drop,
+    Dup,
+    Swap,
+    Over,
+    Rot,
+    Nip,
+    Tuck,
+
+    // -- Arithmetic --
+    Add,
+    Sub,
+    Mul,
+    /// Combined division and modulus: ( n1 n2 -- rem quot )
+    DivMod,
+    Negate,
+    Abs,
+
+    // -- Comparison --
+    Eq,
+    NotEq,
+    Lt,
+    Gt,
+    LtUnsigned,
+    ZeroEq,
+    ZeroLt,
+
+    // -- Logic --
+    And,
+    Or,
+    Xor,
+    Invert,
+    Lshift,
+    Rshift,
+
+    // -- Memory --
+    /// Fetch cell from address: ( addr -- x )
+    Fetch,
+    /// Store cell to address: ( x addr -- )
+    Store,
+    /// Fetch byte: ( addr -- char )
+    CFetch,
+    /// Store byte: ( char addr -- )
+    CStore,
+    /// Add to cell at address: ( n addr -- )
+    PlusStore,
+
+    // -- Control flow --
+    /// Call another word.
+    Call(WordId),
+    /// Tail-call optimization.
+    TailCall(WordId),
+    /// IF ... ELSE ... THEN
+    If {
+        then_body: Vec<IrOp>,
+        else_body: Option<Vec<IrOp>>,
+    },
+    /// DO ... LOOP
+    DoLoop {
+        body: Vec<IrOp>,
+        is_plus_loop: bool,
+    },
+    /// BEGIN ... UNTIL
+    BeginUntil {
+        body: Vec<IrOp>,
+    },
+    /// BEGIN ... WHILE ... REPEAT
+    BeginWhileRepeat {
+        test: Vec<IrOp>,
+        body: Vec<IrOp>,
+    },
+    /// Return from current word.
+    Exit,
+
+    // -- Return stack --
+    /// Move to return stack: ( x -- ) ( R: -- x )
+    ToR,
+    /// Move from return stack: ( -- x ) ( R: x -- )
+    FromR,
+    /// Copy from return stack: ( -- x ) ( R: x -- x )
+    RFetch,
+
+    // -- I/O --
+    /// Output character: ( char -- )
+    Emit,
+    /// Print number: ( n -- )
+    Dot,
+    /// Output newline.
+    Cr,
+    /// Output string: ( c-addr u -- )
+    Type,
+
+    // -- System --
+    /// Execute word by function table index: ( xt -- )
+    Execute,
+}
+
+/// A compiled word definition as IR.
+#[derive(Debug, Clone)]
+pub struct IrWord {
+    /// Word name.
+    pub name: String,
+    /// The word's body as IR operations.
+    pub body: Vec<IrOp>,
+    /// Whether this word has the IMMEDIATE flag.
+    pub is_immediate: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ir_word_construction() {
+        let word = IrWord {
+            name: "SQUARE".to_string(),
+            body: vec![IrOp::Dup, IrOp::Mul],
+            is_immediate: false,
+        };
+        assert_eq!(word.name, "SQUARE");
+        assert_eq!(word.body.len(), 2);
+    }
+
+    #[test]
+    fn ir_control_flow() {
+        // : ABS DUP 0< IF NEGATE THEN ;
+        let abs_word = IrWord {
+            name: "ABS".to_string(),
+            body: vec![
+                IrOp::Dup,
+                IrOp::ZeroLt,
+                IrOp::If {
+                    then_body: vec![IrOp::Negate],
+                    else_body: None,
+                },
+            ],
+            is_immediate: false,
+        };
+        assert_eq!(abs_word.body.len(), 3);
+    }
+}
