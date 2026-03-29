@@ -1,40 +1,57 @@
 # WAFER Project Conventions
 
 ## What is WAFER?
-WAFER (WebAssembly Forth Engine in Rust) is an optimizing Forth 2012 compiler targeting WebAssembly.
+WAFER (WebAssembly Forth Engine in Rust) is an optimizing Forth 2012 compiler targeting WebAssembly. Currently a working Forth system with 70+ words and JIT compilation.
 
 ## Architecture
-- Rust kernel (~35 primitives) + Forth standard library (everything else in .fth files)
-- IR-based compilation pipeline: Forth -> IR -> type inference -> optimize -> WASM codegen
-- Multi-typed stack: use WASM's native typed stack when types are known via inference, fall back to linear memory for dynamic/polymorphic cases
-- Subroutine threading via WASM function tables
-- JIT mode: per-word WASM modules + shared function table
-- Consolidation mode: recompile all words into single optimized WASM module
+- Each Forth word compiles to its own WASM module via `wasm-encoder`
+- Modules share memory, globals (dsp/rsp), and a function table via wasmtime imports
+- IR-based compilation: Forth -> `Vec<IrOp>` -> WASM codegen -> wasmtime instantiation
+- Dictionary: linked-list in a `Vec<u8>` buffer simulating WASM linear memory
+- Primitives: either IR-based (compiled to WASM) or host functions (Rust closures in wasmtime)
+
+## Key Files
+- `crates/core/src/outer.rs` -- ForthVM: the main runtime, outer interpreter, compiler, all primitives
+- `crates/core/src/codegen.rs` -- IR-to-WASM translation, module generation, wasmtime execution tests
+- `crates/core/src/dictionary.rs` -- Dictionary data structure with create/find/reveal
+- `crates/core/src/ir.rs` -- IrOp enum (the intermediate representation)
+- `crates/core/src/memory.rs` -- Memory layout constants (stack regions, dictionary base, etc.)
+- `crates/cli/src/main.rs` -- CLI REPL with rustyline
+
+## Adding a New Word
+
+**IR primitive** (simple stack/arithmetic/logic -- preferred when possible):
+```rust
+self.register_primitive("WORD_NAME", false, vec![IrOp::Dup, IrOp::Mul])?;
+```
+
+**Host function** (needs Rust logic -- I/O, dictionary manipulation, complex stack access):
+```rust
+let func = Func::new(&mut self.store, func_type.clone(), move |mut caller, _params, _results| {
+    // manipulate memory/globals directly
+    Ok(())
+});
+self.register_host_primitive("WORD_NAME", false, func)?;
+```
+
+**Special interpreter token** (defining words like VARIABLE, CONSTANT, CREATE):
+Handle in `interpret_token_immediate()` or `compile_token()` as a special case.
 
 ## Code Style
-- `cargo fmt` and `cargo clippy` must pass with no warnings
+- `cargo fmt --all` and `cargo clippy --workspace` must pass with no warnings
 - Every public function needs a doc comment
-- Every module needs unit tests
-- Use `thiserror` for error types in core crate, `anyhow` for CLI crate
+- Use `thiserror` for error types in core crate, `anyhow` for CLI
 - Prefer returning `Result` over panicking
 
-## Testing (Critical)
-- **Specs-driven TDD**: Every feature starts with its failing test, then implementation
-- Run `cargo test --workspace` before committing
-- Forth 2012 compliance: `cargo test --test compliance`
-- Property-based tests with `proptest` for numeric operations and optimizer correctness
-- Snapshot tests with `insta` for IR and WASM output
-- 100% compliance is mandatory for each implemented word set before moving on
-- Never break existing compliance tests
-
-## Forth Source (.fth files)
-- One file per word set in `forth/`
-- Document each word with standard stack effect notation: `( before -- after )`
-- Maximize words written in Forth, minimize Rust primitives
-- Boot order: boot.fth -> core.fth -> core_ext.fth -> ... -> prelude.fth
+## Testing
+- Run `cargo test --workspace` before committing (currently 185 tests)
+- Forth 2012 compliance: `cargo test -p wafer-core --test compliance`
+- Test helper in outer.rs: `eval_output("forth code")` returns printed output as String
+- Test helper: `eval_stack("forth code")` returns data stack as Vec<i32>
 
 ## Key Principles
-1. Maximize Forth, minimize Rust (self-hosting goal)
-2. Correctness first, performance second
+1. Correctness first, performance second
+2. Maximize Forth, minimize Rust (self-hosting goal -- not yet started)
 3. Test-driven: if it's not tested, it doesn't work
-4. Every word set at 100% compliance before moving to the next
+4. Never break existing tests
+5. No Co-Authored-By or AI attribution in commits
