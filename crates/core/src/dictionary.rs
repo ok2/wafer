@@ -297,9 +297,7 @@ impl Dictionary {
     /// Toggle the IMMEDIATE flag on the most recent word.
     pub fn toggle_immediate(&mut self) -> WaferResult<()> {
         if self.latest == 0 && self.here == DICTIONARY_BASE {
-            return Err(WaferError::CompileError(
-                "no word defined yet".to_string(),
-            ));
+            return Err(WaferError::CompileError("no word defined yet".to_string()));
         }
         let flags_addr = (self.latest + 4) as usize;
         if flags_addr >= self.memory.len() {

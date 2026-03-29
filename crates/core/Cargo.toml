@@ -8,10 +8,10 @@ license.workspace = true
 [dependencies]
 wasm-encoder = { workspace = true }
 wasmparser = { workspace = true }
+wasmtime = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
 insta = { workspace = true }
-wasmtime = { workspace = true }
