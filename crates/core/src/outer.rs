@@ -71,6 +71,23 @@ enum ControlEntry {
         after_repeat: Vec<IrOp>,
         prefix: Vec<IrOp>,
     },
+    /// CASE statement: holds prefix and the list of ENDOF forward branches
+    Case {
+        prefix: Vec<IrOp>,
+        endof_branches: Vec<(Vec<IrOp>, Vec<IrOp>)>, // (of_condition, of_body) pairs
+    },
+    /// OF statement inside CASE: holds prefix and current partial Case state
+    Of {
+        prefix: Vec<IrOp>,
+        endof_branches: Vec<(Vec<IrOp>, Vec<IrOp>)>,
+        of_test: Vec<IrOp>, // code compiled between OF and the CASE's previous state
+    },
+    /// ?DO: wraps a Do frame with a skip check. When LOOP resolves the Do,
+    /// it needs to also close the IF/ELSE wrapping.
+    QDo {
+        /// The prefix before the ?DO (including the OVER OVER = check)
+        prefix: Vec<IrOp>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -202,6 +219,8 @@ pub struct ForthVM {
     pending_does_patch: Arc<Mutex<Option<u32>>>,
     // Exception word set: throw code shared between CATCH and THROW host functions
     throw_code: Arc<Mutex<Option<i32>>>,
+    // Shared dictionary lookup: maps uppercase name -> (WordId, is_immediate)
+    word_lookup: Arc<Mutex<HashMap<String, (u32, bool)>>>,
 }
 
 impl ForthVM {
@@ -301,6 +320,7 @@ impl ForthVM {
             pending_compile: Arc::new(Mutex::new(Vec::new())),
             pending_does_patch: Arc::new(Mutex::new(None)),
             throw_code: Arc::new(Mutex::new(None)),
+            word_lookup: Arc::new(Mutex::new(HashMap::new())),
         };
 
         vm.register_primitives()?;
@@ -433,6 +453,10 @@ impl ForthVM {
         if token_upper == ":" {
             return self.start_colon_def();
         }
+        // Handle :NONAME definition
+        if token_upper == ":NONAME" {
+            return self.start_noname_def();
+        }
 
         // Handle semicolon
         if token_upper == ";" {
@@ -449,6 +473,13 @@ impl ForthVM {
                 self.dictionary
                     .toggle_immediate()
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
+                // Update the word_lookup with the new immediate flag
+                let latest = self.dictionary.latest();
+                if let Ok(name) = self.dictionary.word_name(latest)
+                    && let Some((_, word_id, is_imm)) = self.dictionary.find(&name)
+                {
+                    self.sync_word_lookup(&name, word_id, is_imm);
+                }
                 return Ok(());
             }
             "]" => {
@@ -504,6 +535,38 @@ impl ForthVM {
             }
             return Ok(());
         }
+        if token_upper == "S\\\"" {
+            // S\" with escape sequences in interpret mode
+            if let Some(s) = self.parse_s_escape() {
+                self.refresh_user_here();
+                let addr = self.user_here;
+                let bytes = s.as_bytes();
+                let len = bytes.len() as u32;
+                let data = self.memory.data_mut(&mut self.store);
+                data[addr as usize..addr as usize + len as usize].copy_from_slice(bytes);
+                self.user_here += len;
+                self.sync_here_cell();
+                self.push_data_stack(addr as i32)?;
+                self.push_data_stack(len as i32)?;
+            }
+            return Ok(());
+        }
+        if token_upper == "C\"" {
+            // C" in interpret mode: store counted string at transient area
+            if let Some(s) = self.parse_until('"') {
+                self.refresh_user_here();
+                let addr = self.user_here;
+                let bytes = s.as_bytes();
+                let len = bytes.len() as u8;
+                let data = self.memory.data_mut(&mut self.store);
+                data[addr as usize] = len;
+                data[addr as usize + 1..addr as usize + 1 + len as usize].copy_from_slice(bytes);
+                self.user_here += 1 + len as u32;
+                self.sync_here_cell();
+                self.push_data_stack(addr as i32)?;
+            }
+            return Ok(());
+        }
         if token_upper == "(" {
             // Comment -- skip until )
             self.parse_until(')');
@@ -520,6 +583,8 @@ impl ForthVM {
             "VARIABLE" => return self.define_variable(),
             "CONSTANT" => return self.define_constant(),
             "CREATE" => return self.define_create(),
+            "VALUE" => return self.define_value(),
+            "DEFER" => return self.define_defer(),
             "DOES>" => return self.interpret_does(),
             "'" => return self.interpret_tick(),
             "[CHAR]" => {
@@ -529,7 +594,18 @@ impl ForthVM {
             "CHAR" => return self.interpret_char(),
             "EVALUATE" => return self.interpret_evaluate(),
             "WORD" => return self.interpret_word(),
-            "FIND" => return self.interpret_find(),
+            "TO" => return self.interpret_to(),
+            "IS" => return self.interpret_is(),
+            "ACTION-OF" => return self.interpret_action_of(),
+            "PARSE" => return self.interpret_parse(),
+            "PARSE-NAME" => return self.interpret_parse_name(),
+            "REFILL" => {
+                // In piped/string mode, REFILL returns FALSE
+                self.push_data_stack(0)?;
+                return Ok(());
+            }
+            "BUFFER:" => return self.define_buffer(),
+            "MARKER" => return self.define_marker(),
             _ => {}
         }
 
@@ -580,6 +656,22 @@ impl ForthVM {
                 self.sync_here_cell();
                 self.push_ir(IrOp::PushI32(addr as i32));
                 self.push_ir(IrOp::PushI32(len as i32));
+            }
+            return Ok(());
+        }
+        if token_upper == "C\"" {
+            // C" in compile mode: store counted string at HERE, compile literal
+            if let Some(s) = self.parse_until('"') {
+                self.refresh_user_here();
+                let addr = self.user_here;
+                let bytes = s.as_bytes();
+                let len = bytes.len() as u8;
+                let data = self.memory.data_mut(&mut self.store);
+                data[addr as usize] = len;
+                data[addr as usize + 1..addr as usize + 1 + len as usize].copy_from_slice(bytes);
+                self.user_here += 1 + len as u32;
+                self.sync_here_cell();
+                self.push_ir(IrOp::PushI32(addr as i32));
             }
             return Ok(());
         }
@@ -634,8 +726,14 @@ impl ForthVM {
             "+LOOP" => return self.compile_loop(true),
             "BEGIN" => return self.compile_begin(),
             "UNTIL" => return self.compile_until(),
+            "AGAIN" => return self.compile_again(),
             "WHILE" => return self.compile_while(),
             "REPEAT" => return self.compile_repeat(),
+            "?DO" => return self.compile_qdo(),
+            "CASE" => return self.compile_case(),
+            "OF" => return self.compile_of(),
+            "ENDOF" => return self.compile_endof(),
+            "ENDCASE" => return self.compile_endcase(),
             "RECURSE" => {
                 if let Some(word_id) = self.compiling_word_id {
                     self.push_ir(IrOp::Call(word_id));
@@ -733,6 +831,31 @@ impl ForthVM {
             "VARIABLE" | "CONSTANT" => {
                 // These are now in the dictionary as host functions.
                 // Fall through to dictionary lookup to compile a call.
+            }
+            "TO" => {
+                return self.compile_to();
+            }
+            "IS" => {
+                return self.compile_is();
+            }
+            "ACTION-OF" => {
+                return self.compile_action_of();
+            }
+            "S\\\"" => {
+                // S\" with escape sequences
+                if let Some(s) = self.parse_s_escape() {
+                    self.refresh_user_here();
+                    let addr = self.user_here;
+                    let bytes = s.as_bytes();
+                    let len = bytes.len() as u32;
+                    let data = self.memory.data_mut(&mut self.store);
+                    data[addr as usize..addr as usize + len as usize].copy_from_slice(bytes);
+                    self.user_here += len;
+                    self.sync_here_cell();
+                    self.push_ir(IrOp::PushI32(addr as i32));
+                    self.push_ir(IrOp::PushI32(len as i32));
+                }
+                return Ok(());
             }
             _ => {}
         }
@@ -903,6 +1026,23 @@ impl ForthVM {
                 let body = std::mem::take(&mut self.compiling_ir);
                 self.compiling_ir = prefix;
                 self.compiling_ir.push(IrOp::DoLoop { body, is_plus_loop });
+
+                // Check if this was a ?DO: resolve the wrapping IF/ELSE too
+                if matches!(self.control_stack.last(), Some(ControlEntry::QDo { .. })) {
+                    let qdo_prefix = match self.control_stack.pop() {
+                        Some(ControlEntry::QDo { prefix }) => prefix,
+                        _ => unreachable!(),
+                    };
+                    // The do_loop IR is now in compiling_ir.
+                    // Build: prefix + IF { 2DROP } ELSE { do_loop } THEN
+                    let else_body = std::mem::take(&mut self.compiling_ir);
+                    let then_body = vec![IrOp::Drop, IrOp::Drop];
+                    self.compiling_ir = qdo_prefix;
+                    self.compiling_ir.push(IrOp::If {
+                        then_body,
+                        else_body: Some(else_body),
+                    });
+                }
             }
             _ => anyhow::bail!("LOOP without matching DO"),
         }
@@ -986,9 +1126,181 @@ impl ForthVM {
         Ok(())
     }
 
+    fn compile_again(&mut self) -> anyhow::Result<()> {
+        match self.control_stack.pop() {
+            Some(ControlEntry::Begin { body: prefix }) => {
+                let body = std::mem::take(&mut self.compiling_ir);
+                self.compiling_ir = prefix;
+                self.compiling_ir.push(IrOp::BeginAgain { body });
+            }
+            _ => anyhow::bail!("AGAIN without matching BEGIN"),
+        }
+        Ok(())
+    }
+
+    fn compile_qdo(&mut self) -> anyhow::Result<()> {
+        // ?DO is like DO but skips the loop body if limit == index.
+        // Emit: OVER OVER = IF 2DROP ELSE <DO body LOOP> THEN
+        //
+        // We use a QDo control entry to track that LOOP needs to close
+        // the IF/ELSE wrapper too.
+
+        // Emit the equality check as part of the current compiling_ir
+        self.push_ir(IrOp::Over);
+        self.push_ir(IrOp::Over);
+        self.push_ir(IrOp::Eq);
+
+        // Save the prefix (including the check)
+        let prefix = std::mem::take(&mut self.compiling_ir);
+
+        // Push QDo frame (bottom), then Do frame (top)
+        self.control_stack.push(ControlEntry::QDo { prefix });
+        self.control_stack.push(ControlEntry::Do {
+            body: Vec::new(), // Do's "prefix" is empty since we're inside the else branch
+        });
+        // compiling_ir is now empty, collecting the loop body
+
+        Ok(())
+    }
+
+    fn compile_case(&mut self) -> anyhow::Result<()> {
+        let prefix = std::mem::take(&mut self.compiling_ir);
+        self.control_stack.push(ControlEntry::Case {
+            prefix,
+            endof_branches: Vec::new(),
+        });
+        // compiling_ir now empty, collects default/fallthrough code or the first OF
+        Ok(())
+    }
+
+    fn compile_of(&mut self) -> anyhow::Result<()> {
+        // OF: compile `OVER = IF DROP`
+        // The code between CASE (or last ENDOF) and OF is part of the test
+        match self.control_stack.pop() {
+            Some(ControlEntry::Case {
+                prefix,
+                endof_branches,
+            }) => {
+                let of_test = std::mem::take(&mut self.compiling_ir);
+                self.control_stack.push(ControlEntry::Of {
+                    prefix,
+                    endof_branches,
+                    of_test,
+                });
+                // compiling_ir now empty, collects the OF body (code until ENDOF)
+            }
+            _ => anyhow::bail!("OF without matching CASE"),
+        }
+        Ok(())
+    }
+
+    fn compile_endof(&mut self) -> anyhow::Result<()> {
+        match self.control_stack.pop() {
+            Some(ControlEntry::Of {
+                prefix,
+                mut endof_branches,
+                of_test,
+            }) => {
+                let of_body = std::mem::take(&mut self.compiling_ir);
+                endof_branches.push((of_test, of_body));
+                self.control_stack.push(ControlEntry::Case {
+                    prefix,
+                    endof_branches,
+                });
+                // compiling_ir now empty, collects the next OF or default code
+            }
+            _ => anyhow::bail!("ENDOF without matching OF"),
+        }
+        Ok(())
+    }
+
+    fn compile_endcase(&mut self) -> anyhow::Result<()> {
+        // ENDCASE: compile DROP then resolve all branches
+        match self.control_stack.pop() {
+            Some(ControlEntry::Case {
+                prefix,
+                endof_branches,
+            }) => {
+                let default_code = std::mem::take(&mut self.compiling_ir);
+                self.compiling_ir = prefix;
+
+                // Build nested IF/ELSE structure:
+                // OVER = IF DROP <body1> ELSE OVER = IF DROP <body2> ELSE ... DROP <default> THEN ... THEN
+                self.compile_case_ir(&endof_branches, &default_code);
+            }
+            _ => anyhow::bail!("ENDCASE without matching CASE"),
+        }
+        Ok(())
+    }
+
+    /// Build the nested IR for a CASE statement.
+    fn compile_case_ir(&mut self, branches: &[(Vec<IrOp>, Vec<IrOp>)], default_code: &[IrOp]) {
+        if branches.is_empty() {
+            // Default case: just emit DROP and default code
+            self.compiling_ir.push(IrOp::Drop);
+            self.compiling_ir.extend(default_code.iter().cloned());
+            return;
+        }
+
+        let (ref test_code, ref body) = branches[0];
+        let remaining = &branches[1..];
+
+        // Emit test_code (if any -- usually empty for simple CASE n OF patterns)
+        self.compiling_ir.extend(test_code.iter().cloned());
+
+        // OVER = IF DROP <body>
+        let mut then_body = vec![IrOp::Drop];
+        then_body.extend(body.iter().cloned());
+
+        // Build else body recursively
+        let mut else_ir = Vec::new();
+        let saved = std::mem::take(&mut self.compiling_ir);
+        self.compiling_ir = else_ir;
+        self.compile_case_ir(remaining, default_code);
+        else_ir = std::mem::take(&mut self.compiling_ir);
+        self.compiling_ir = saved;
+
+        // Emit: OVER = IF DROP <body> ELSE <rest> THEN
+        self.compiling_ir.push(IrOp::Over);
+        self.compiling_ir.push(IrOp::Eq);
+        self.compiling_ir.push(IrOp::If {
+            then_body,
+            else_body: Some(else_ir),
+        });
+    }
+
     // -----------------------------------------------------------------------
     // Colon definition
     // -----------------------------------------------------------------------
+
+    fn start_noname_def(&mut self) -> anyhow::Result<()> {
+        if self.state != 0 {
+            anyhow::bail!("nested colon definitions not allowed");
+        }
+
+        // Allocate a word ID for the anonymous definition
+        let name = format!("_noname_{}_", self.next_table_index);
+        let word_id = self
+            .dictionary
+            .create(&name, false)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        // Reveal immediately so it gets an xt but isn't findable by name
+        // (since the name is internal)
+        self.dictionary.reveal();
+
+        self.compiling_name = Some(name);
+        self.compiling_word_id = Some(word_id);
+        self.compiling_ir.clear();
+        self.control_stack.clear();
+        self.state = -1;
+        self.saw_create_in_def = false;
+        self.next_table_index = self.next_table_index.max(word_id.0 + 1);
+
+        // Push the xt onto the data stack (so caller can use it)
+        self.push_data_stack(word_id.0 as i32)?;
+
+        Ok(())
+    }
 
     fn start_colon_def(&mut self) -> anyhow::Result<()> {
         if self.state != 0 {
@@ -1046,6 +1358,13 @@ impl ForthVM {
 
         // Reveal the word
         self.dictionary.reveal();
+        // Check if IMMEDIATE was toggled (the word might be immediate)
+        let is_immediate = self
+            .dictionary
+            .find(&name)
+            .map(|(_, _, imm)| imm)
+            .unwrap_or(false);
+        self.sync_word_lookup(&name, word_id, is_immediate);
         self.state = 0;
         // Refresh user_here from the shared cell before syncing back,
         // so that host-function advances (ALLOT, , etc.) are preserved.
@@ -1113,6 +1432,9 @@ impl ForthVM {
 
     /// Execute a word by its WordId (calls through the function table).
     fn execute_word(&mut self, word_id: WordId) -> anyhow::Result<()> {
+        // Rebuild word lookup so inline FIND host function has latest data
+        self.rebuild_word_lookup();
+
         let r = self
             .table
             .get(&mut self.store, word_id.0 as u64)
@@ -1233,6 +1555,7 @@ impl ForthVM {
 
         self.instantiate_and_install(&compiled, word_id)?;
         self.dictionary.reveal();
+        self.sync_word_lookup(name, word_id, immediate);
         self.next_table_index = self.next_table_index.max(word_id.0 + 1);
 
         Ok(word_id)
@@ -1254,6 +1577,7 @@ impl ForthVM {
         self.table
             .set(&mut self.store, word_id.0 as u64, Ref::Func(Some(func)))?;
         self.dictionary.reveal();
+        self.sync_word_lookup(name, word_id, immediate);
         self.next_table_index = self.next_table_index.max(word_id.0 + 1);
 
         Ok(word_id)
@@ -1447,6 +1771,74 @@ impl ForthVM {
 
         // Exception word set: CATCH and THROW
         self.register_catch_throw()?;
+
+        // SOURCE-ID ( -- 0 ) always 0 for user input
+        self.register_primitive(
+            "SOURCE-ID",
+            false,
+            vec![
+                IrOp::PushI32(crate::memory::SYSVAR_SOURCE_ID as i32),
+                IrOp::Fetch,
+            ],
+        )?;
+
+        // -- Core Extension words --
+        // 2>R, 2R>, 2R@
+        self.register_primitive("2>R", false, vec![IrOp::Swap, IrOp::ToR, IrOp::ToR])?;
+        self.register_primitive("2R>", false, vec![IrOp::FromR, IrOp::FromR, IrOp::Swap])?;
+        self.register_2r_fetch()?;
+
+        // U>
+        self.register_primitive("U>", false, vec![IrOp::Swap, IrOp::LtUnsigned])?;
+
+        // PAD
+        self.register_primitive(
+            "PAD",
+            false,
+            vec![IrOp::PushI32(crate::memory::PAD_BASE as i32)],
+        )?;
+
+        // ERASE ( addr u -- ) fill memory with zeros
+        self.register_erase()?;
+
+        // .R and U.R
+        self.register_dot_r()?;
+        self.register_u_dot_r()?;
+
+        // UNUSED
+        self.register_unused()?;
+
+        // HOLDS
+        self.register_holds()?;
+
+        // PARSE as a host function (for compiled code)
+        self.register_parse_host()?;
+
+        // PARSE-NAME as a host function (for compiled code)
+        self.register_parse_name_host()?;
+
+        // REFILL as a host function (always returns FALSE in piped mode)
+        self.register_refill()?;
+
+        // S\" (string with escape sequences)
+        // Handled as a special token in compile_token/interpret_token
+
+        // BUFFER: ( u "name" -- ) like CREATE + ALLOT
+        // Handled as a special token in interpret_token_immediate
+
+        // MARKER -- stub
+        // Handled as a special token in interpret_token_immediate
+
+        // DEFER!, DEFER@ (standard aliases)
+        self.register_defer_store()?;
+        self.register_defer_fetch()?;
+
+        // FALSE and TRUE are already registered in core
+        // NIP, TUCK already registered
+        // 0<>, 0>, <> already registered
+        // HEX already registered
+        // .( already handled
+        // \ already registered
 
         Ok(())
     }
@@ -1654,6 +2046,7 @@ impl ForthVM {
 
         self.instantiate_and_install(&compiled, word_id)?;
         self.dictionary.reveal();
+        self.sync_word_lookup(&name, word_id, false);
         self.next_table_index = self.next_table_index.max(word_id.0 + 1);
         self.sync_here_cell();
 
@@ -1729,6 +2122,372 @@ impl ForthVM {
         self.sync_here_cell();
 
         Ok(())
+    }
+
+    /// VALUE <name> -- ( x -- ) create a value that pushes x when invoked.
+    fn define_value(&mut self) -> anyhow::Result<()> {
+        let value = self.pop_data_stack()?;
+        let name = self
+            .next_token()
+            .ok_or_else(|| anyhow::anyhow!("VALUE: expected name"))?;
+
+        let word_id = self
+            .dictionary
+            .create(&name, false)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+        // Allocate one cell in WASM memory for the value's storage
+        self.refresh_user_here();
+        let val_addr = self.user_here;
+        self.user_here += CELL_SIZE;
+
+        // Initialize the cell with the given value
+        let data = self.memory.data_mut(&mut self.store);
+        data[val_addr as usize..val_addr as usize + 4].copy_from_slice(&value.to_le_bytes());
+
+        // Compile a word that fetches from the value's address
+        let ir_body = vec![IrOp::PushI32(val_addr as i32), IrOp::Fetch];
+        let config = CodegenConfig {
+            base_fn_index: word_id.0,
+            table_size: self.table_size(),
+        };
+        let compiled = compile_word(&name, &ir_body, &config)
+            .map_err(|e| anyhow::anyhow!("codegen error for VALUE {}: {}", name, e))?;
+
+        self.instantiate_and_install(&compiled, word_id)?;
+        self.dictionary.reveal();
+        self.next_table_index = self.next_table_index.max(word_id.0 + 1);
+        // Map xt -> PFA for TO and >BODY
+        self.word_pfa_map.insert(word_id.0, val_addr);
+        self.sync_pfa_map(word_id.0, val_addr);
+        self.sync_here_cell();
+
+        Ok(())
+    }
+
+    /// DEFER <name> -- create a deferred execution word.
+    fn define_defer(&mut self) -> anyhow::Result<()> {
+        let name = self
+            .next_token()
+            .ok_or_else(|| anyhow::anyhow!("DEFER: expected name"))?;
+
+        let word_id = self
+            .dictionary
+            .create(&name, false)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+        // Allocate one cell to hold the xt
+        self.refresh_user_here();
+        let defer_addr = self.user_here;
+        self.user_here += CELL_SIZE;
+
+        // Default: find ABORT and use its xt, or use 0
+        let default_xt = self
+            .dictionary
+            .find("ABORT")
+            .map(|(_, id, _)| id.0)
+            .unwrap_or(0);
+
+        let data = self.memory.data_mut(&mut self.store);
+        data[defer_addr as usize..defer_addr as usize + 4]
+            .copy_from_slice(&default_xt.to_le_bytes());
+
+        // Compile a word that fetches the xt and executes it
+        let ir_body = vec![IrOp::PushI32(defer_addr as i32), IrOp::Fetch, IrOp::Execute];
+        let config = CodegenConfig {
+            base_fn_index: word_id.0,
+            table_size: self.table_size(),
+        };
+        let compiled = compile_word(&name, &ir_body, &config)
+            .map_err(|e| anyhow::anyhow!("codegen error for DEFER {}: {}", name, e))?;
+
+        self.instantiate_and_install(&compiled, word_id)?;
+        self.dictionary.reveal();
+        self.next_table_index = self.next_table_index.max(word_id.0 + 1);
+        // Map xt -> PFA for IS and ACTION-OF
+        self.word_pfa_map.insert(word_id.0, defer_addr);
+        self.sync_pfa_map(word_id.0, defer_addr);
+        self.sync_here_cell();
+
+        Ok(())
+    }
+
+    /// BUFFER: ( u "name" -- ) create a named buffer of u bytes.
+    fn define_buffer(&mut self) -> anyhow::Result<()> {
+        let size = self.pop_data_stack()? as u32;
+        let name = self
+            .next_token()
+            .ok_or_else(|| anyhow::anyhow!("BUFFER:: expected name"))?;
+
+        let word_id = self
+            .dictionary
+            .create(&name, false)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+        // Allocate the buffer in WASM memory
+        self.refresh_user_here();
+        let buf_addr = self.user_here;
+        self.user_here += size;
+
+        // Compile a word that pushes the buffer address
+        let ir_body = vec![IrOp::PushI32(buf_addr as i32)];
+        let config = CodegenConfig {
+            base_fn_index: word_id.0,
+            table_size: self.table_size(),
+        };
+        let compiled = compile_word(&name, &ir_body, &config)
+            .map_err(|e| anyhow::anyhow!("codegen error for BUFFER: {}: {}", name, e))?;
+
+        self.instantiate_and_install(&compiled, word_id)?;
+        self.dictionary.reveal();
+        self.next_table_index = self.next_table_index.max(word_id.0 + 1);
+        self.word_pfa_map.insert(word_id.0, buf_addr);
+        self.sync_pfa_map(word_id.0, buf_addr);
+        self.sync_here_cell();
+
+        Ok(())
+    }
+
+    /// MARKER <name> -- create a marker that restores dictionary state.
+    /// This is a stub implementation that creates a no-op word.
+    fn define_marker(&mut self) -> anyhow::Result<()> {
+        let name = self
+            .next_token()
+            .ok_or_else(|| anyhow::anyhow!("MARKER: expected name"))?;
+
+        let word_id = self
+            .dictionary
+            .create(&name, false)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+        // Stub: marker word does nothing when executed
+        let ir_body = vec![];
+        let config = CodegenConfig {
+            base_fn_index: word_id.0,
+            table_size: self.table_size(),
+        };
+        let compiled = compile_word(&name, &ir_body, &config)
+            .map_err(|e| anyhow::anyhow!("codegen error for MARKER {}: {}", name, e))?;
+
+        self.instantiate_and_install(&compiled, word_id)?;
+        self.dictionary.reveal();
+        self.next_table_index = self.next_table_index.max(word_id.0 + 1);
+
+        Ok(())
+    }
+
+    /// TO <name> -- ( x -- ) store x into the value named by <name>.
+    fn interpret_to(&mut self) -> anyhow::Result<()> {
+        let name = self
+            .next_token()
+            .ok_or_else(|| anyhow::anyhow!("TO: expected name"))?;
+        let value = self.pop_data_stack()?;
+
+        if let Some((_addr, word_id, _imm)) = self.dictionary.find(&name) {
+            if let Some(&pfa) = self.word_pfa_map.get(&word_id.0) {
+                let data = self.memory.data_mut(&mut self.store);
+                data[pfa as usize..pfa as usize + 4].copy_from_slice(&value.to_le_bytes());
+            } else {
+                anyhow::bail!("TO: {} has no parameter field", name);
+            }
+        } else {
+            anyhow::bail!("TO: unknown word: {}", name);
+        }
+        Ok(())
+    }
+
+    /// IS <name> -- ( xt -- ) set the deferred word to xt.
+    fn interpret_is(&mut self) -> anyhow::Result<()> {
+        let name = self
+            .next_token()
+            .ok_or_else(|| anyhow::anyhow!("IS: expected name"))?;
+        let xt = self.pop_data_stack()?;
+
+        if let Some((_addr, word_id, _imm)) = self.dictionary.find(&name) {
+            if let Some(&pfa) = self.word_pfa_map.get(&word_id.0) {
+                let data = self.memory.data_mut(&mut self.store);
+                data[pfa as usize..pfa as usize + 4].copy_from_slice(&xt.to_le_bytes());
+            } else {
+                anyhow::bail!("IS: {} has no parameter field", name);
+            }
+        } else {
+            anyhow::bail!("IS: unknown word: {}", name);
+        }
+        Ok(())
+    }
+
+    /// ACTION-OF <name> -- ( -- xt ) retrieve the xt from a deferred word.
+    fn interpret_action_of(&mut self) -> anyhow::Result<()> {
+        let name = self
+            .next_token()
+            .ok_or_else(|| anyhow::anyhow!("ACTION-OF: expected name"))?;
+
+        if let Some((_addr, word_id, _imm)) = self.dictionary.find(&name) {
+            if let Some(&pfa) = self.word_pfa_map.get(&word_id.0) {
+                let data = self.memory.data(&self.store);
+                let b: [u8; 4] = data[pfa as usize..pfa as usize + 4].try_into().unwrap();
+                let xt = i32::from_le_bytes(b);
+                self.push_data_stack(xt)?;
+            } else {
+                anyhow::bail!("ACTION-OF: {} has no parameter field", name);
+            }
+        } else {
+            anyhow::bail!("ACTION-OF: unknown word: {}", name);
+        }
+        Ok(())
+    }
+
+    /// TO in compile mode: read next word, find its PFA, compile a store.
+    fn compile_to(&mut self) -> anyhow::Result<()> {
+        let name = self
+            .next_token()
+            .ok_or_else(|| anyhow::anyhow!("TO: expected name"))?;
+
+        if let Some((_addr, word_id, _imm)) = self.dictionary.find(&name) {
+            if let Some(&pfa) = self.word_pfa_map.get(&word_id.0) {
+                self.push_ir(IrOp::PushI32(pfa as i32));
+                self.push_ir(IrOp::Store);
+            } else {
+                anyhow::bail!("TO: {} has no parameter field", name);
+            }
+        } else {
+            anyhow::bail!("TO: unknown word: {}", name);
+        }
+        Ok(())
+    }
+
+    /// IS in compile mode: read next word, find its PFA, compile a store.
+    fn compile_is(&mut self) -> anyhow::Result<()> {
+        // IS is the same as TO for DEFER words
+        self.compile_to()
+    }
+
+    /// ACTION-OF in compile mode: read next word, compile fetch from PFA.
+    fn compile_action_of(&mut self) -> anyhow::Result<()> {
+        let name = self
+            .next_token()
+            .ok_or_else(|| anyhow::anyhow!("ACTION-OF: expected name"))?;
+
+        if let Some((_addr, word_id, _imm)) = self.dictionary.find(&name) {
+            if let Some(&pfa) = self.word_pfa_map.get(&word_id.0) {
+                self.push_ir(IrOp::PushI32(pfa as i32));
+                self.push_ir(IrOp::Fetch);
+            } else {
+                anyhow::bail!("ACTION-OF: {} has no parameter field", name);
+            }
+        } else {
+            anyhow::bail!("ACTION-OF: unknown word: {}", name);
+        }
+        Ok(())
+    }
+
+    /// PARSE ( char "text" -- c-addr u ) parse input delimited by char.
+    fn interpret_parse(&mut self) -> anyhow::Result<()> {
+        let delim = self.pop_data_stack()? as u8 as char;
+
+        let bytes = self.input_buffer.as_bytes();
+        let start = self.input_pos;
+        while self.input_pos < bytes.len() && bytes[self.input_pos] != delim as u8 {
+            self.input_pos += 1;
+        }
+        let end = self.input_pos;
+        // Skip past delimiter
+        if self.input_pos < bytes.len() {
+            self.input_pos += 1;
+        }
+
+        // Store the parsed text in WASM memory at PAD area
+        let text = &bytes[start..end];
+        let text_len = text.len() as u32;
+        let buf_addr = INPUT_BUFFER_BASE + start as u32;
+
+        self.push_data_stack(buf_addr as i32)?;
+        self.push_data_stack(text_len as i32)?;
+        Ok(())
+    }
+
+    /// PARSE-NAME ( "name" -- c-addr u ) parse next whitespace-delimited name.
+    fn interpret_parse_name(&mut self) -> anyhow::Result<()> {
+        let bytes = self.input_buffer.as_bytes();
+        // Skip leading whitespace
+        while self.input_pos < bytes.len() && bytes[self.input_pos].is_ascii_whitespace() {
+            self.input_pos += 1;
+        }
+        let start = self.input_pos;
+        while self.input_pos < bytes.len() && !bytes[self.input_pos].is_ascii_whitespace() {
+            self.input_pos += 1;
+        }
+        let end = self.input_pos;
+
+        let buf_addr = INPUT_BUFFER_BASE + start as u32;
+        let text_len = (end - start) as u32;
+
+        self.push_data_stack(buf_addr as i32)?;
+        self.push_data_stack(text_len as i32)?;
+        Ok(())
+    }
+
+    /// Parse a string with escape sequences for S\".
+    fn parse_s_escape(&mut self) -> Option<String> {
+        let bytes = self.input_buffer.as_bytes();
+        // Skip one leading space if present
+        if self.input_pos < bytes.len() && bytes[self.input_pos] == b' ' {
+            self.input_pos += 1;
+        }
+        let mut result = Vec::new();
+        while self.input_pos < bytes.len() && bytes[self.input_pos] != b'"' {
+            if bytes[self.input_pos] == b'\\' {
+                self.input_pos += 1;
+                if self.input_pos < bytes.len() {
+                    let ch = bytes[self.input_pos];
+                    match ch {
+                        b'a' => result.push(7),  // BEL
+                        b'b' => result.push(8),  // BS
+                        b'e' => result.push(27), // ESC
+                        b'f' => result.push(12), // FF
+                        b'l' => result.push(10), // LF
+                        b'm' => {
+                            result.push(13);
+                            result.push(10);
+                        } // CR/LF
+                        b'n' => result.push(10), // newline
+                        b'q' => result.push(b'"'), // quote
+                        b'r' => result.push(13), // CR
+                        b't' => result.push(9),  // TAB
+                        b'v' => result.push(11), // VT
+                        b'z' => result.push(0),  // NUL
+                        b'\\' => result.push(b'\\'),
+                        b'"' => result.push(b'"'),
+                        b'x' | b'X' => {
+                            // Hex escape: \xNN
+                            self.input_pos += 1;
+                            let mut hex_val = 0u8;
+                            for _ in 0..2 {
+                                if self.input_pos < bytes.len() {
+                                    if let Some(d) = (bytes[self.input_pos] as char).to_digit(16) {
+                                        hex_val = hex_val * 16 + d as u8;
+                                        self.input_pos += 1;
+                                    } else {
+                                        break;
+                                    }
+                                }
+                            }
+                            result.push(hex_val);
+                            continue; // already advanced past the hex digits
+                        }
+                        _ => result.push(ch),
+                    }
+                }
+            } else {
+                result.push(bytes[self.input_pos]);
+            }
+            self.input_pos += 1;
+        }
+        // Skip past closing quote
+        if self.input_pos < bytes.len() {
+            self.input_pos += 1;
+        }
+        Some(String::from_utf8_lossy(&result).to_string())
     }
 
     // -----------------------------------------------------------------------
@@ -3073,12 +3832,63 @@ impl ForthVM {
 
     /// FIND ( c-addr -- c-addr 0 | xt 1 | xt -1 ) look up counted string.
     fn register_find(&mut self) -> anyhow::Result<()> {
-        let pending = Arc::clone(&self.pending_define);
+        let memory = self.memory;
+        let dsp = self.dsp;
+        let word_lookup = Arc::clone(&self.word_lookup);
+
         let func = Func::new(
             &mut self.store,
             FuncType::new(&self.engine, [], []),
-            move |_caller, _params, _results| {
-                *pending.lock().unwrap() = 6;
+            move |mut caller, _params, _results| {
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let data = memory.data(&caller);
+                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
+                let c_addr = u32::from_le_bytes(b);
+
+                // Bounds check
+                let mem_len = data.len() as u32;
+                if c_addr >= mem_len {
+                    // Push c-addr and 0 (not found)
+                    let new_sp = sp - CELL_SIZE;
+                    let data = memory.data_mut(&mut caller);
+                    data[new_sp as usize..new_sp as usize + 4].copy_from_slice(&0i32.to_le_bytes());
+                    dsp.set(&mut caller, Val::I32(new_sp as i32))?;
+                    return Ok(());
+                }
+
+                let count = data[c_addr as usize] as usize;
+                let name_start = (c_addr + 1) as usize;
+                if name_start + count > mem_len as usize {
+                    let new_sp = sp - CELL_SIZE;
+                    let data = memory.data_mut(&mut caller);
+                    data[new_sp as usize..new_sp as usize + 4].copy_from_slice(&0i32.to_le_bytes());
+                    dsp.set(&mut caller, Val::I32(new_sp as i32))?;
+                    return Ok(());
+                }
+
+                let name_bytes = &data[name_start..name_start + count];
+                let name = String::from_utf8_lossy(name_bytes).to_ascii_uppercase();
+
+                let lookup = word_lookup.lock().unwrap();
+                if let Some(&(xt, is_imm)) = lookup.get(&name) {
+                    // Found: replace c-addr with xt, push flag
+                    let new_sp = sp - CELL_SIZE;
+                    let flag: i32 = if is_imm { 1 } else { -1 };
+                    let data = memory.data_mut(&mut caller);
+                    // Replace c-addr with xt
+                    data[(new_sp + 4) as usize..(new_sp + 8) as usize]
+                        .copy_from_slice(&(xt as i32).to_le_bytes());
+                    // Push flag
+                    data[new_sp as usize..new_sp as usize + 4].copy_from_slice(&flag.to_le_bytes());
+                    dsp.set(&mut caller, Val::I32(new_sp as i32))?;
+                } else {
+                    // Not found: push c-addr and 0
+                    let new_sp = sp - CELL_SIZE;
+                    let data = memory.data_mut(&mut caller);
+                    data[new_sp as usize..new_sp as usize + 4].copy_from_slice(&0i32.to_le_bytes());
+                    dsp.set(&mut caller, Val::I32(new_sp as i32))?;
+                }
+
                 Ok(())
             },
         );
@@ -3635,13 +4445,79 @@ impl ForthVM {
     }
 
     /// Register WORD as a host function callable from compiled code.
+    /// WORD ( char -- c-addr ) reads from the WASM input buffer and updates >IN.
     fn register_word_word(&mut self) -> anyhow::Result<()> {
-        let pending = Arc::clone(&self.pending_define);
+        let memory = self.memory;
+        let dsp = self.dsp;
+
         let func = Func::new(
             &mut self.store,
             FuncType::new(&self.engine, [], []),
-            move |_caller, _params, _results| {
-                *pending.lock().unwrap() = 5;
+            move |mut caller, _params, _results| {
+                // Pop delimiter from data stack
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let data = memory.data(&caller);
+                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
+                let delim = i32::from_le_bytes(b) as u8;
+                dsp.set(&mut caller, Val::I32((sp + CELL_SIZE) as i32))?;
+
+                // Read >IN and #TIB from WASM memory
+                let data = memory.data(&caller);
+                let b: [u8; 4] = data[SYSVAR_TO_IN as usize..SYSVAR_TO_IN as usize + 4]
+                    .try_into()
+                    .unwrap();
+                let mut to_in = u32::from_le_bytes(b);
+                let b: [u8; 4] = data[SYSVAR_NUM_TIB as usize..SYSVAR_NUM_TIB as usize + 4]
+                    .try_into()
+                    .unwrap();
+                let num_tib = u32::from_le_bytes(b);
+
+                // Skip leading delimiters
+                while to_in < num_tib {
+                    let data = memory.data(&caller);
+                    if data[(INPUT_BUFFER_BASE + to_in) as usize] != delim {
+                        break;
+                    }
+                    to_in += 1;
+                }
+
+                // Collect word
+                let start = to_in;
+                while to_in < num_tib {
+                    let data = memory.data(&caller);
+                    if data[(INPUT_BUFFER_BASE + to_in) as usize] == delim {
+                        break;
+                    }
+                    to_in += 1;
+                }
+                let word_len = to_in - start;
+
+                // Skip past delimiter
+                if to_in < num_tib {
+                    to_in += 1;
+                }
+
+                // Update >IN in WASM memory
+                let data = memory.data_mut(&mut caller);
+                data[SYSVAR_TO_IN as usize..SYSVAR_TO_IN as usize + 4]
+                    .copy_from_slice(&to_in.to_le_bytes());
+
+                // Store counted string at PAD
+                let buf_addr = crate::memory::PAD_BASE;
+                data[buf_addr as usize] = word_len as u8;
+                let src_start = (INPUT_BUFFER_BASE + start) as usize;
+                let dst_start = buf_addr as usize + 1;
+                for i in 0..word_len as usize {
+                    data[dst_start + i] = data[src_start + i];
+                }
+
+                // Push c-addr onto data stack
+                let new_sp = sp; // We already popped delim, now push c-addr
+                let data = memory.data_mut(&mut caller);
+                data[(new_sp) as usize..(new_sp + 4) as usize]
+                    .copy_from_slice(&(buf_addr as i32).to_le_bytes());
+                dsp.set(&mut caller, Val::I32(new_sp as i32))?;
+
                 Ok(())
             },
         );
@@ -3654,10 +4530,25 @@ impl ForthVM {
         // Pop counted string address
         let c_addr = self.pop_data_stack()? as u32;
 
+        // Bounds check: c_addr must be within WASM memory
+        let mem_len = self.memory.data(&self.store).len() as u32;
+        if c_addr >= mem_len {
+            // Invalid address -- push original address and 0 (not found)
+            self.push_data_stack(c_addr as i32)?;
+            self.push_data_stack(0)?;
+            return Ok(());
+        }
+
         // Read counted string from WASM memory
         let data = self.memory.data(&self.store);
         let count = data[c_addr as usize] as usize;
         let name_start = (c_addr + 1) as usize;
+        if name_start + count > mem_len as usize {
+            // String extends past memory -- push original address and 0
+            self.push_data_stack(c_addr as i32)?;
+            self.push_data_stack(0)?;
+            return Ok(());
+        }
         let name = String::from_utf8_lossy(&data[name_start..name_start + count]).to_string();
 
         // Look up in dictionary
@@ -3689,6 +4580,8 @@ impl ForthVM {
             4 => self.interpret_evaluate(),
             5 => self.interpret_word(),
             6 => self.interpret_find(),
+            7 => self.interpret_parse(),
+            8 => self.interpret_parse_name(),
             _ => Ok(()),
         }
     }
@@ -4132,6 +5025,382 @@ impl ForthVM {
     fn store_latest_fn_index(&mut self, word_id: WordId) {
         let data = self.memory.data_mut(&mut self.store);
         data[0x30..0x34].copy_from_slice(&word_id.0.to_le_bytes());
+    }
+
+    /// Sync a word to the shared word_lookup for inline FIND access.
+    fn sync_word_lookup(&self, name: &str, word_id: WordId, is_immediate: bool) {
+        let mut lookup = self.word_lookup.lock().unwrap();
+        lookup.insert(name.to_ascii_uppercase(), (word_id.0, is_immediate));
+    }
+
+    /// Rebuild the entire word_lookup from the dictionary.
+    /// This iterates all visible words and populates the shared lookup table.
+    fn rebuild_word_lookup(&self) {
+        let mut lookup = self.word_lookup.lock().unwrap();
+        lookup.clear();
+        // Use dictionary.find for each known word is too slow.
+        // Instead, iterate through the dictionary's linked list.
+        // We use the dictionary's public API to traverse:
+        let mut addr = self.dictionary.latest();
+        while addr != 0 {
+            if let Ok(name) = self.dictionary.word_name(addr)
+                && let Some((_, word_id, is_imm)) = self.dictionary.find(&name)
+            {
+                lookup.insert(name.to_ascii_uppercase(), (word_id.0, is_imm));
+            }
+            // The link field is at the start of the entry (first 4 bytes)
+            let prev = self.dictionary.read_link(addr);
+            if prev == addr {
+                break; // Prevent infinite loop
+            }
+            addr = prev;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Core Extension words: register functions
+    // -----------------------------------------------------------------------
+
+    /// 2R@ ( -- x1 x2 ) ( R: x1 x2 -- x1 x2 ) copy two cells from return stack.
+    fn register_2r_fetch(&mut self) -> anyhow::Result<()> {
+        let memory = self.memory;
+        let dsp = self.dsp;
+        let rsp = self.rsp;
+
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                let rsp_val = rsp.get(&mut caller).unwrap_i32() as u32;
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let data = memory.data(&caller);
+                // Return stack: x2 at rsp, x1 at rsp+4
+                let b: [u8; 4] = data[rsp_val as usize..rsp_val as usize + 4]
+                    .try_into()
+                    .unwrap();
+                let x2 = i32::from_le_bytes(b);
+                let b: [u8; 4] = data[(rsp_val + 4) as usize..(rsp_val + 8) as usize]
+                    .try_into()
+                    .unwrap();
+                let x1 = i32::from_le_bytes(b);
+                // Push x1 then x2 onto data stack
+                let new_sp = sp - 8;
+                let data = memory.data_mut(&mut caller);
+                data[(new_sp + 4) as usize..(new_sp + 8) as usize]
+                    .copy_from_slice(&x1.to_le_bytes());
+                data[new_sp as usize..new_sp as usize + 4].copy_from_slice(&x2.to_le_bytes());
+                dsp.set(&mut caller, Val::I32(new_sp as i32))?;
+                Ok(())
+            },
+        );
+
+        self.register_host_primitive("2R@", false, func)?;
+        Ok(())
+    }
+
+    /// ERASE ( addr u -- ) fill memory with zeros.
+    fn register_erase(&mut self) -> anyhow::Result<()> {
+        let memory = self.memory;
+        let dsp = self.dsp;
+
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let data = memory.data(&caller);
+                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
+                let u = i32::from_le_bytes(b) as usize;
+                let b: [u8; 4] = data[(sp + 4) as usize..(sp + 8) as usize]
+                    .try_into()
+                    .unwrap();
+                let addr = i32::from_le_bytes(b) as usize;
+                dsp.set(&mut caller, Val::I32((sp + 8) as i32))?;
+                let data = memory.data_mut(&mut caller);
+                for i in 0..u {
+                    data[addr + i] = 0;
+                }
+                Ok(())
+            },
+        );
+
+        self.register_host_primitive("ERASE", false, func)?;
+        Ok(())
+    }
+
+    /// .R ( n width -- ) right-justified signed number output.
+    fn register_dot_r(&mut self) -> anyhow::Result<()> {
+        let memory = self.memory;
+        let dsp = self.dsp;
+        let output = Arc::clone(&self.output);
+
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let data = memory.data(&caller);
+                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
+                let width = i32::from_le_bytes(b) as usize;
+                let b: [u8; 4] = data[(sp + 4) as usize..(sp + 8) as usize]
+                    .try_into()
+                    .unwrap();
+                let n = i32::from_le_bytes(b);
+                // Read BASE
+                let b: [u8; 4] = data[SYSVAR_BASE_VAR as usize..SYSVAR_BASE_VAR as usize + 4]
+                    .try_into()
+                    .unwrap();
+                let base_val = u32::from_le_bytes(b);
+                dsp.set(&mut caller, Val::I32((sp + 8) as i32))?;
+                // Format number without trailing space
+                let s = format_signed(n, base_val);
+                let s = s.trim_end(); // remove trailing space
+                let mut out = output.lock().unwrap();
+                if s.len() < width {
+                    for _ in 0..width - s.len() {
+                        out.push(' ');
+                    }
+                }
+                out.push_str(s);
+                Ok(())
+            },
+        );
+
+        self.register_host_primitive(".R", false, func)?;
+        Ok(())
+    }
+
+    /// U.R ( u width -- ) right-justified unsigned number output.
+    fn register_u_dot_r(&mut self) -> anyhow::Result<()> {
+        let memory = self.memory;
+        let dsp = self.dsp;
+        let output = Arc::clone(&self.output);
+
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let data = memory.data(&caller);
+                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
+                let width = i32::from_le_bytes(b) as usize;
+                let b: [u8; 4] = data[(sp + 4) as usize..(sp + 8) as usize]
+                    .try_into()
+                    .unwrap();
+                let u = u32::from_le_bytes(b);
+                // Read BASE
+                let b: [u8; 4] = data[SYSVAR_BASE_VAR as usize..SYSVAR_BASE_VAR as usize + 4]
+                    .try_into()
+                    .unwrap();
+                let base_val = u32::from_le_bytes(b);
+                dsp.set(&mut caller, Val::I32((sp + 8) as i32))?;
+                let s = format_unsigned(u, base_val);
+                let s = s.trim_end();
+                let mut out = output.lock().unwrap();
+                if s.len() < width {
+                    for _ in 0..width - s.len() {
+                        out.push(' ');
+                    }
+                }
+                out.push_str(s);
+                Ok(())
+            },
+        );
+
+        self.register_host_primitive("U.R", false, func)?;
+        Ok(())
+    }
+
+    /// UNUSED ( -- u ) return available dictionary space.
+    fn register_unused(&mut self) -> anyhow::Result<()> {
+        let memory = self.memory;
+        let dsp = self.dsp;
+        let here_cell = self.here_cell.clone();
+
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                let here_val = here_cell.as_ref().map(|c| *c.lock().unwrap()).unwrap_or(0);
+                let mem_size = memory.data(&caller).len() as u32;
+                let unused = mem_size.saturating_sub(here_val);
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let new_sp = sp - CELL_SIZE;
+                let data = memory.data_mut(&mut caller);
+                data[new_sp as usize..new_sp as usize + 4]
+                    .copy_from_slice(&(unused as i32).to_le_bytes());
+                dsp.set(&mut caller, Val::I32(new_sp as i32))?;
+                Ok(())
+            },
+        );
+
+        self.register_host_primitive("UNUSED", false, func)?;
+        Ok(())
+    }
+
+    /// HOLDS ( c-addr u -- ) add string to pictured output.
+    fn register_holds(&mut self) -> anyhow::Result<()> {
+        use crate::memory::SYSVAR_HLD;
+
+        let memory = self.memory;
+        let dsp = self.dsp;
+
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let data = memory.data(&caller);
+                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
+                let u = i32::from_le_bytes(b) as usize;
+                let b: [u8; 4] = data[(sp + 4) as usize..(sp + 8) as usize]
+                    .try_into()
+                    .unwrap();
+                let c_addr = i32::from_le_bytes(b) as usize;
+                // Read HLD
+                let b: [u8; 4] = data[SYSVAR_HLD as usize..SYSVAR_HLD as usize + 4]
+                    .try_into()
+                    .unwrap();
+                let mut hld = u32::from_le_bytes(b);
+                dsp.set(&mut caller, Val::I32((sp + 8) as i32))?;
+                // Add string to pictured output (backwards)
+                let data = memory.data_mut(&mut caller);
+                for i in (0..u).rev() {
+                    hld -= 1;
+                    data[hld as usize] = data[c_addr + i];
+                }
+                data[SYSVAR_HLD as usize..SYSVAR_HLD as usize + 4]
+                    .copy_from_slice(&hld.to_le_bytes());
+                Ok(())
+            },
+        );
+
+        self.register_host_primitive("HOLDS", false, func)?;
+        Ok(())
+    }
+
+    /// PARSE as a host function for compiled code.
+    fn register_parse_host(&mut self) -> anyhow::Result<()> {
+        let pending = Arc::clone(&self.pending_define);
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |_caller, _params, _results| {
+                *pending.lock().unwrap() = 7;
+                Ok(())
+            },
+        );
+
+        self.register_host_primitive("PARSE", false, func)?;
+        Ok(())
+    }
+
+    /// PARSE-NAME as a host function for compiled code.
+    fn register_parse_name_host(&mut self) -> anyhow::Result<()> {
+        let pending = Arc::clone(&self.pending_define);
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |_caller, _params, _results| {
+                *pending.lock().unwrap() = 8;
+                Ok(())
+            },
+        );
+
+        self.register_host_primitive("PARSE-NAME", false, func)?;
+        Ok(())
+    }
+
+    /// REFILL ( -- flag ) in piped/string mode, always returns FALSE.
+    fn register_refill(&mut self) -> anyhow::Result<()> {
+        let memory = self.memory;
+        let dsp = self.dsp;
+
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let new_sp = sp - CELL_SIZE;
+                let data = memory.data_mut(&mut caller);
+                data[new_sp as usize..new_sp as usize + 4].copy_from_slice(&0i32.to_le_bytes());
+                dsp.set(&mut caller, Val::I32(new_sp as i32))?;
+                Ok(())
+            },
+        );
+
+        self.register_host_primitive("REFILL", false, func)?;
+        Ok(())
+    }
+
+    /// DEFER! ( xt2 xt1 -- ) set deferred word xt1 to execute xt2.
+    fn register_defer_store(&mut self) -> anyhow::Result<()> {
+        let memory = self.memory;
+        let dsp = self.dsp;
+        let pfa_map = self.word_pfa_map_shared.clone();
+
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let data = memory.data(&caller);
+                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
+                let xt1 = u32::from_le_bytes(b); // deferred word's xt
+                let b: [u8; 4] = data[(sp + 4) as usize..(sp + 8) as usize]
+                    .try_into()
+                    .unwrap();
+                let xt2 = i32::from_le_bytes(b); // xt to store
+                dsp.set(&mut caller, Val::I32((sp + 8) as i32))?;
+
+                if let Some(ref map) = pfa_map {
+                    let map = map.lock().unwrap();
+                    if let Some(&pfa) = map.get(&xt1) {
+                        let data = memory.data_mut(&mut caller);
+                        data[pfa as usize..pfa as usize + 4].copy_from_slice(&xt2.to_le_bytes());
+                    }
+                }
+                Ok(())
+            },
+        );
+
+        self.register_host_primitive("DEFER!", false, func)?;
+        Ok(())
+    }
+
+    /// DEFER@ ( xt1 -- xt2 ) retrieve the xt from a deferred word.
+    fn register_defer_fetch(&mut self) -> anyhow::Result<()> {
+        let memory = self.memory;
+        let dsp = self.dsp;
+        let pfa_map = self.word_pfa_map_shared.clone();
+
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let data = memory.data(&caller);
+                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
+                let xt1 = u32::from_le_bytes(b);
+
+                let mut result = 0i32;
+                if let Some(ref map) = pfa_map {
+                    let map = map.lock().unwrap();
+                    if let Some(&pfa) = map.get(&xt1) {
+                        let data = memory.data(&caller);
+                        let b: [u8; 4] = data[pfa as usize..pfa as usize + 4].try_into().unwrap();
+                        result = i32::from_le_bytes(b);
+                    }
+                }
+
+                let data = memory.data_mut(&mut caller);
+                data[sp as usize..sp as usize + 4].copy_from_slice(&result.to_le_bytes());
+                Ok(())
+            },
+        );
+
+        self.register_host_primitive("DEFER@", false, func)?;
+        Ok(())
     }
 }
 
@@ -5228,5 +6497,233 @@ mod tests {
         // Second call: PFA 2 +
         vm.evaluate("W1").unwrap();
         assert_eq!(vm.data_stack(), vec![pfa + 2]);
+    }
+
+    // ===================================================================
+    // Core Extension words
+    // ===================================================================
+
+    #[test]
+    fn test_value_basic() {
+        assert_eq!(eval_output("10 VALUE FOO FOO ."), "10 ");
+    }
+
+    #[test]
+    fn test_value_to() {
+        assert_eq!(eval_output("10 VALUE FOO 20 TO FOO FOO ."), "20 ");
+    }
+
+    #[test]
+    fn test_value_in_colon() {
+        assert_eq!(eval_output("10 VALUE FOO : TEST FOO . ; TEST"), "10 ");
+    }
+
+    #[test]
+    fn test_value_to_in_colon() {
+        let mut vm = ForthVM::new().unwrap();
+        vm.evaluate("10 VALUE FOO").unwrap();
+        vm.evaluate(": SETFOO TO FOO ;").unwrap();
+        vm.evaluate("20 SETFOO FOO .").unwrap();
+        assert_eq!(vm.take_output(), "20 ");
+    }
+
+    #[test]
+    fn test_defer_basic() {
+        let mut vm = ForthVM::new().unwrap();
+        vm.evaluate("DEFER MY-DEFER").unwrap();
+        vm.evaluate("' DUP IS MY-DEFER").unwrap();
+        vm.evaluate("5 MY-DEFER .S").unwrap();
+        assert_eq!(vm.take_output(), "<2> 5 5 ");
+    }
+
+    #[test]
+    fn test_defer_action_of() {
+        let mut vm = ForthVM::new().unwrap();
+        vm.evaluate("DEFER MY-DEFER").unwrap();
+        vm.evaluate("' DUP IS MY-DEFER").unwrap();
+        vm.evaluate("ACTION-OF MY-DEFER ' DUP =").unwrap();
+        assert_eq!(vm.data_stack(), vec![-1]); // TRUE
+    }
+
+    #[test]
+    fn test_2r_operations() {
+        assert_eq!(eval_stack(": TEST 1 2 2>R 2R> ; TEST"), vec![2, 1]);
+        assert_eq!(
+            eval_stack(": TEST 1 2 2>R 2R@ 2R> 2DROP ; TEST"),
+            vec![2, 1]
+        );
+    }
+
+    #[test]
+    fn test_again() {
+        // AGAIN creates an infinite loop; use EXIT to break out
+        assert_eq!(
+            eval_output(": TEST BEGIN DUP . 1+ DUP 5 > IF EXIT THEN AGAIN ; 1 TEST"),
+            "1 2 3 4 5 "
+        );
+    }
+
+    #[test]
+    fn test_case_of_endof_endcase() {
+        assert_eq!(
+            eval_output(
+                ": TEST CASE 1 OF 10 ENDOF 2 OF 20 ENDOF 0 SWAP ENDCASE ; 1 TEST . 2 TEST . 3 TEST ."
+            ),
+            "10 20 0 "
+        );
+    }
+
+    #[test]
+    fn test_case_empty() {
+        // Empty CASE with just DROP
+        assert_eq!(eval_output(": TEST CASE ENDCASE ; 5 TEST"), "");
+    }
+
+    #[test]
+    fn test_u_greater() {
+        assert_eq!(eval_stack("2 1 U>"), vec![-1]);
+        assert_eq!(eval_stack("1 2 U>"), vec![0]);
+        assert_eq!(eval_stack("-1 1 U>"), vec![-1]); // -1 as unsigned > 1
+    }
+
+    #[test]
+    fn test_qdo_basic() {
+        assert_eq!(
+            eval_output(": TEST 10 0 ?DO I . LOOP ; TEST"),
+            "0 1 2 3 4 5 6 7 8 9 "
+        );
+    }
+
+    #[test]
+    fn test_qdo_skip() {
+        // ?DO should skip the loop body when limit == index
+        assert_eq!(eval_output(": TEST 0 0 ?DO I . LOOP ; TEST"), "");
+    }
+
+    #[test]
+    fn test_pad() {
+        let stack = eval_stack("PAD");
+        assert_eq!(stack.len(), 1);
+        assert_eq!(stack[0], crate::memory::PAD_BASE as i32);
+    }
+
+    #[test]
+    fn test_erase() {
+        let mut vm = ForthVM::new().unwrap();
+        vm.evaluate("HERE 65 C, 66 C, 67 C,").unwrap(); // write ABC, stack: addr
+        vm.evaluate("DUP 3 ERASE").unwrap(); // erase 3 bytes at addr
+        vm.evaluate("DUP C@ SWAP 1+ C@").unwrap();
+        assert_eq!(vm.data_stack(), vec![0, 0]);
+    }
+
+    #[test]
+    fn test_dot_r() {
+        assert_eq!(eval_output("123 6 .R"), "   123");
+    }
+
+    #[test]
+    fn test_u_dot_r() {
+        assert_eq!(eval_output("123 6 U.R"), "   123");
+    }
+
+    #[test]
+    fn test_unused() {
+        let stack = eval_stack("UNUSED");
+        assert_eq!(stack.len(), 1);
+        assert!(stack[0] > 0); // Should have some available space
+    }
+
+    #[test]
+    fn test_noname() {
+        assert_eq!(eval_output(":NONAME 42 . ; EXECUTE"), "42 ");
+    }
+
+    #[test]
+    fn test_noname_constant() {
+        assert_eq!(
+            eval_output(":NONAME DUP + ; CONSTANT DUP+ 5 DUP+ EXECUTE ."),
+            "10 "
+        );
+    }
+
+    #[test]
+    fn test_parse() {
+        // PARSE ( char -- c-addr u ) in interpret mode
+        // PARSE does NOT skip leading delimiter, so includes leading space
+        let mut vm = ForthVM::new().unwrap();
+        vm.evaluate("CHAR ) PARSE hello)").unwrap();
+        let stack = vm.data_stack();
+        assert_eq!(stack.len(), 2);
+        // The parsed text is " hello" (with leading space) -- length 6
+        assert_eq!(stack[0], 6); // length
+    }
+
+    #[test]
+    fn test_parse_name() {
+        let mut vm = ForthVM::new().unwrap();
+        vm.evaluate("PARSE-NAME hello").unwrap();
+        let stack = vm.data_stack();
+        assert_eq!(stack.len(), 2);
+        assert_eq!(stack[0], 5); // length of "hello"
+    }
+
+    #[test]
+    fn test_buffer_colon() {
+        let mut vm = ForthVM::new().unwrap();
+        vm.evaluate("100 BUFFER: BUF").unwrap();
+        vm.evaluate("BUF").unwrap();
+        let stack = vm.data_stack();
+        assert_eq!(stack.len(), 1);
+        assert!(stack[0] > 0); // Address should be valid
+    }
+
+    #[test]
+    fn test_source_id() {
+        // SOURCE-ID should return 0 for user input
+        assert_eq!(eval_stack("SOURCE-ID"), vec![0]);
+    }
+
+    #[test]
+    fn test_c_quote() {
+        assert_eq!(eval_output("C\" hello\" COUNT TYPE"), "hello");
+    }
+
+    #[test]
+    fn test_refill() {
+        // REFILL should return FALSE in piped mode
+        assert_eq!(eval_stack("REFILL"), vec![0]);
+    }
+
+    #[test]
+    fn test_marker() {
+        // MARKER should create a word without errors
+        let mut vm = ForthVM::new().unwrap();
+        vm.evaluate("MARKER MARK1").unwrap();
+        // MARK1 should exist and be callable
+        vm.evaluate("MARK1").unwrap();
+    }
+
+    #[test]
+    fn test_holds() {
+        // HOLDS adds string to pictured output
+        assert_eq!(
+            eval_output(": TEST 0 <# S\" xyz\" HOLDS 0 #> TYPE ; TEST"),
+            "xyz"
+        );
+    }
+
+    #[test]
+    fn test_defer_store_fetch() {
+        let mut vm = ForthVM::new().unwrap();
+        vm.evaluate("DEFER MY-DEF").unwrap();
+        vm.evaluate("' DUP ' MY-DEF DEFER!").unwrap();
+        vm.evaluate("' MY-DEF DEFER@").unwrap();
+        let dup_xt = {
+            vm.evaluate("' DUP").unwrap();
+            vm.data_stack()[0]
+        };
+        // The DEFER@ result should match DUP's xt
+        let stack = vm.data_stack();
+        assert_eq!(stack[0], dup_xt);
     }
 }

@@ -193,6 +193,14 @@ impl Dictionary {
         self.latest
     }
 
+    /// Read the link field (previous word address) at a word entry.
+    pub fn read_link(&self, word_addr: u32) -> u32 {
+        if (word_addr + 4) as usize > self.memory.len() {
+            return 0;
+        }
+        self.read_u32_unchecked(word_addr)
+    }
+
     /// Allocate n bytes at HERE (like Forth's ALLOT).
     pub fn allot(&mut self, n: u32) -> WaferResult<u32> {
         let new_here = self

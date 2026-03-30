@@ -436,6 +436,13 @@ fn emit_op(f: &mut Function, op: &IrOp) {
                 .instruction(&Instruction::End);
         }
 
+        IrOp::BeginAgain { body } => {
+            f.instruction(&Instruction::Loop(BlockType::Empty));
+            emit_body(f, body);
+            f.instruction(&Instruction::Br(0))
+                .instruction(&Instruction::End);
+        }
+
         IrOp::BeginWhileRepeat { test, body } => {
             f.instruction(&Instruction::Block(BlockType::Empty));
             f.instruction(&Instruction::Loop(BlockType::Empty));
@@ -702,6 +709,7 @@ fn count_needed_locals(ops: &[IrOp]) -> u32 {
             IrOp::Rot | IrOp::Tuck => max = max.max(4),
             IrOp::DoLoop { body, .. } => max = max.max(count_needed_locals(body)),
             IrOp::BeginUntil { body } => max = max.max(count_needed_locals(body)),
+            IrOp::BeginAgain { body } => max = max.max(count_needed_locals(body)),
             IrOp::BeginWhileRepeat { test, body } => {
                 max = max
                     .max(count_needed_locals(test))

@@ -6,12 +6,12 @@ An optimizing Forth 2012 compiler targeting WebAssembly.
 
 ## Status
 
-WAFER is a working Forth system. It JIT-compiles each word definition to a separate WASM module and executes via `wasmtime`. 232 unit tests passing, **0 errors on the Forth 2012 Core test suite** (100% Core compliance).
+WAFER is a working Forth system. It JIT-compiles each word definition to a separate WASM module and executes via `wasmtime`. 261 unit tests passing, **0 errors on Core, Core Extensions, and Exception test suites**.
 
 **Working features:**
 
 - Colon definitions with full control flow (IF/ELSE/THEN, DO/LOOP/+LOOP, BEGIN/UNTIL, BEGIN/WHILE/REPEAT)
-- 90+ words: stack, arithmetic, comparison, logic, memory, I/O, defining words, system
+- 110+ words: stack, arithmetic, comparison, logic, memory, I/O, defining words, system, exceptions
 - Recursion (RECURSE), nested control structures, loop counters (I, J)
 - VARIABLE, CONSTANT, CREATE, DOES>
 - Number bases (HEX, DECIMAL), number prefixes ($hex, #dec, %bin)
@@ -117,7 +117,7 @@ tests/        Forth 2012 compliance suite (gerryjackson/forth2012-test-suite sub
 
 ### Not Yet Implemented
 
-All Core words implemented. Exception word set (CATCH/THROW) also available.
+All Core and Core Extension words implemented. Exception word set (CATCH/THROW) also complete. VALUE, TO, DEFER, IS, CASE/OF/ENDOF/ENDCASE, :NONAME, PARSE-NAME, S\\", BUFFER:, ?DO, AGAIN, and more.
 
 ## Compliance Status
 
@@ -126,9 +126,9 @@ Targeting 100% Forth 2012 compliance via [Gerry Jackson's test suite](https://gi
 | Word Set           | Status             |
 | ------------------ | ------------------ |
 | Core               | **100%** (0 errors on test suite) |
-| Core Extensions    | Pending            |
+| Core Extensions    | **100%** (0 errors on test suite) |
 | Double-Number      | Pending            |
-| Exception          | **CATCH/THROW implemented** |
+| Exception          | **100%** (0 errors on test suite) |
 | Facility           | Pending            |
 | File-Access        | Pending            |
 | Floating-Point     | Pending            |

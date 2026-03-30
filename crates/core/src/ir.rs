@@ -84,6 +84,10 @@ pub enum IrOp {
     BeginUntil {
         body: Vec<IrOp>,
     },
+    /// BEGIN ... AGAIN (infinite loop)
+    BeginAgain {
+        body: Vec<IrOp>,
+    },
     /// BEGIN ... WHILE ... REPEAT
     BeginWhileRepeat {
         test: Vec<IrOp>,
