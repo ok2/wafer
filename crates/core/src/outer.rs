@@ -196,6 +196,12 @@ pub struct ForthVM {
     // Pending action from compiled defining/parsing words
     // 0 = none, 1 = CONSTANT, 2 = VARIABLE, 3 = CREATE, 4 = EVALUATE
     pending_define: Arc<Mutex<i32>>,
+    // Pending word IDs to compile (used by COMPILE, / POSTPONE mechanism)
+    pending_compile: Arc<Mutex<Vec<u32>>>,
+    // Pending DOES> patch: (does_action_id) to apply after word execution
+    pending_does_patch: Arc<Mutex<Option<u32>>>,
+    // Exception word set: throw code shared between CATCH and THROW host functions
+    throw_code: Arc<Mutex<Option<i32>>>,
 }
 
 impl ForthVM {
@@ -292,6 +298,9 @@ impl ForthVM {
             word_pfa_map: HashMap::new(),
             word_pfa_map_shared: None,
             pending_define: Arc::new(Mutex::new(0)),
+            pending_compile: Arc::new(Mutex::new(Vec::new())),
+            pending_does_patch: Arc::new(Mutex::new(None)),
+            throw_code: Arc::new(Mutex::new(None)),
         };
 
         vm.register_primitives()?;
@@ -655,10 +664,27 @@ impl ForthVM {
                 return Ok(());
             }
             "POSTPONE" => {
-                // Read next token, compile a call to it
+                // Forth 2012 POSTPONE semantics:
+                // - Immediate word: compile a call (so it executes at runtime,
+                //   i.e., during compilation of the enclosing definition)
+                // - Non-immediate word: compile code that, when executed,
+                //   appends Call(word_id) to the current compilation.
+                //   This uses COMPILE, to signal the outer interpreter.
                 if let Some(next) = self.next_token() {
-                    if let Some((_addr, word_id, _imm)) = self.dictionary.find(&next) {
-                        self.push_ir(IrOp::Call(word_id));
+                    if let Some((_addr, word_id, is_imm)) = self.dictionary.find(&next) {
+                        if is_imm {
+                            // Immediate: just compile a call to it
+                            self.push_ir(IrOp::Call(word_id));
+                        } else {
+                            // Non-immediate: compile code to push xt and call COMPILE,
+                            let compile_comma_id = self
+                                .dictionary
+                                .find("COMPILE,")
+                                .map(|(_, id, _)| id)
+                                .ok_or_else(|| anyhow::anyhow!("POSTPONE: COMPILE, not found"))?;
+                            self.push_ir(IrOp::PushI32(word_id.0 as i32));
+                            self.push_ir(IrOp::Call(compile_comma_id));
+                        }
                     } else {
                         anyhow::bail!("POSTPONE: unknown word: {}", next);
                     }
@@ -716,6 +742,8 @@ impl ForthVM {
             if is_immediate {
                 // Execute immediately even in compile mode
                 self.execute_word(word_id)?;
+                // Handle any pending COMPILE, operations from POSTPONE
+                self.handle_pending_compile();
             } else {
                 self.push_ir(IrOp::Call(word_id));
             }
@@ -1098,6 +1126,8 @@ impl ForthVM {
         self.sync_base_from_wasm();
         // Handle pending defining actions (CONSTANT, VARIABLE, CREATE called at runtime)
         self.handle_pending_define()?;
+        // Handle pending DOES> patch (runtime DOES> from double-DOES> words)
+        self.handle_pending_does_patch()?;
         Ok(())
     }
 
@@ -1395,6 +1425,12 @@ impl ForthVM {
         // \ (backslash comment) as an immediate word so POSTPONE can find it
         self.register_backslash()?;
 
+        // COMPILE, (compile-comma) for POSTPONE mechanism
+        self.register_compile_comma()?;
+
+        // Runtime DOES> patch for double-DOES> support
+        self.register_does_patch()?;
+
         // CONSTANT, VARIABLE, CREATE as callable words (for use inside colon defs)
         self.register_defining_words()?;
 
@@ -1408,6 +1444,9 @@ impl ForthVM {
 
         // Pictured numeric output
         self.register_pictured_numeric()?;
+
+        // Exception word set: CATCH and THROW
+        self.register_catch_throw()?;
 
         Ok(())
     }
@@ -2382,6 +2421,120 @@ impl ForthVM {
     }
 
     // -----------------------------------------------------------------------
+    // Exception word set: CATCH and THROW
+    // -----------------------------------------------------------------------
+
+    /// Register CATCH and THROW (Forth 2012 Exception word set).
+    ///
+    /// CATCH ( xt -- exception# | 0 ) executes xt. If it completes normally,
+    /// pushes 0. If THROW is called, restores stacks and pushes the throw code.
+    ///
+    /// THROW ( exception# -- ) if non-zero, unwinds execution back to the
+    /// nearest CATCH, passing the exception code.
+    fn register_catch_throw(&mut self) -> anyhow::Result<()> {
+        let throw_code = Arc::clone(&self.throw_code);
+        let memory = self.memory;
+        let dsp = self.dsp;
+        let rsp = self.rsp;
+        let table = self.table;
+
+        // THROW ( exception# -- )
+        let throw_code_for_throw = Arc::clone(&throw_code);
+        let throw_func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                // Pop throw code from data stack
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                if sp >= DATA_STACK_TOP {
+                    return Err(wasmtime::Error::msg("THROW: stack underflow"));
+                }
+                let data = memory.data(&caller);
+                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
+                let code = i32::from_le_bytes(b);
+                // Pop TOS
+                dsp.set(&mut caller, Val::I32((sp + CELL_SIZE) as i32))?;
+
+                if code == 0 {
+                    return Ok(());
+                }
+
+                // Store the throw code and trigger a trap to unwind back to CATCH
+                *throw_code_for_throw.lock().unwrap() = Some(code);
+                Err(wasmtime::Error::msg("forth-throw"))
+            },
+        );
+        self.register_host_primitive("THROW", false, throw_func)?;
+
+        // CATCH ( xt -- exception# | 0 )
+        let throw_code_for_catch = Arc::clone(&throw_code);
+        let catch_func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                // Pop xt from data stack
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                if sp >= DATA_STACK_TOP {
+                    return Err(wasmtime::Error::msg("CATCH: stack underflow"));
+                }
+                let data = memory.data(&caller);
+                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
+                let xt = u32::from_le_bytes(b);
+                // Pop TOS (remove xt)
+                let sp_after_pop = sp + CELL_SIZE;
+                dsp.set(&mut caller, Val::I32(sp_after_pop as i32))?;
+
+                // Save stack depths for restoration on THROW
+                let saved_dsp = sp_after_pop;
+                let saved_rsp = rsp.get(&mut caller).unwrap_i32() as u32;
+
+                // Look up the function in the table
+                let func_ref = table
+                    .get(&mut caller, xt as u64)
+                    .ok_or_else(|| wasmtime::Error::msg("CATCH: invalid xt"))?;
+                let func = *func_ref
+                    .unwrap_func()
+                    .ok_or_else(|| wasmtime::Error::msg("CATCH: null funcref"))?;
+
+                // Call the word -- if THROW is invoked, func.call returns Err
+                match func.call(&mut caller, &[], &mut []) {
+                    Ok(()) => {
+                        // Normal completion: push 0
+                        let current_sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                        let new_sp = current_sp.wrapping_sub(CELL_SIZE);
+                        let data = memory.data_mut(&mut caller);
+                        data[new_sp as usize..new_sp as usize + 4]
+                            .copy_from_slice(&0_i32.to_le_bytes());
+                        dsp.set(&mut caller, Val::I32(new_sp as i32))?;
+                        Ok(())
+                    }
+                    Err(_) => {
+                        // Check if this was a THROW (vs some other trap)
+                        let mut tc = throw_code_for_catch.lock().unwrap();
+                        let code = tc.take().unwrap_or(-1);
+                        drop(tc);
+
+                        // Restore stack pointers to saved depths
+                        dsp.set(&mut caller, Val::I32(saved_dsp as i32))?;
+                        rsp.set(&mut caller, Val::I32(saved_rsp as i32))?;
+
+                        // Push the throw code onto the restored stack
+                        let new_sp = saved_dsp.wrapping_sub(CELL_SIZE);
+                        let data = memory.data_mut(&mut caller);
+                        data[new_sp as usize..new_sp as usize + 4]
+                            .copy_from_slice(&code.to_le_bytes());
+                        dsp.set(&mut caller, Val::I32(new_sp as i32))?;
+                        Ok(())
+                    }
+                }
+            },
+        );
+        self.register_host_primitive("CATCH", false, catch_func)?;
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
     // EVALUATE -- save input, interpret string, restore input
     // -----------------------------------------------------------------------
 
@@ -2570,7 +2723,61 @@ impl ForthVM {
             does_tokens.push(token);
         }
 
-        // Compile the does-body as a separate word
+        // Check for a second DOES> in the does-body (double-DOES> pattern).
+        // If found, split: first part is the first does-action, second part
+        // becomes a separate does-action that gets patched in at runtime.
+        let does_split = does_tokens
+            .iter()
+            .position(|t| t.eq_ignore_ascii_case("DOES>"));
+        let (first_tokens, second_does_tokens) = if let Some(pos) = does_split {
+            (
+                does_tokens[..pos].to_vec(),
+                Some(does_tokens[pos + 1..].to_vec()),
+            )
+        } else {
+            (does_tokens, None)
+        };
+
+        // If there's a second DOES>, compile its body first as a separate word
+        let second_does_action_id = if let Some(ref second_tokens) = second_does_tokens {
+            let second_word_id = self
+                .dictionary
+                .create("_does_action2_", false)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            self.dictionary.reveal();
+            self.next_table_index = self.next_table_index.max(second_word_id.0 + 1);
+
+            let saved_name2 = self.compiling_name.take();
+            let saved_word_id2 = self.compiling_word_id.take();
+            let saved_control2 = std::mem::take(&mut self.control_stack);
+
+            self.compiling_ir.clear();
+            self.compiling_name = Some("_does_action2_".to_string());
+            self.compiling_word_id = Some(second_word_id);
+
+            for token in second_tokens {
+                self.compile_token(token)?;
+            }
+
+            let second_ir = std::mem::take(&mut self.compiling_ir);
+            let config = CodegenConfig {
+                base_fn_index: second_word_id.0,
+                table_size: self.table_size(),
+            };
+            let compiled = compile_word("_does_action2_", &second_ir, &config)
+                .map_err(|e| anyhow::anyhow!("codegen error for DOES> body 2: {}", e))?;
+            self.instantiate_and_install(&compiled, second_word_id)?;
+
+            self.compiling_name = saved_name2;
+            self.compiling_word_id = saved_word_id2;
+            self.control_stack = saved_control2;
+
+            Some(second_word_id)
+        } else {
+            None
+        };
+
+        // Compile the first does-body as a separate word
         let does_word_id = self
             .dictionary
             .create("_does_action_", false)
@@ -2587,8 +2794,19 @@ impl ForthVM {
         self.compiling_name = Some("_does_action_".to_string());
         self.compiling_word_id = Some(does_word_id);
 
-        for token in &does_tokens {
+        for token in &first_tokens {
             self.compile_token(token)?;
+        }
+
+        // If there's a second DOES>, append code to patch the word at runtime
+        if let Some(second_action_id) = second_does_action_id {
+            let does_patch_id = self
+                .dictionary
+                .find("_DOES_PATCH_")
+                .map(|(_, id, _)| id)
+                .ok_or_else(|| anyhow::anyhow!("_DOES_PATCH_ not found"))?;
+            self.push_ir(IrOp::PushI32(second_action_id.0 as i32));
+            self.push_ir(IrOp::Call(does_patch_id));
         }
 
         let does_ir = std::mem::take(&mut self.compiling_ir);
@@ -3295,6 +3513,64 @@ impl ForthVM {
     // CONSTANT, VARIABLE, CREATE as callable defining words
     // -----------------------------------------------------------------------
 
+    /// Register COMPILE, as a host function.
+    /// COMPILE, ( xt -- ) appends a call to xt into the current compilation.
+    /// Used internally by POSTPONE for non-immediate words.
+    fn register_compile_comma(&mut self) -> anyhow::Result<()> {
+        let memory = self.memory;
+        let dsp = self.dsp;
+        let pending_compile = Arc::clone(&self.pending_compile);
+
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                // Pop xt from data stack
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let data = memory.data(&caller);
+                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
+                let xt = u32::from_le_bytes(b);
+                // Drop top of stack
+                let new_sp = sp + 4;
+                dsp.set(&mut caller, Val::I32(new_sp as i32)).unwrap();
+                // Signal the outer interpreter to compile a call to this xt
+                pending_compile.lock().unwrap().push(xt);
+                Ok(())
+            },
+        );
+
+        self.register_host_primitive("COMPILE,", false, func)?;
+        Ok(())
+    }
+
+    /// Register `_does_patch_` as a host function for runtime DOES> patching.
+    /// ( does_action_id -- ) Signals the outer interpreter to patch the most
+    /// recently CREATEd word with a new DOES> action.
+    fn register_does_patch(&mut self) -> anyhow::Result<()> {
+        let memory = self.memory;
+        let dsp = self.dsp;
+        let pending_does_patch = Arc::clone(&self.pending_does_patch);
+
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                // Pop does_action_id from data stack
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let data = memory.data(&caller);
+                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
+                let does_action_id = u32::from_le_bytes(b);
+                let new_sp = sp + 4;
+                dsp.set(&mut caller, Val::I32(new_sp as i32)).unwrap();
+                *pending_does_patch.lock().unwrap() = Some(does_action_id);
+                Ok(())
+            },
+        );
+
+        self.register_host_primitive("_DOES_PATCH_", false, func)?;
+        Ok(())
+    }
+
     /// Register CONSTANT, VARIABLE, CREATE as host functions so they can
     /// be compiled into colon definitions (e.g., `: EQU CONSTANT ;`).
     fn register_defining_words(&mut self) -> anyhow::Result<()> {
@@ -3415,6 +3691,54 @@ impl ForthVM {
             6 => self.interpret_find(),
             _ => Ok(()),
         }
+    }
+
+    /// Drain pending_compile and push IrOp::Call for each entry into compiling_ir.
+    /// Called after executing an immediate word during compilation.
+    fn handle_pending_compile(&mut self) {
+        let pending: Vec<u32> = {
+            let mut v = self.pending_compile.lock().unwrap();
+            std::mem::take(&mut *v)
+        };
+        for xt in pending {
+            self.push_ir(IrOp::Call(WordId(xt)));
+        }
+    }
+
+    /// Handle a pending runtime DOES> patch.
+    /// When a DOES> body contains another DOES>, the inner DOES> signals via
+    /// `_DOES_PATCH_` to replace the most recently CREATEd word's behavior.
+    fn handle_pending_does_patch(&mut self) -> anyhow::Result<()> {
+        let does_action_id = {
+            let mut p = self.pending_does_patch.lock().unwrap();
+            p.take()
+        };
+        if let Some(action_id) = does_action_id {
+            let (target_addr, pfa) = self
+                .last_created_info
+                .ok_or_else(|| anyhow::anyhow!("runtime DOES>: no CREATEd word to patch"))?;
+
+            let fn_index = self
+                .dictionary
+                .code_field(target_addr)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            let target_word_id = WordId(fn_index);
+
+            let name = self
+                .dictionary
+                .word_name(target_addr)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+            let patched_ir = vec![IrOp::PushI32(pfa as i32), IrOp::Call(WordId(action_id))];
+            let config = CodegenConfig {
+                base_fn_index: target_word_id.0,
+                table_size: self.table_size(),
+            };
+            let compiled = compile_word(&name, &patched_ir, &config)
+                .map_err(|e| anyhow::anyhow!("runtime DOES> patch codegen: {}", e))?;
+            self.instantiate_and_install(&compiled, target_word_id)?;
+        }
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -4758,5 +5082,151 @@ mod tests {
         let data = vm.memory.data(&vm.store);
         let len = data[addr as usize];
         assert_eq!(len, 5); // "HELLO" is 5 chars
+    }
+
+    // ===================================================================
+    // Exception word set: CATCH and THROW
+    // ===================================================================
+
+    #[test]
+    fn test_catch_no_throw() {
+        // CATCH with a word that doesn't throw should push 0
+        assert_eq!(eval_output(": TEST ['] DUP CATCH . ; 5 TEST"), "0 ");
+    }
+
+    #[test]
+    fn test_catch_no_throw_stack() {
+        // After CATCH of a non-throwing word, TOS should be 0 and the
+        // word's effect should be visible underneath
+        assert_eq!(eval_stack("5 ' DUP CATCH"), vec![0, 5, 5]);
+    }
+
+    #[test]
+    fn test_throw_zero_is_noop() {
+        // THROW with 0 should do nothing
+        assert_eq!(eval_output(": TEST 0 THROW 123 . ; TEST"), "123 ");
+    }
+
+    #[test]
+    fn test_catch_throw_basic() {
+        // CATCH with a word that throws should push the throw code
+        assert_eq!(
+            eval_output(": THROWER 42 THROW ; : TEST ['] THROWER CATCH . ; TEST"),
+            "42 "
+        );
+    }
+
+    #[test]
+    fn test_catch_stack_restore() {
+        // THROW should restore the data stack to the depth saved by CATCH
+        // Before CATCH: stack is (10 20), CATCH pops xt, saves depth (10 20)
+        // THROWER pushes 1 2 3 then throws 99
+        // CATCH restores to (10 20) and pushes 99
+        let stack = eval_stack(": THROWER 1 2 3 99 THROW ; 10 20 ' THROWER CATCH");
+        assert_eq!(stack, vec![99, 20, 10]);
+    }
+
+    #[test]
+    fn test_nested_catch() {
+        // Nested CATCH: inner CATCH catches the throw, outer CATCH sees success
+        assert_eq!(
+            eval_output(
+                ": INNER 5 THROW ; : OUTER ['] INNER CATCH . ; : TEST ['] OUTER CATCH . ; TEST"
+            ),
+            "5 0 "
+        );
+    }
+
+    #[test]
+    fn test_catch_negative_throw() {
+        // Standard throw codes are negative
+        assert_eq!(
+            eval_output(": THROWER -1 THROW ; : TEST ['] THROWER CATCH . ; TEST"),
+            "-1 "
+        );
+    }
+
+    #[test]
+    fn test_catch_preserves_output() {
+        // Output before THROW should still be visible
+        assert_eq!(
+            eval_output(": THROWER 65 EMIT 1 THROW ; : TEST ['] THROWER CATCH DROP ; TEST"),
+            "A"
+        );
+    }
+
+    #[test]
+    fn test_catch_in_colon_def() {
+        // CATCH can be used inside a colon definition
+        assert_eq!(
+            eval_output(": ERR 10 THROW ; : SAFE ['] ERR CATCH ; SAFE ."),
+            "10 "
+        );
+    }
+
+    #[test]
+    fn test_throw_skips_rest_of_word() {
+        // After THROW, remaining code in the throwing word should not execute
+        assert_eq!(
+            eval_output(": BAD 1 THROW 999 . ; : TEST ['] BAD CATCH . ; TEST"),
+            "1 "
+        );
+    }
+
+    // ===================================================================
+    // POSTPONE: Forth 2012 GT5/GT7 tests
+    // ===================================================================
+
+    #[test]
+    fn test_postpone_non_immediate_gt5() {
+        // : GT1 123 ;
+        // : GT4 POSTPONE GT1 ; IMMEDIATE
+        // : GT5 GT4 ;
+        // GT5 -> 123
+        let mut vm = ForthVM::new().unwrap();
+        vm.evaluate(": GT1 123 ;").unwrap();
+        vm.evaluate(": GT4 POSTPONE GT1 ; IMMEDIATE").unwrap();
+        vm.evaluate(": GT5 GT4 ;").unwrap();
+        vm.evaluate("GT5").unwrap();
+        assert_eq!(vm.data_stack(), vec![123]);
+    }
+
+    #[test]
+    fn test_postpone_immediate_gt7() {
+        // : GT6 345 ; IMMEDIATE
+        // : GT7 POSTPONE GT6 ;
+        // GT7 -> 345
+        let mut vm = ForthVM::new().unwrap();
+        vm.evaluate(": GT6 345 ; IMMEDIATE").unwrap();
+        vm.evaluate(": GT7 POSTPONE GT6 ;").unwrap();
+        vm.evaluate("GT7").unwrap();
+        assert_eq!(vm.data_stack(), vec![345]);
+    }
+
+    // ===================================================================
+    // Double DOES>: Forth 2012 WEIRD: W1 test
+    // ===================================================================
+
+    #[test]
+    fn test_double_does() {
+        // : WEIRD: CREATE DOES> 1 + DOES> 2 + ;
+        // WEIRD: W1
+        // W1 first call: PFA 1 + (first DOES> behavior, then patches to second)
+        // W1 second call: PFA 2 + (second DOES> behavior)
+        let mut vm = ForthVM::new().unwrap();
+        vm.evaluate(": WEIRD: CREATE DOES> 1 + DOES> 2 + ;")
+            .unwrap();
+        vm.evaluate("WEIRD: W1").unwrap();
+        // Get HERE (which is the PFA of W1)
+        vm.evaluate("' W1 >BODY").unwrap();
+        let pfa = vm.data_stack()[0];
+        vm.evaluate("DROP").unwrap();
+        // First call: PFA 1 +
+        vm.evaluate("W1").unwrap();
+        assert_eq!(vm.data_stack(), vec![pfa + 1]);
+        vm.evaluate("DROP").unwrap();
+        // Second call: PFA 2 +
+        vm.evaluate("W1").unwrap();
+        assert_eq!(vm.data_stack(), vec![pfa + 2]);
     }
 }

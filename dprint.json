@@ -1,0 +1,14 @@
+{
+  "markdown": {
+    "lineWidth": 120,
+    "textWrap": "maintain"
+  },
+  "includes": ["**/*.md"],
+  "excludes": [
+    "target/",
+    "tests/forth2012-test-suite/"
+  ],
+  "plugins": [
+    "https://plugins.dprint.dev/markdown-0.21.1.wasm"
+  ]
+}

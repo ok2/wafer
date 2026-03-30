@@ -6,7 +6,7 @@ An optimizing Forth 2012 compiler targeting WebAssembly.
 
 ## Status
 
-WAFER is a working Forth system. It JIT-compiles each word definition to a separate WASM module and executes via `wasmtime`. 219 unit tests passing, 3 errors on the Forth 2012 Core test suite.
+WAFER is a working Forth system. It JIT-compiles each word definition to a separate WASM module and executes via `wasmtime`. 232 unit tests passing, **0 errors on the Forth 2012 Core test suite** (100% Core compliance).
 
 **Working features:**
 
@@ -117,10 +117,7 @@ tests/        Forth 2012 compliance suite (gerryjackson/forth2012-test-suite sub
 
 ### Not Yet Implemented
 
-3 remaining Core test failures:
-- `POSTPONE` for non-immediate words in IMMEDIATE context (GT5)
-- Double-DOES> in one definition (WEIRD: W1)
-- `: NOP : POSTPONE ; ;` meta-programming pattern
+All Core words implemented. Exception word set (CATCH/THROW) also available.
 
 ## Compliance Status
 
@@ -128,10 +125,10 @@ Targeting 100% Forth 2012 compliance via [Gerry Jackson's test suite](https://gi
 
 | Word Set           | Status             |
 | ------------------ | ------------------ |
-| Core               | **97%** (3 failures on test suite) |
+| Core               | **100%** (0 errors on test suite) |
 | Core Extensions    | Pending            |
 | Double-Number      | Pending            |
-| Exception          | Pending            |
+| Exception          | **CATCH/THROW implemented** |
 | Facility           | Pending            |
 | File-Access        | Pending            |
 | Floating-Point     | Pending            |

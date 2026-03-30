@@ -23,8 +23,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Check formatting
+      - name: Check Rust formatting
         run: cargo fmt --all --check
+
+      - name: Check Markdown formatting
+        uses: dprint/check@v2.2
 
       - name: Clippy
         run: cargo clippy --workspace -- -D warnings
