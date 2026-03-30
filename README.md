@@ -6,18 +6,21 @@ An optimizing Forth 2012 compiler targeting WebAssembly.
 
 ## Status
 
-WAFER is a working Forth system. It JIT-compiles each word definition to a separate WASM module and executes via `wasmtime`. 185 tests passing.
+WAFER is a working Forth system. It JIT-compiles each word definition to a separate WASM module and executes via `wasmtime`. 219 unit tests passing, 3 errors on the Forth 2012 Core test suite.
 
 **Working features:**
+
 - Colon definitions with full control flow (IF/ELSE/THEN, DO/LOOP/+LOOP, BEGIN/UNTIL, BEGIN/WHILE/REPEAT)
-- 70+ words: stack, arithmetic, comparison, logic, memory, I/O, defining words, system
+- 90+ words: stack, arithmetic, comparison, logic, memory, I/O, defining words, system
 - Recursion (RECURSE), nested control structures, loop counters (I, J)
-- VARIABLE, CONSTANT, CREATE
+- VARIABLE, CONSTANT, CREATE, DOES>
 - Number bases (HEX, DECIMAL), number prefixes ($hex, #dec, %bin)
+- Pictured numeric output (<# # #S #> HOLD SIGN)
 - Comments (backslash, parentheses), string output (." ...)
 - Interactive REPL with line editing
 
 **Example session:**
+
 ```forth
 : FIB DUP 2 < IF DROP 1 ELSE DUP 1 - RECURSE SWAP 2 - RECURSE + THEN ;
 : FIBS 0 DO I FIB . LOOP ;
@@ -97,44 +100,47 @@ tests/        Forth 2012 compliance suite (gerryjackson/forth2012-test-suite sub
 
 ### Core (Forth 2012 Section 6.1) -- In Progress
 
-| Category | Words |
-|----------|-------|
-| Stack | `DUP DROP SWAP OVER ROT NIP TUCK 2DUP 2DROP 2SWAP 2OVER ?DUP PICK DEPTH` |
-| Arithmetic | `+ - * / MOD /MOD NEGATE ABS MIN MAX 1+ 1- 2* 2/ */ */MOD M* UM* UM/MOD FM/MOD SM/REM S>D` |
-| Comparison | `= <> < > U< 0= 0< 0<> 0> WITHIN` |
-| Logic | `AND OR XOR INVERT LSHIFT RSHIFT` |
-| Memory | `@ ! C@ C! +! HERE ALLOT , C, CELLS CELL+ CHARS CHAR+ ALIGNED ALIGN MOVE FILL CMOVE CMOVE>` |
-| Control | `IF ELSE THEN DO LOOP +LOOP I J UNLOOP LEAVE BEGIN UNTIL WHILE REPEAT RECURSE EXIT` |
-| Defining | `: ; VARIABLE CONSTANT CREATE DOES> IMMEDIATE` |
-| I/O | `. U. .S CR EMIT SPACE SPACES TYPE ." S" ACCEPT` |
-| Return stack | `>R R> R@` |
-| System | `EXECUTE ' CHAR [CHAR] ['] DECIMAL HEX BASE STATE >IN >BODY ENVIRONMENT? SOURCE ABORT TRUE FALSE BL` |
-| Compiler | `LITERAL POSTPONE [ ] EVALUATE ABORT"` |
-| Parsing | `WORD FIND COUNT >NUMBER` |
+| Category     | Words                                                                                                |
+| ------------ | ---------------------------------------------------------------------------------------------------- |
+| Stack        | `DUP DROP SWAP OVER ROT NIP TUCK 2DUP 2DROP 2SWAP 2OVER ?DUP PICK DEPTH`                             |
+| Arithmetic   | `+ - * / MOD /MOD NEGATE ABS MIN MAX 1+ 1- 2* 2/ */ */MOD M* UM* UM/MOD FM/MOD SM/REM S>D <# # #S #> HOLD SIGN` |
+| Comparison   | `= <> < > U< 0= 0< 0<> 0> WITHIN`                                                                    |
+| Logic        | `AND OR XOR INVERT LSHIFT RSHIFT`                                                                    |
+| Memory       | `@ ! C@ C! +! 2@ 2! HERE ALLOT , C, CELLS CELL+ CHARS CHAR+ ALIGNED ALIGN MOVE FILL CMOVE CMOVE>`   |
+| Control      | `IF ELSE THEN DO LOOP +LOOP I J UNLOOP LEAVE BEGIN UNTIL WHILE REPEAT RECURSE EXIT`                  |
+| Defining     | `: ; VARIABLE CONSTANT CREATE DOES> IMMEDIATE`                                                       |
+| I/O          | `. U. .S CR EMIT SPACE SPACES TYPE ." S" ACCEPT`                                                     |
+| Return stack | `>R R> R@`                                                                                           |
+| System       | `EXECUTE ' CHAR [CHAR] ['] DECIMAL HEX BASE STATE >IN >BODY ENVIRONMENT? SOURCE ABORT TRUE FALSE BL` |
+| Compiler     | `LITERAL POSTPONE [ ] EVALUATE ABORT"`                                                               |
+| Parsing      | `WORD FIND COUNT >NUMBER`                                                                            |
 
 ### Not Yet Implemented
 
-Remaining words needed for full Core compliance: `#` `#>` `#S` `<#` `HOLD` `SIGN` (pictured numeric output), `2!` `2@` `2>R` `2R>` `2R@`, and edge cases in existing words.
+3 remaining Core test failures:
+- `POSTPONE` for non-immediate words in IMMEDIATE context (GT5)
+- Double-DOES> in one definition (WEIRD: W1)
+- `: NOP : POSTPONE ; ;` meta-programming pattern
 
 ## Compliance Status
 
 Targeting 100% Forth 2012 compliance via [Gerry Jackson's test suite](https://github.com/gerryjackson/forth2012-test-suite).
 
-| Word Set | Status |
-|----------|--------|
-| Core | In progress (~90%) |
-| Core Extensions | Pending |
-| Double-Number | Pending |
-| Exception | Pending |
-| Facility | Pending |
-| File-Access | Pending |
-| Floating-Point | Pending |
-| Locals | Pending |
-| Memory-Allocation | Pending |
-| Programming-Tools | Pending |
-| Search-Order | Pending |
-| String | Pending |
-| Extended-Character | Pending |
+| Word Set           | Status             |
+| ------------------ | ------------------ |
+| Core               | **97%** (3 failures on test suite) |
+| Core Extensions    | Pending            |
+| Double-Number      | Pending            |
+| Exception          | Pending            |
+| Facility           | Pending            |
+| File-Access        | Pending            |
+| Floating-Point     | Pending            |
+| Locals             | Pending            |
+| Memory-Allocation  | Pending            |
+| Programming-Tools  | Pending            |
+| Search-Order       | Pending            |
+| String             | Pending            |
+| Extended-Character | Pending            |
 
 ## License
 

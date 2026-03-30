@@ -89,6 +89,18 @@ pub enum IrOp {
         test: Vec<IrOp>,
         body: Vec<IrOp>,
     },
+    /// BEGIN test1 WHILE test2 WHILE body REPEAT after_repeat ELSE else_body THEN
+    ///
+    /// Two nested WHILEs in a single BEGIN loop. When the first WHILE fails,
+    /// control goes to `else_body`. When the second WHILE fails, control goes
+    /// to `after_repeat`. REPEAT jumps back to BEGIN.
+    BeginDoubleWhileRepeat {
+        outer_test: Vec<IrOp>,
+        inner_test: Vec<IrOp>,
+        body: Vec<IrOp>,
+        after_repeat: Vec<IrOp>,
+        else_body: Option<Vec<IrOp>>,
+    },
     /// Return from current word.
     Exit,
 

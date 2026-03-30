@@ -449,6 +449,58 @@ fn emit_op(f: &mut Function, op: &IrOp) {
                 .instruction(&Instruction::End); // end block
         }
 
+        IrOp::BeginDoubleWhileRepeat {
+            outer_test,
+            inner_test,
+            body,
+            after_repeat,
+            else_body,
+        } => {
+            // WASM structure:
+            //   block $end           ;; THEN target
+            //     block $else        ;; first WHILE false target
+            //       block $after     ;; second WHILE false target
+            //         loop $begin
+            //           outer_test
+            //           br_if(2) $else   ;; first WHILE: if false, skip to else
+            //           inner_test
+            //           br_if(1) $after  ;; second WHILE: if false, skip to after
+            //           body
+            //           br(0)            ;; REPEAT: back to loop start
+            //         end
+            //       end
+            //       after_repeat code
+            //       br(1) $end           ;; skip else, goto end
+            //     end
+            //     else code
+            //   end
+            f.instruction(&Instruction::Block(BlockType::Empty)); // $end
+            f.instruction(&Instruction::Block(BlockType::Empty)); // $else
+            f.instruction(&Instruction::Block(BlockType::Empty)); // $after
+            f.instruction(&Instruction::Loop(BlockType::Empty)); // $begin
+            emit_body(f, outer_test);
+            pop(f);
+            f.instruction(&Instruction::I32Eqz)
+                .instruction(&Instruction::BrIf(2)); // to $else
+            emit_body(f, inner_test);
+            pop(f);
+            f.instruction(&Instruction::I32Eqz)
+                .instruction(&Instruction::BrIf(1)); // to $after
+            emit_body(f, body);
+            f.instruction(&Instruction::Br(0)); // back to $begin
+            f.instruction(&Instruction::End); // end loop
+            f.instruction(&Instruction::End); // end $after block
+            emit_body(f, after_repeat);
+            if else_body.is_some() {
+                f.instruction(&Instruction::Br(1)); // skip else, goto $end
+            }
+            f.instruction(&Instruction::End); // end $else block
+            if let Some(eb) = else_body {
+                emit_body(f, eb);
+            }
+            f.instruction(&Instruction::End); // end $end block
+        }
+
         IrOp::Exit => {
             f.instruction(&Instruction::Return);
         }
@@ -654,6 +706,22 @@ fn count_needed_locals(ops: &[IrOp]) -> u32 {
                 max = max
                     .max(count_needed_locals(test))
                     .max(count_needed_locals(body));
+            }
+            IrOp::BeginDoubleWhileRepeat {
+                outer_test,
+                inner_test,
+                body,
+                after_repeat,
+                else_body,
+            } => {
+                max = max
+                    .max(count_needed_locals(outer_test))
+                    .max(count_needed_locals(inner_test))
+                    .max(count_needed_locals(body))
+                    .max(count_needed_locals(after_repeat));
+                if let Some(eb) = else_body {
+                    max = max.max(count_needed_locals(eb));
+                }
             }
             IrOp::If {
                 then_body,

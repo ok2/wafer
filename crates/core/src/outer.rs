@@ -48,6 +48,29 @@ enum ControlEntry {
         test: Vec<IrOp>,
         body: Vec<IrOp>,
     },
+    /// Two WHILEs in a single BEGIN loop: BEGIN test1 WHILE test2 WHILE ...
+    BeginWhileWhile {
+        outer_test: Vec<IrOp>,
+        inner_test: Vec<IrOp>,
+        body: Vec<IrOp>,
+    },
+    /// After REPEAT resolves a double-WHILE loop. Holds the completed loop
+    /// structure and collects the "after_repeat" code. ELSE/THEN close it.
+    PostDoubleWhileRepeat {
+        outer_test: Vec<IrOp>,
+        inner_test: Vec<IrOp>,
+        loop_body: Vec<IrOp>,
+        prefix: Vec<IrOp>,
+    },
+    /// After ELSE in a double-WHILE structure. Holds everything and collects
+    /// the else body. THEN closes it.
+    PostDoubleWhileRepeatElse {
+        outer_test: Vec<IrOp>,
+        inner_test: Vec<IrOp>,
+        loop_body: Vec<IrOp>,
+        after_repeat: Vec<IrOp>,
+        prefix: Vec<IrOp>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -70,6 +93,8 @@ struct DoesDefinition {
     create_ir: Vec<IrOp>,
     /// The word ID of the compiled does-action (code after DOES>).
     does_action_id: WordId,
+    /// Whether the definition included CREATE before DOES>.
+    has_create: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -160,6 +185,14 @@ pub struct ForthVM {
     base_cell: Arc<Mutex<u32>>,
     // DOES> definitions: maps defining word ID to its DoesDefinition
     does_definitions: HashMap<WordId, DoesDefinition>,
+    // Last word created by CREATE: (dictionary address, PFA in WASM memory), for DOES> patching
+    last_created_info: Option<(u32, u32)>,
+    // Map from word_id (xt) to PFA (for >BODY)
+    word_pfa_map: HashMap<u32, u32>,
+    // Shared copy of word_pfa_map for host function access
+    word_pfa_map_shared: Option<Arc<Mutex<HashMap<u32, u32>>>>,
+    // True when CREATE appeared in the current colon definition before DOES>
+    saw_create_in_def: bool,
     // Pending action from compiled defining/parsing words
     // 0 = none, 1 = CONSTANT, 2 = VARIABLE, 3 = CREATE, 4 = EVALUATE
     pending_define: Arc<Mutex<i32>>,
@@ -254,6 +287,10 @@ impl ForthVM {
             user_here: 0x10000,
             base_cell: Arc::new(Mutex::new(10)),
             does_definitions: HashMap::new(),
+            last_created_info: None,
+            saw_create_in_def: false,
+            word_pfa_map: HashMap::new(),
+            word_pfa_map_shared: None,
             pending_define: Arc::new(Mutex::new(0)),
         };
 
@@ -664,6 +701,7 @@ impl ForthVM {
                 // In compile mode, CREATE is a no-op marker for DOES> definitions.
                 // The actual creation happens at runtime via the DOES> mechanism
                 // or via the pending_define mechanism for non-DOES> patterns.
+                self.saw_create_in_def = true;
                 return Ok(());
             }
             "VARIABLE" | "CONSTANT" => {
@@ -738,6 +776,24 @@ impl ForthVM {
                 });
                 // compiling_ir is now empty and will collect the else_body
             }
+            Some(ControlEntry::PostDoubleWhileRepeat {
+                outer_test,
+                inner_test,
+                loop_body,
+                prefix,
+            }) => {
+                // ELSE after REPEAT in double-WHILE: collect after_repeat code
+                let after_repeat = std::mem::take(&mut self.compiling_ir);
+                self.control_stack
+                    .push(ControlEntry::PostDoubleWhileRepeatElse {
+                        outer_test,
+                        inner_test,
+                        loop_body,
+                        after_repeat,
+                        prefix,
+                    });
+                // compiling_ir now empty, collects the else body
+            }
             _ => anyhow::bail!("ELSE without matching IF"),
         }
         Ok(())
@@ -764,6 +820,41 @@ impl ForthVM {
                 self.compiling_ir = prefix;
                 self.compiling_ir.push(IrOp::If {
                     then_body,
+                    else_body: Some(else_body),
+                });
+            }
+            Some(ControlEntry::PostDoubleWhileRepeat {
+                outer_test,
+                inner_test,
+                loop_body,
+                prefix,
+            }) => {
+                // THEN directly after REPEAT (no ELSE): collect after_repeat
+                let after_repeat = std::mem::take(&mut self.compiling_ir);
+                self.compiling_ir = prefix;
+                self.compiling_ir.push(IrOp::BeginDoubleWhileRepeat {
+                    outer_test,
+                    inner_test,
+                    body: loop_body,
+                    after_repeat,
+                    else_body: None,
+                });
+            }
+            Some(ControlEntry::PostDoubleWhileRepeatElse {
+                outer_test,
+                inner_test,
+                loop_body,
+                after_repeat,
+                prefix,
+            }) => {
+                // THEN after ELSE in double-WHILE: collect else body, emit IR
+                let else_body = std::mem::take(&mut self.compiling_ir);
+                self.compiling_ir = prefix;
+                self.compiling_ir.push(IrOp::BeginDoubleWhileRepeat {
+                    outer_test,
+                    inner_test,
+                    body: loop_body,
+                    after_repeat,
                     else_body: Some(else_body),
                 });
             }
@@ -819,6 +910,19 @@ impl ForthVM {
                 });
                 // compiling_ir now empty, collects the body
             }
+            Some(ControlEntry::BeginWhile {
+                test: outer_test,
+                body: prefix,
+            }) => {
+                // Second WHILE in the same BEGIN loop
+                let inner_test = std::mem::take(&mut self.compiling_ir);
+                self.control_stack.push(ControlEntry::BeginWhileWhile {
+                    outer_test,
+                    inner_test,
+                    body: prefix, // stash original prefix
+                });
+                // compiling_ir now empty, collects the inner loop body
+            }
             _ => anyhow::bail!("WHILE without matching BEGIN"),
         }
         Ok(())
@@ -831,6 +935,23 @@ impl ForthVM {
                 self.compiling_ir = prefix;
                 self.compiling_ir
                     .push(IrOp::BeginWhileRepeat { test, body });
+            }
+            Some(ControlEntry::BeginWhileWhile {
+                outer_test,
+                inner_test,
+                body: prefix,
+            }) => {
+                // REPEAT in a double-WHILE: closes the inner loop.
+                // Code after REPEAT (before ELSE/THEN) still needs to be collected.
+                let loop_body = std::mem::take(&mut self.compiling_ir);
+                self.control_stack
+                    .push(ControlEntry::PostDoubleWhileRepeat {
+                        outer_test,
+                        inner_test,
+                        loop_body,
+                        prefix,
+                    });
+                // compiling_ir is now empty, collects the after_repeat code
             }
             _ => anyhow::bail!("REPEAT without matching BEGIN...WHILE"),
         }
@@ -860,6 +981,7 @@ impl ForthVM {
         self.compiling_ir.clear();
         self.control_stack.clear();
         self.state = -1;
+        self.saw_create_in_def = false;
         self.next_table_index = self.next_table_index.max(word_id.0 + 1);
 
         Ok(())
@@ -897,6 +1019,9 @@ impl ForthVM {
         // Reveal the word
         self.dictionary.reveal();
         self.state = 0;
+        // Refresh user_here from the shared cell before syncing back,
+        // so that host-function advances (ALLOT, , etc.) are preserved.
+        self.refresh_user_here();
         self.sync_here_cell();
 
         Ok(())
@@ -1364,9 +1489,17 @@ impl ForthVM {
             FuncType::new(&self.engine, [], []),
             move |mut caller, _params, _results| {
                 let sp = dsp_global.get(&mut caller).unwrap_i32() as u32;
-                let depth = ((DATA_STACK_TOP - sp) / CELL_SIZE) as i32;
+                let depth = if sp <= DATA_STACK_TOP {
+                    ((DATA_STACK_TOP - sp) / CELL_SIZE) as i32
+                } else {
+                    // Stack pointer has gone below the base -- treat as empty
+                    0
+                };
                 // Push depth onto stack
-                let new_sp = sp - CELL_SIZE;
+                let new_sp = sp.wrapping_sub(CELL_SIZE);
+                if new_sp < crate::memory::DATA_STACK_BASE {
+                    return Err(wasmtime::Error::msg("data stack overflow"));
+                }
                 let data = memory.data_mut(&mut caller);
                 let bytes = depth.to_le_bytes();
                 data[new_sp as usize..new_sp as usize + 4].copy_from_slice(&bytes);
@@ -1512,6 +1645,8 @@ impl ForthVM {
         self.instantiate_and_install(&compiled, word_id)?;
         self.dictionary.reveal();
         self.next_table_index = self.next_table_index.max(word_id.0 + 1);
+        // Refresh before sync to preserve host-function-side changes (C,, ALLOT, etc.)
+        self.refresh_user_here();
         self.sync_here_cell();
 
         Ok(())
@@ -1547,6 +1682,11 @@ impl ForthVM {
         self.next_table_index = self.next_table_index.max(word_id.0 + 1);
         // Store fn_index at 0x30 for DOES> to find
         self.store_latest_fn_index(word_id);
+        // Track for DOES> patching (used when DOES> has no CREATE)
+        self.last_created_info = Some((self.dictionary.latest(), pfa));
+        // Map xt -> PFA for >BODY
+        self.word_pfa_map.insert(word_id.0, pfa);
+        self.sync_pfa_map(word_id.0, pfa);
         self.sync_here_cell();
 
         Ok(())
@@ -1588,6 +1728,13 @@ impl ForthVM {
     fn sync_here_cell(&self) {
         if let Some(ref cell) = self.here_cell {
             *cell.lock().unwrap() = self.user_here;
+        }
+    }
+
+    /// Sync a new word_pfa_map entry to the shared copy (for >BODY host function).
+    fn sync_pfa_map(&self, word_id: u32, pfa: u32) {
+        if let Some(ref shared) = self.word_pfa_map_shared {
+            shared.lock().unwrap().insert(word_id, pfa);
         }
     }
 
@@ -2119,12 +2266,33 @@ impl ForthVM {
 
     /// >BODY -- ( xt -- addr ) given xt, return parameter field address.
     fn register_to_body(&mut self) -> anyhow::Result<()> {
-        // For our system, >BODY is tricky since we'd need to map xt back to
-        // a dictionary entry. For now, a stub that's unused in simple programs.
+        let memory = self.memory;
+        let dsp = self.dsp;
+        // Share the PFA map with the host function via Arc<Mutex<>>
+        let pfa_map = Arc::new(Mutex::new(self.word_pfa_map.clone()));
+        // Store the Arc for later updates
+        self.word_pfa_map_shared = Some(Arc::clone(&pfa_map));
+
         let func = Func::new(
             &mut self.store,
             FuncType::new(&self.engine, [], []),
-            move |_caller, _params, _results| Ok(()),
+            move |mut caller, _params, _results| {
+                // Pop xt from data stack
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let data = memory.data(&caller);
+                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
+                let xt = u32::from_le_bytes(b);
+
+                // Look up PFA for this xt
+                let map = pfa_map.lock().unwrap();
+                let pfa = map.get(&xt).copied().unwrap_or(0);
+                drop(map);
+
+                // Replace TOS with PFA
+                let data = memory.data_mut(&mut caller);
+                data[sp as usize..sp as usize + 4].copy_from_slice(&(pfa as i32).to_le_bytes());
+                Ok(())
+            },
         );
 
         self.register_host_primitive(">BODY", false, func)?;
@@ -2438,11 +2606,13 @@ impl ForthVM {
         self.control_stack = saved_control;
 
         // Register the defining word as a "does-defining" word.
+        let has_create = self.saw_create_in_def;
         self.does_definitions.insert(
             defining_word_id,
             DoesDefinition {
                 create_ir,
                 does_action_id: does_word_id,
+                has_create,
             },
         );
 
@@ -2470,6 +2640,12 @@ impl ForthVM {
 
     /// Execute a DOES>-defining word (like CONST, VALUE, etc.).
     /// This handles the CREATE + create-part + DOES> patching at runtime.
+    ///
+    /// Two cases:
+    /// - With create-part (e.g., `: MYDEF CREATE , DOES> @ ;`): reads a name,
+    ///   creates a new word, runs the create-part, then patches the new word.
+    /// - Without create-part (e.g., `: DOES1 DOES> @ 1 + ;`): simply patches
+    ///   the most recently defined word with the DOES> action.
     fn execute_does_defining(&mut self, defining_word_id: WordId) -> anyhow::Result<()> {
         // Get the does-definition info
         let def = self
@@ -2479,38 +2655,44 @@ impl ForthVM {
         let create_ir = def.create_ir.clone();
         let does_action_id = def.does_action_id;
 
-        // Step 1: Read the name of the new word from the input stream
-        let name = self
-            .next_token()
-            .ok_or_else(|| anyhow::anyhow!("defining word: expected name"))?;
+        // Check if the definition included CREATE. If not, the word just
+        // patches the most recently CREATEd word without reading a new name.
+        let has_create = def.has_create;
 
-        // Step 2: Create the new word (like define_create)
-        let new_word_id = self
-            .dictionary
-            .create(&name, false)
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        if has_create {
+            // Full defining-word pattern: read name, create word, run create-part
+            // Step 1: Read the name of the new word from the input stream
+            let name = self
+                .next_token()
+                .ok_or_else(|| anyhow::anyhow!("defining word: expected name"))?;
 
-        self.refresh_user_here();
-        let pfa = self.user_here;
+            // Step 2: Create the new word (like define_create)
+            let new_word_id = self
+                .dictionary
+                .create(&name, false)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-        // Temporarily install a "push PFA" word (will be patched later)
-        let ir_body = vec![IrOp::PushI32(pfa as i32)];
-        let config = CodegenConfig {
-            base_fn_index: new_word_id.0,
-            table_size: self.table_size(),
-        };
-        let compiled = compile_word(&name, &ir_body, &config)
-            .map_err(|e| anyhow::anyhow!("codegen: {}", e))?;
-        self.instantiate_and_install(&compiled, new_word_id)?;
-        self.dictionary.reveal();
-        self.next_table_index = self.next_table_index.max(new_word_id.0 + 1);
+            self.refresh_user_here();
+            let pfa = self.user_here;
 
-        // Step 3: Execute the create-part IR
-        // In standard Forth, CREATE does NOT push PFA onto the stack.
-        // The create-part (e.g., `,`) operates on the data already on the stack.
-        // For `: CONST CREATE , DOES> @ ;` with `42 CONST X`:
-        //   stack has [42], CREATE reads "X", `,` pops 42 and stores at HERE (=PFA)
-        if !create_ir.is_empty() {
+            // Temporarily install a "push PFA" word (will be patched later)
+            let ir_body = vec![IrOp::PushI32(pfa as i32)];
+            let config = CodegenConfig {
+                base_fn_index: new_word_id.0,
+                table_size: self.table_size(),
+            };
+            let compiled = compile_word(&name, &ir_body, &config)
+                .map_err(|e| anyhow::anyhow!("codegen: {}", e))?;
+            self.instantiate_and_install(&compiled, new_word_id)?;
+            self.dictionary.reveal();
+            self.next_table_index = self.next_table_index.max(new_word_id.0 + 1);
+            // Track PFA for >BODY
+            self.word_pfa_map.insert(new_word_id.0, pfa);
+            self.sync_pfa_map(new_word_id.0, pfa);
+            // Track for DOES> patching
+            self.last_created_info = Some((self.dictionary.latest(), pfa));
+
+            // Step 3: Execute the create-part IR
             let tmp_word_id = self
                 .dictionary
                 .create("_create_part_", false)
@@ -2526,19 +2708,45 @@ impl ForthVM {
                 .map_err(|e| anyhow::anyhow!("codegen: {}", e))?;
             self.instantiate_and_install(&compiled, tmp_word_id)?;
             self.execute_word(tmp_word_id)?;
-        }
 
-        // Step 4: Patch the new word to push PFA and call does-action
-        self.refresh_user_here();
-        let patched_ir = vec![IrOp::PushI32(pfa as i32), IrOp::Call(does_action_id)];
-        let config = CodegenConfig {
-            base_fn_index: new_word_id.0,
-            table_size: self.table_size(),
-        };
-        let compiled = compile_word(&name, &patched_ir, &config)
-            .map_err(|e| anyhow::anyhow!("DOES> patch codegen: {}", e))?;
-        self.instantiate_and_install(&compiled, new_word_id)?;
-        self.sync_here_cell();
+            // Step 4: Patch the new word to push PFA and call does-action
+            self.refresh_user_here();
+            let patched_ir = vec![IrOp::PushI32(pfa as i32), IrOp::Call(does_action_id)];
+            let config = CodegenConfig {
+                base_fn_index: new_word_id.0,
+                table_size: self.table_size(),
+            };
+            let compiled = compile_word(&name, &patched_ir, &config)
+                .map_err(|e| anyhow::anyhow!("DOES> patch codegen: {}", e))?;
+            self.instantiate_and_install(&compiled, new_word_id)?;
+            self.sync_here_cell();
+        } else {
+            // No create-part: just patch the most recently CREATEd word.
+            // This handles patterns like `: DOES1 DOES> @ 1 + ;`
+            let (target_addr, pfa) = self
+                .last_created_info
+                .ok_or_else(|| anyhow::anyhow!("DOES>: no CREATEd word to patch"))?;
+
+            let fn_index = self
+                .dictionary
+                .code_field(target_addr)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            let target_word_id = WordId(fn_index);
+
+            let name = self
+                .dictionary
+                .word_name(target_addr)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+            let patched_ir = vec![IrOp::PushI32(pfa as i32), IrOp::Call(does_action_id)];
+            let config = CodegenConfig {
+                base_fn_index: target_word_id.0,
+                table_size: self.table_size(),
+            };
+            let compiled = compile_word(&name, &patched_ir, &config)
+                .map_err(|e| anyhow::anyhow!("DOES> patch codegen: {}", e))?;
+            self.instantiate_and_install(&compiled, target_word_id)?;
+        }
 
         Ok(())
     }
