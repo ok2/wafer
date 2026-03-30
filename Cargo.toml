@@ -8,6 +8,38 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/ok2/wafer"
 
+[workspace.lints.rust]
+unsafe_code = "deny"
+unused_must_use = "deny"
+elided_lifetimes_in_paths = "warn"
+trivial_numeric_casts = "warn"
+unreachable_pub = "warn"
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+# Pedantic group (selective)
+cloned_instead_of_copied = "warn"
+explicit_iter_loop = "warn"
+flat_map_option = "warn"
+implicit_clone = "warn"
+inconsistent_struct_constructor = "warn"
+inefficient_to_string = "warn"
+manual_let_else = "warn"
+map_unwrap_or = "warn"
+redundant_closure_for_method_calls = "warn"
+semicolon_if_nothing_returned = "warn"
+uninlined_format_args = "warn"
+unnested_or_patterns = "warn"
+unused_self = "warn"
+# Correctness & suspicious
+doc_markdown = "warn"
+match_wildcard_for_single_variants = "warn"
+needless_continue = "warn"
+ref_as_ptr = "warn"
+# Nursery (stable enough to use)
+needless_collect = "warn"
+or_fun_call = "warn"
+
 [workspace.dependencies]
 wasm-encoder = "0.228"
 wasmparser = "0.228"

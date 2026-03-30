@@ -17,13 +17,15 @@ compliance:
 clippy:
     cargo clippy --workspace -- -D warnings
 
-# Check formatting
+# Check formatting (Rust + Markdown)
 fmt:
     cargo fmt --all --check
+    dprint check
 
-# Format code
+# Format code (Rust + Markdown)
 fmt-fix:
     cargo fmt --all
+    dprint fmt
 
 # Run the REPL
 repl:
@@ -37,8 +39,16 @@ run file:
 bench:
     cargo bench --workspace
 
+# Check dependency licenses and advisories
+deny:
+    cargo deny check
+
+# Detect unused dependencies
+machete:
+    cargo machete --skip-target-dir
+
 # Full CI check (what CI runs)
-ci: fmt clippy test
+ci: fmt clippy deny test
 
 # Check compilation without running
 check:

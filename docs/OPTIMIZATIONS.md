@@ -12,24 +12,22 @@ This document describes every optimization that makes sense for WAFER, why it ma
 
 ## Status Summary
 
-| #  | Optimization              | Level        | Status              | Impact   |
-|----|---------------------------|--------------|---------------------|----------|
-| 1  | Stack-to-Local Promotion  | Codegen      | Not implemented     | Highest  |
-| 2  | Peephole Optimization     | IR pass      | Not implemented     | High     |
-| 3  | Constant Folding          | IR pass      | Not implemented     | High     |
-| 4  | Inlining                  | IR pass      | Not implemented     | High     |
-| 5  | Strength Reduction        | IR pass      | Not implemented     | Medium   |
-| 6  | Dead Code Elimination     | IR pass      | Not implemented     | Medium   |
-| 7  | Tail Call Optimization    | IR + Codegen | Partial             | Medium   |
-| 8  | Consolidation             | Architecture | Not implemented     | High     |
-| 9  | Compound IR Operations    | IR + Codegen | Not implemented     | Medium   |
-| 10 | Codegen Improvements      | Codegen      | Not implemented     | Medium   |
-| 11 | wasmtime Configuration    | Runtime      | Not implemented     | Low      |
-| 12 | Dictionary Hash Index     | Runtime      | Not implemented     | Low      |
-| 13 | Startup Batching          | Architecture | Not implemented     | Low      |
-| 14 | Float / Double-Cell       | Codegen      | Not implemented     | Future   |
-
----
+| #  | Optimization             | Level        | Status          | Impact  |
+| -- | ------------------------ | ------------ | --------------- | ------- |
+| 1  | Stack-to-Local Promotion | Codegen      | Not implemented | Highest |
+| 2  | Peephole Optimization    | IR pass      | Not implemented | High    |
+| 3  | Constant Folding         | IR pass      | Not implemented | High    |
+| 4  | Inlining                 | IR pass      | Not implemented | High    |
+| 5  | Strength Reduction       | IR pass      | Not implemented | Medium  |
+| 6  | Dead Code Elimination    | IR pass      | Not implemented | Medium  |
+| 7  | Tail Call Optimization   | IR + Codegen | Partial         | Medium  |
+| 8  | Consolidation            | Architecture | Not implemented | High    |
+| 9  | Compound IR Operations   | IR + Codegen | Not implemented | Medium  |
+| 10 | Codegen Improvements     | Codegen      | Not implemented | Medium  |
+| 11 | wasmtime Configuration   | Runtime      | Not implemented | Low     |
+| 12 | Dictionary Hash Index    | Runtime      | Not implemented | Low     |
+| 13 | Startup Batching         | Architecture | Not implemented | Low     |
+| 14 | Float / Double-Cell      | Codegen      | Not implemented | Future  |
 
 ## 1. Stack-to-Local Promotion
 
@@ -105,8 +103,6 @@ When the compiler can statically determine the types and lifetimes of values on 
 - Inference pass: new code in `optimizer.rs` or a dedicated `promote.rs`
 - Codegen integration: `crates/core/src/codegen.rs` `emit_op()` needs a second code path
 
----
-
 ## 2. Peephole Optimization
 
 **Status: Not implemented.**
@@ -115,28 +111,26 @@ A peephole optimizer scans adjacent IR operations and replaces recognized patter
 
 ### Patterns
 
-| Pattern | Replacement | Savings |
-|---------|-------------|---------|
-| `PushI32(n), Drop` | *(remove both)* | 1 push + 1 pop |
-| `Dup, Drop` | *(remove both)* | 1 peek+push + 1 pop |
-| `Swap, Swap` | *(remove both)* | 2x(2 pops + 2 pushes) |
-| `Swap, Drop` | `Nip` | 1 pop |
-| `Over, Over` | `TwoDup` (new) | 1 peek+push |
-| `Drop, Drop` | `TwoDrop` (new) | 1 dsp adjustment |
-| `PushI32(0), Add` | *(remove both)* | 1 push + 1 pop + add |
-| `PushI32(0), Or` | *(remove both)* | same |
-| `PushI32(-1), And` | *(remove both)* | same |
-| `PushI32(1), Add` | `Inc` (new or codegen special) | avoids pushing constant |
-| `PushI32(1), Sub` | `Dec` (new or codegen special) | same |
-| `ZeroEq, ZeroEq` | *(remove both)* for boolean inputs | 2 comparisons |
-| `DivMod, Swap, Drop` | `Div` (new or codegen special) | avoids computing remainder |
-| `DivMod, Drop` | `Mod` (new or codegen special) | avoids computing quotient |
+| Pattern              | Replacement                        | Savings                    |
+| -------------------- | ---------------------------------- | -------------------------- |
+| `PushI32(n), Drop`   | _(remove both)_                    | 1 push + 1 pop             |
+| `Dup, Drop`          | _(remove both)_                    | 1 peek+push + 1 pop        |
+| `Swap, Swap`         | _(remove both)_                    | 2x(2 pops + 2 pushes)      |
+| `Swap, Drop`         | `Nip`                              | 1 pop                      |
+| `Over, Over`         | `TwoDup` (new)                     | 1 peek+push                |
+| `Drop, Drop`         | `TwoDrop` (new)                    | 1 dsp adjustment           |
+| `PushI32(0), Add`    | _(remove both)_                    | 1 push + 1 pop + add       |
+| `PushI32(0), Or`     | _(remove both)_                    | same                       |
+| `PushI32(-1), And`   | _(remove both)_                    | same                       |
+| `PushI32(1), Add`    | `Inc` (new or codegen special)     | avoids pushing constant    |
+| `PushI32(1), Sub`    | `Dec` (new or codegen special)     | same                       |
+| `ZeroEq, ZeroEq`     | _(remove both)_ for boolean inputs | 2 comparisons              |
+| `DivMod, Swap, Drop` | `Div` (new or codegen special)     | avoids computing remainder |
+| `DivMod, Drop`       | `Mod` (new or codegen special)     | avoids computing quotient  |
 
 ### Implementation
 
 A single function `fn peephole(ops: Vec<IrOp>) -> Vec<IrOp>` that makes repeated passes until no more patterns match. Recurse into control flow bodies (If/DoLoop/Begin*).
-
----
 
 ## 3. Constant Folding
 
@@ -167,8 +161,6 @@ Constant folding composes with inlining: after inlining a word, new folding oppo
 
 A function `fn constant_fold(ops: Vec<IrOp>) -> Vec<IrOp>` that simulates a compile-time stack of known constants and replaces foldable sequences. Must handle all arithmetic, comparison, logic, and unary operations in `IrOp`.
 
----
-
 ## 4. Inlining
 
 **Status: Not implemented.**
@@ -187,21 +179,25 @@ Every call in WAFER is `call_indirect` through a function table. This is slower 
 ```
 
 Before inlining, MAIN's IR:
+
 ```
 PushI32(5), Call(SQUARE), PushI32(3), Call(SQUARE), Add
 ```
 
 After inlining SQUARE:
+
 ```
 PushI32(5), Dup, Mul, PushI32(3), Dup, Mul, Add
 ```
 
 After constant folding:
+
 ```
 PushI32(25), PushI32(9), Add
 ```
 
 After more folding:
+
 ```
 PushI32(34)
 ```
@@ -214,8 +210,6 @@ PushI32(34)
 - Do not inline words with side effects that depend on call context (rare)
 - Re-run peephole and constant folding after inlining
 
----
-
 ## 5. Strength Reduction
 
 **Status: Not implemented.**
@@ -224,18 +218,16 @@ Replace expensive operations with cheaper equivalents when one operand is a know
 
 ### Patterns
 
-| Pattern | Replacement | Why |
-|---------|-------------|-----|
-| `PushI32(2^n), Mul` | `PushI32(n), Lshift` | shift is 1 cycle vs multiply |
-| `PushI32(2^n), DivMod` | `PushI32(n), Rshift` (unsigned) | shift vs divide |
-| `PushI32(1), Lshift` | `Dup, Add` | add is often faster than shift |
-| `PushI32(0), Gt` | `ZeroGt` (if added) | avoids pushing constant |
-| `PushI32(0), Eq` | `ZeroEq` | already exists as IR op |
-| `PushI32(0), Lt` | `ZeroLt` | already exists as IR op |
+| Pattern                | Replacement                     | Why                            |
+| ---------------------- | ------------------------------- | ------------------------------ |
+| `PushI32(2^n), Mul`    | `PushI32(n), Lshift`            | shift is 1 cycle vs multiply   |
+| `PushI32(2^n), DivMod` | `PushI32(n), Rshift` (unsigned) | shift vs divide                |
+| `PushI32(1), Lshift`   | `Dup, Add`                      | add is often faster than shift |
+| `PushI32(0), Gt`       | `ZeroGt` (if added)             | avoids pushing constant        |
+| `PushI32(0), Eq`       | `ZeroEq`                        | already exists as IR op        |
+| `PushI32(0), Lt`       | `ZeroLt`                        | already exists as IR op        |
 
 The most common case is `CELLS` which is defined as `PushI32(4), Mul`. Strength reduction turns this into `PushI32(2), Lshift`.
-
----
 
 ## 6. Dead Code Elimination
 
@@ -252,8 +244,6 @@ Remove IR operations that can never execute or whose results are never used.
 
 DCE should run after constant folding, since folding can create new constant conditionals.
 
----
-
 ## 7. Tail Call Optimization
 
 **Status: Partial.** `IrOp::TailCall(WordId)` exists in `ir.rs` and codegen handles it in `codegen.rs`, but the compiler never generates it.
@@ -261,6 +251,7 @@ DCE should run after constant folding, since folding can create new constant con
 ### What Exists
 
 The codegen for `TailCall` emits:
+
 ```wasm
 i32.const <word_id>
 call_indirect (type $void) (table 0)
@@ -278,8 +269,6 @@ The compiler (`outer.rs`) needs to detect tail position: when the last operation
 ```
 
 Detection rule: if the last IR op in a word body (or in a branch of an `If`) is `Call(id)`, and there are no pending return-stack items (`>R` without matching `R>`), replace with `TailCall(id)`.
-
----
 
 ## 8. Consolidation
 
@@ -304,12 +293,10 @@ After interactive development, `CONSOLIDATE` recompiles all defined words into a
 
 ### Two Modes
 
-| Mode | When | Properties |
-|------|------|------------|
+| Mode          | When                    | Properties                                       |
+| ------------- | ----------------------- | ------------------------------------------------ |
 | JIT (current) | Interactive development | Per-word modules, `call_indirect`, fast redefine |
-| Consolidated | After `CONSOLIDATE` | Single module, direct `call`, no redefine |
-
----
+| Consolidated  | After `CONSOLIDATE`     | Single module, direct `call`, no redefine        |
 
 ## 9. Compound IR Operations
 
@@ -352,8 +339,6 @@ Instead of two separate `dsp += 4`, emit one `dsp += 8`.
 **`IncFetch` / `FetchInc`** -- `1+ @` or `@ 1+`, common loop patterns.
 
 These can be added as new `IrOp` variants recognized by peephole and emitted by codegen with specialized WASM sequences.
-
----
 
 ## 10. Codegen Improvements
 
@@ -407,25 +392,21 @@ i32.add               ;; result on wasm stack
 
 `DO...LOOP` currently stores the loop index and limit on the return stack (in memory). Keep them in WASM locals for the duration of the loop body. This makes `I` (read loop index) a simple `local.get` instead of a memory load from the return stack.
 
----
-
 ## 11. wasmtime Configuration
 
 **Status: Not implemented.** Currently using `Engine::default()`.
 
 ### Available Knobs
 
-| Setting | Current | Recommended | Effect |
-|---------|---------|-------------|--------|
-| `Config::cranelift_opt_level` | Speed (default) | Speed | Already optimal for JIT |
-| `Config::cranelift_nan_canonicalization` | true | false | Skip NaN fixup (no floats yet) |
-| `Config::parallel_compilation` | true | true | Already optimal |
-| Module caching | none | file-based | Cache compiled modules across sessions |
-| Epoch interruption | none | enable | Protect against infinite loops |
+| Setting                                  | Current         | Recommended | Effect                                 |
+| ---------------------------------------- | --------------- | ----------- | -------------------------------------- |
+| `Config::cranelift_opt_level`            | Speed (default) | Speed       | Already optimal for JIT                |
+| `Config::cranelift_nan_canonicalization` | true            | false       | Skip NaN fixup (no floats yet)         |
+| `Config::parallel_compilation`           | true            | true        | Already optimal                        |
+| Module caching                           | none            | file-based  | Cache compiled modules across sessions |
+| Epoch interruption                       | none            | enable      | Protect against infinite loops         |
 
 Module caching is the most impactful: `wasmtime::Config::cache_config_load_default()` enables disk-based caching of compiled WASM, so restarting WAFER with the same definitions does not re-invoke Cranelift.
-
----
 
 ## 12. Dictionary Hash Index
 
@@ -439,8 +420,6 @@ Maintain a `HashMap<String, (u32, WordId, bool)>` alongside the linked list. Upd
 
 This affects **compile time** (word lookup during parsing), not runtime (compiled code uses function table indices directly).
 
----
-
 ## 13. Startup Batching
 
 **Status: Not implemented.** `compile_core_module()` stub exists in `codegen.rs`.
@@ -451,35 +430,31 @@ Currently, each of the 80+ primitives registered at boot creates a separate WASM
 
 Batch all IR-based primitives into a single WASM module with multiple exported functions. One `Module::new()` + one `Instance::new()` replaces 80+ pairs. This is a subset of what Consolidation (section 8) achieves, but scoped to primitives only and simpler to implement.
 
----
-
 ## 14. Float and Double-Cell Stack
 
 **Status: Not implemented.** `PushI64` and `PushF64` exist as IR ops but are stubs in codegen.
 
 The float stack lives in its own memory region (0x2540--0x2D40). Float operations will have the same memory-based overhead as integer operations, but worse: `f64` values are 8 bytes, doubling the memory traffic per push/pop. Stack-to-local promotion (section 1) is even more impactful for floats because WASM has native `f64` locals and operand stack support.
 
----
-
 ## Suggested Implementation Order
 
 Ordered by effort-to-impact ratio (cheapest wins first):
 
-| Priority | Optimization | Effort | Unlocks |
-|----------|-------------|--------|---------|
-| 1 | Peephole optimization | Low | Immediate code size reduction |
-| 2 | Constant folding | Low | Composes with peephole |
-| 3 | Tail call detection | Low | Recursive word optimization |
-| 4 | Dictionary hash index | Low | Faster compilation |
-| 5 | wasmtime config tuning | Trivial | Caching, interruption |
-| 6 | Codegen improvements (global caching, loop locals) | Medium | ~30% fewer instructions |
-| 7 | Inlining | Medium | Unlocks cross-word folding and peephole |
-| 8 | Strength reduction | Low | Best after inlining exists |
-| 9 | Dead code elimination | Low | Best after constant folding exists |
-| 10 | Compound IR operations | Medium | Cumulative gains |
-| 11 | Stack-to-local promotion | High | The single biggest speedup (~7x for arithmetic) |
-| 12 | Startup batching | Medium | Faster boot |
-| 13 | Consolidation | High | Direct calls, cross-word optimization |
-| 14 | Float/double-cell | Medium | Depends on stack-to-local |
+| Priority | Optimization                                       | Effort  | Unlocks                                         |
+| -------- | -------------------------------------------------- | ------- | ----------------------------------------------- |
+| 1        | Peephole optimization                              | Low     | Immediate code size reduction                   |
+| 2        | Constant folding                                   | Low     | Composes with peephole                          |
+| 3        | Tail call detection                                | Low     | Recursive word optimization                     |
+| 4        | Dictionary hash index                              | Low     | Faster compilation                              |
+| 5        | wasmtime config tuning                             | Trivial | Caching, interruption                           |
+| 6        | Codegen improvements (global caching, loop locals) | Medium  | ~30% fewer instructions                         |
+| 7        | Inlining                                           | Medium  | Unlocks cross-word folding and peephole         |
+| 8        | Strength reduction                                 | Low     | Best after inlining exists                      |
+| 9        | Dead code elimination                              | Low     | Best after constant folding exists              |
+| 10       | Compound IR operations                             | Medium  | Cumulative gains                                |
+| 11       | Stack-to-local promotion                           | High    | The single biggest speedup (~7x for arithmetic) |
+| 12       | Startup batching                                   | Medium  | Faster boot                                     |
+| 13       | Consolidation                                      | High    | Direct calls, cross-word optimization           |
+| 14       | Float/double-cell                                  | Medium  | Depends on stack-to-local                       |
 
 Stack-to-local promotion has the highest impact but also the highest implementation cost. The passes before it (peephole, folding, inlining) are simpler and their benefits multiply when stack-to-local promotion is eventually added. Consolidation is last because it requires storing IR bodies and restructuring the module generation -- it benefits most from having all other passes working first.
