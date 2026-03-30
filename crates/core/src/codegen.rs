@@ -345,7 +345,8 @@ fn emit_op(f: &mut Function, op: &IrOp) {
         }
 
         IrOp::Lshift => emit_binary_ordered(f, &Instruction::I32Shl),
-        IrOp::Rshift => emit_binary_ordered(f, &Instruction::I32ShrS),
+        IrOp::Rshift => emit_binary_ordered(f, &Instruction::I32ShrU),
+        IrOp::ArithRshift => emit_binary_ordered(f, &Instruction::I32ShrS),
 
         // -- Memory ---------------------------------------------------------
         IrOp::Fetch => {
@@ -560,37 +561,75 @@ fn emit_do_loop(f: &mut Function, body: &[IrOp], is_plus_loop: bool) {
 
     emit_body(f, body);
 
-    // Pop current index from return stack
+    // Pop current index from return stack into local 0
     rpop(f);
+
     if is_plus_loop {
+        // +LOOP: Forth 2012 termination check.
+        // Exit when (old_index - limit) XOR (new_index - limit) is negative.
+        // local 0 = old_index (from rpop)
+        // local 2 = step (from data stack)
         f.instruction(&Instruction::LocalSet(0));
-        pop_to(f, 2); // increment from data stack
+        pop_to(f, 2); // step from data stack
+
+        // Peek limit from return stack
+        rpeek(f);
+        f.instruction(&Instruction::LocalSet(1));
+
+        // Compute old_index - limit
+        // local 3 = old_index - limit
+        f.instruction(&Instruction::LocalGet(0))
+            .instruction(&Instruction::LocalGet(1))
+            .instruction(&Instruction::I32Sub)
+            .instruction(&Instruction::LocalSet(3));
+
+        // new_index = old_index + step
         f.instruction(&Instruction::LocalGet(0))
             .instruction(&Instruction::LocalGet(2))
             .instruction(&Instruction::I32Add)
             .instruction(&Instruction::LocalSet(0));
+
+        // Push updated index to return stack
+        f.instruction(&Instruction::LocalGet(0));
+        rpush_via_local(f, 2);
+
+        // Compute new_index - limit
+        // (old_index - limit) XOR (new_index - limit)
+        // If sign bit set (negative), exit
+        f.instruction(&Instruction::LocalGet(3)) // old - limit
+            .instruction(&Instruction::LocalGet(0)) // new_index
+            .instruction(&Instruction::LocalGet(1)) // limit
+            .instruction(&Instruction::I32Sub) // new - limit
+            .instruction(&Instruction::I32Xor) // (old-limit) XOR (new-limit)
+            .instruction(&Instruction::I32Const(0))
+            .instruction(&Instruction::I32LtS) // < 0 means sign bit set
+            .instruction(&Instruction::BrIf(1)) // break to $exit
+            .instruction(&Instruction::Br(0)) // continue loop
+            .instruction(&Instruction::End) // end loop
+            .instruction(&Instruction::End); // end block
     } else {
+        // LOOP: simple increment by 1
         f.instruction(&Instruction::I32Const(1))
             .instruction(&Instruction::I32Add)
             .instruction(&Instruction::LocalSet(0));
+
+        // Peek limit from return stack
+        rpeek(f);
+        f.instruction(&Instruction::LocalSet(1));
+
+        // Push updated index back to return stack
+        f.instruction(&Instruction::LocalGet(0));
+        rpush_via_local(f, 2);
+
+        // if index >= limit, exit
+        f.instruction(&Instruction::LocalGet(0))
+            .instruction(&Instruction::LocalGet(1))
+            .instruction(&Instruction::I32GeS)
+            .instruction(&Instruction::BrIf(1)) // break to $exit
+            .instruction(&Instruction::Br(0)) // continue loop
+            .instruction(&Instruction::End) // end loop
+            .instruction(&Instruction::End); // end block
     }
-
-    // Peek limit from return stack
-    rpeek(f);
-    f.instruction(&Instruction::LocalSet(1));
-
-    // Push updated index back to return stack
-    f.instruction(&Instruction::LocalGet(0));
-    rpush_via_local(f, 2);
-
-    // if index >= limit, exit
-    f.instruction(&Instruction::LocalGet(0))
-        .instruction(&Instruction::LocalGet(1))
-        .instruction(&Instruction::I32GeS)
-        .instruction(&Instruction::BrIf(1)) // break to $exit (block, depth 1)
-        .instruction(&Instruction::Br(0)) // continue $continue (loop, depth 0)
-        .instruction(&Instruction::End) // end loop
-        .instruction(&Instruction::End); // end block
 
     // Clean up: pop index and limit from return stack
     rpop(f);

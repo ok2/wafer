@@ -50,6 +50,8 @@ pub enum IrOp {
     Invert,
     Lshift,
     Rshift,
+    /// Arithmetic (signed) right shift -- used by 2/.
+    ArithRshift,
 
     // -- Memory --
     /// Fetch cell from address: ( addr -- x )
