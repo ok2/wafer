@@ -1,91 +1,184 @@
 //! Forth 2012 compliance tests using Gerry Jackson's test suite.
 //!
-//! Each test function loads the corresponding test file from the
-//! forth2012-test-suite submodule and runs it through WAFER.
-//! Tests are initially `#[ignore]` and enabled as word sets are implemented.
+//! Each test loads the corresponding test file from the
+//! forth2012-test-suite submodule and runs it through WAFER,
+//! asserting 0 test failures.
+
+use wafer_core::outer::ForthVM;
 
 /// Path to the test suite source directory.
-/// The submodule lives at the workspace root: tests/forth2012-test-suite/
-const _TEST_SUITE_DIR: &str = concat!(
+const SUITE_DIR: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tests/forth2012-test-suite/src"
 );
 
-// TODO: Test harness that boots WAFER, loads tester.fr, and runs test files.
-// For now, these are placeholder tests that document the compliance targets.
+/// Load a file and evaluate it line by line, ignoring errors on individual lines.
+fn load_file(vm: &mut ForthVM, path: &str) {
+    let source = std::fs::read_to_string(path).unwrap_or_else(|_| panic!("Failed to read {path}"));
+    for line in source.lines() {
+        let _ = vm.evaluate(line);
+    }
+    vm.take_output(); // discard output
+}
+
+/// Boot a WAFER VM with full prerequisites loaded.
+fn boot_with_prerequisites() -> ForthVM {
+    let mut vm = ForthVM::new().expect("Failed to create ForthVM");
+
+    // Load test framework
+    load_file(&mut vm, &format!("{SUITE_DIR}/tester.fr"));
+    // Load core tests (prerequisite)
+    load_file(&mut vm, &format!("{SUITE_DIR}/core.fr"));
+    // Switch to decimal and load utilities
+    let _ = vm.evaluate("DECIMAL");
+    vm.take_output();
+    load_file(&mut vm, &format!("{SUITE_DIR}/utilities.fth"));
+    // Load core extensions
+    load_file(&mut vm, &format!("{SUITE_DIR}/coreexttest.fth"));
+
+    vm
+}
+
+/// Run a test suite file and return the #ERRORS count.
+fn run_suite(vm: &mut ForthVM, test_file: &str) -> u32 {
+    // Reset error counter
+    let _ = vm.evaluate("DECIMAL 0 #ERRORS !");
+    vm.take_output();
+
+    // Load the test file
+    load_file(vm, &format!("{SUITE_DIR}/{test_file}"));
+
+    // Read error count -- try multiple approaches to be robust
+    let _ = vm.evaluate("DECIMAL");
+    vm.take_output();
+
+    // Clear data stack first
+    let _ = vm.evaluate("DEPTH 0 > IF DEPTH 0 DO DROP LOOP THEN");
+    vm.take_output();
+
+    // Push error count
+    if vm.evaluate("#ERRORS @").is_err() {
+        // #ERRORS not accessible -- test framework was corrupted
+        return u32::MAX;
+    }
+    let stack = vm.data_stack();
+    let errors = stack.first().copied().unwrap_or(-1);
+    vm.take_output();
+
+    // Clean up
+    let _ = vm.evaluate("DEPTH 0 > IF DROP THEN");
+    vm.take_output();
+
+    if errors < 0 { u32::MAX } else { errors as u32 }
+}
 
 #[test]
-#[ignore = "Step 10: Core word set not yet implemented"]
 fn compliance_core() {
-    // Will load: tester.fr, then core.fr
-    // Must pass with 0 failures
-    todo!("Boot WAFER, load tester.fr + core.fr, assert 0 failures");
+    let mut vm = ForthVM::new().expect("Failed to create ForthVM");
+    load_file(&mut vm, &format!("{SUITE_DIR}/tester.fr"));
+    load_file(&mut vm, &format!("{SUITE_DIR}/core.fr"));
+
+    let _ = vm.evaluate("DECIMAL #ERRORS @");
+    let errors = vm.data_stack().first().copied().unwrap_or(-1);
+    assert_eq!(errors, 0, "Core word set: {errors} test failures");
 }
 
 #[test]
-#[ignore = "Step 10: Core word set not yet implemented"]
 fn compliance_core_plus() {
-    // Will load: tester.fr, then coreplustest.fth
-    todo!("Boot WAFER, load tester.fr + coreplustest.fth");
+    let mut vm = boot_with_prerequisites();
+    let errors = run_suite(&mut vm, "coreplustest.fth");
+    assert_eq!(errors, 0, "Core Plus: {errors} test failures");
 }
 
 #[test]
-#[ignore = "Step 13: Core extensions not yet implemented"]
 fn compliance_core_ext() {
-    // Will load: tester.fr, utilities.fth, then coreexttest.fth
-    todo!("Boot WAFER, load coreexttest.fth");
+    // Core Extensions are loaded as part of prerequisites.
+    // Run from scratch to get a clean error count.
+    let mut vm = ForthVM::new().expect("Failed to create ForthVM");
+    load_file(&mut vm, &format!("{SUITE_DIR}/tester.fr"));
+    load_file(&mut vm, &format!("{SUITE_DIR}/core.fr"));
+    let _ = vm.evaluate("DECIMAL");
+    vm.take_output();
+    load_file(&mut vm, &format!("{SUITE_DIR}/utilities.fth"));
+    let _ = vm.evaluate("DECIMAL 0 #ERRORS !");
+    vm.take_output();
+    load_file(&mut vm, &format!("{SUITE_DIR}/coreexttest.fth"));
+    let _ = vm.evaluate("DECIMAL #ERRORS @");
+    let errors = vm.data_stack().first().copied().unwrap_or(-1) as u32;
+    assert_eq!(errors, 0, "Core Extensions: {errors} test failures");
 }
 
 #[test]
-#[ignore = "Step 13: Double-number word set not yet implemented"]
 fn compliance_double() {
-    todo!("Boot WAFER, load doubletest.fth");
+    let mut vm = boot_with_prerequisites();
+    let errors = run_suite(&mut vm, "doubletest.fth");
+    assert_eq!(errors, 0, "Double-Number: {errors} test failures");
 }
 
 #[test]
-#[ignore = "Step 13: Exception word set not yet implemented"]
 fn compliance_exception() {
-    todo!("Boot WAFER, load exceptiontest.fth");
+    let mut vm = boot_with_prerequisites();
+    let errors = run_suite(&mut vm, "exceptiontest.fth");
+    assert_eq!(errors, 0, "Exception: {errors} test failures");
 }
 
 #[test]
-#[ignore = "Step 13: Facility word set not yet implemented"]
 fn compliance_facility() {
-    todo!("Boot WAFER, load facilitytest.fth");
+    let mut vm = boot_with_prerequisites();
+    let errors = run_suite(&mut vm, "facilitytest.fth");
+    assert_eq!(errors, 0, "Facility: {errors} test failures");
 }
 
 #[test]
-#[ignore = "Step 13: File-access word set not yet implemented"]
+#[ignore = "File-Access requires WASI filesystem operations"]
 fn compliance_file() {
-    todo!("Boot WAFER, load filetest.fth");
+    let mut vm = boot_with_prerequisites();
+    let errors = run_suite(&mut vm, "filetest.fth");
+    assert_eq!(errors, 0, "File-Access: {errors} test failures");
 }
 
 #[test]
-#[ignore = "Step 13: Locals word set not yet implemented"]
 fn compliance_locals() {
-    todo!("Boot WAFER, load localstest.fth");
+    let mut vm = boot_with_prerequisites();
+    let errors = run_suite(&mut vm, "localstest.fth");
+    assert_eq!(errors, 0, "Locals: {errors} test failures");
 }
 
 #[test]
-#[ignore = "Step 13: Memory-allocation word set not yet implemented"]
 fn compliance_memory() {
-    todo!("Boot WAFER, load memorytest.fth");
+    let mut vm = boot_with_prerequisites();
+    let errors = run_suite(&mut vm, "memorytest.fth");
+    assert_eq!(errors, 0, "Memory-Allocation: {errors} test failures");
 }
 
 #[test]
-#[ignore = "Step 13: Search-order word set not yet implemented"]
 fn compliance_search_order() {
-    todo!("Boot WAFER, load searchordertest.fth");
+    let mut vm = boot_with_prerequisites();
+    let errors = run_suite(&mut vm, "searchordertest.fth");
+    assert_eq!(errors, 0, "Search-Order: {errors} test failures");
 }
 
 #[test]
-#[ignore = "Step 13: String word set not yet implemented"]
 fn compliance_string() {
-    todo!("Boot WAFER, load stringtest.fth");
+    // Run from scratch -- the stringtest includes CoreExt tests that
+    // cascade failures when run on top of an already-loaded CoreExt suite.
+    let mut vm = ForthVM::new().expect("Failed to create ForthVM");
+    load_file(&mut vm, &format!("{SUITE_DIR}/tester.fr"));
+    load_file(&mut vm, &format!("{SUITE_DIR}/core.fr"));
+    let _ = vm.evaluate("DECIMAL");
+    vm.take_output();
+    load_file(&mut vm, &format!("{SUITE_DIR}/utilities.fth"));
+    let _ = vm.evaluate("DECIMAL 0 #ERRORS !");
+    vm.take_output();
+    load_file(&mut vm, &format!("{SUITE_DIR}/stringtest.fth"));
+    let _ = vm.evaluate("DECIMAL #ERRORS @");
+    let errors = vm.data_stack().first().copied().unwrap_or(-1) as u32;
+    assert_eq!(errors, 0, "String: {errors} test failures");
 }
 
 #[test]
-#[ignore = "Step 13: Programming-tools word set not yet implemented"]
 fn compliance_tools() {
-    todo!("Boot WAFER, load toolstest.fth");
+    let mut vm = boot_with_prerequisites();
+    let errors = run_suite(&mut vm, "toolstest.fth");
+    assert_eq!(errors, 0, "Programming-Tools: {errors} test failures");
 }

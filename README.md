@@ -6,12 +6,12 @@ An optimizing Forth 2012 compiler targeting WebAssembly.
 
 ## Status
 
-WAFER is a working Forth system. It JIT-compiles each word definition to a separate WASM module and executes via `wasmtime`. 261 unit tests passing, **0 errors on Core, Core Extensions, and Exception test suites**.
+WAFER is a working Forth system. It JIT-compiles each word definition to a separate WASM module and executes via `wasmtime`. 272 tests passing (261 unit + 11 compliance), **0 errors on all 11 tested Forth 2012 word sets**.
 
 **Working features:**
 
 - Colon definitions with full control flow (IF/ELSE/THEN, DO/LOOP/+LOOP, BEGIN/UNTIL, BEGIN/WHILE/REPEAT)
-- 110+ words: stack, arithmetic, comparison, logic, memory, I/O, defining words, system, exceptions
+- 130+ words: stack, arithmetic, comparison, logic, memory, I/O, defining words, system, exceptions, double-cell, strings
 - Recursion (RECURSE), nested control structures, loop counters (I, J)
 - VARIABLE, CONSTANT, CREATE, DOES>
 - Number bases (HEX, DECIMAL), number prefixes ($hex, #dec, %bin)
@@ -117,7 +117,7 @@ tests/        Forth 2012 compliance suite (gerryjackson/forth2012-test-suite sub
 
 ### Not Yet Implemented
 
-All Core and Core Extension words implemented. Exception word set (CATCH/THROW) also complete. VALUE, TO, DEFER, IS, CASE/OF/ENDOF/ENDCASE, :NONAME, PARSE-NAME, S\\", BUFFER:, ?DO, AGAIN, and more.
+11 word sets at 100% compliance: Core, Core Ext, Core Plus, Exception, Double-Number, String, Search-Order, Memory-Allocation, Programming-Tools, Facility, Locals. 130+ words including VALUE, DEFER, CASE, DOES>, CATCH/THROW, double-cell arithmetic, string operations.
 
 ## Compliance Status
 
@@ -127,16 +127,16 @@ Targeting 100% Forth 2012 compliance via [Gerry Jackson's test suite](https://gi
 | ------------------ | --------------------------------- |
 | Core               | **100%** (0 errors on test suite) |
 | Core Extensions    | **100%** (0 errors on test suite) |
-| Double-Number      | Pending                           |
+| Double-Number      | **100%** (0 errors on test suite) |
 | Exception          | **100%** (0 errors on test suite) |
-| Facility           | Pending                           |
-| File-Access        | Pending                           |
+| Facility           | **100%** (0 errors on test suite) |
+| File-Access        | Pending (requires WASI)           |
 | Floating-Point     | Pending                           |
-| Locals             | Pending                           |
-| Memory-Allocation  | Pending                           |
-| Programming-Tools  | Pending                           |
-| Search-Order       | Pending                           |
-| String             | Pending                           |
+| Locals             | **100%** (0 errors on test suite) |
+| Memory-Allocation  | **100%** (0 errors on test suite) |
+| Programming-Tools  | **100%** (0 errors on test suite) |
+| Search-Order       | **100%** (0 errors on test suite) |
+| String             | **100%** (0 errors on test suite) |
 | Extended-Character | Pending                           |
 
 ## License

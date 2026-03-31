@@ -2,7 +2,7 @@
 
 ## What is WAFER?
 
-WAFER (WebAssembly Forth Engine in Rust) is an optimizing Forth 2012 compiler targeting WebAssembly. Currently a working Forth system with 70+ words and JIT compilation.
+WAFER (WebAssembly Forth Engine in Rust) is an optimizing Forth 2012 compiler targeting WebAssembly. Currently a working Forth system with 130+ words, JIT compilation, and 11 word sets at 100% compliance.
 
 ## Architecture
 
@@ -51,7 +51,7 @@ Handle in `interpret_token_immediate()` or `compile_token()` as a special case.
 
 ## Testing
 
-- Run `cargo test --workspace` before committing (currently 185 tests)
+- Run `cargo test --workspace` before committing (currently 261 unit + 11 compliance tests)
 - Forth 2012 compliance: `cargo test -p wafer-core --test compliance`
 - Test helper in outer.rs: `eval_output("forth code")` returns printed output as String
 - Test helper: `eval_stack("forth code")` returns data stack as Vec<i32>
