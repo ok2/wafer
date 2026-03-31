@@ -25,8 +25,22 @@ allow = [
 confidence-threshold = 0.8
 
 [bans]
-multiple-versions = "warn"
+multiple-versions = "deny"
 wildcards = "deny"
+# Transitive duplicates from wasmtime v31 -- will resolve when upgrading
+skip = [
+    "getrandom",
+    "hashbrown",
+    "linux-raw-sys",
+    "object",
+    "rustix",
+    "thiserror",
+    "thiserror-impl",
+    "wasm-encoder",
+    "wasmparser",
+    "wast",
+    "windows-sys",
+]
 
 [sources]
 unknown-registry = "deny"

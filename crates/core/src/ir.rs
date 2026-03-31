@@ -93,7 +93,7 @@ pub enum IrOp {
         test: Vec<IrOp>,
         body: Vec<IrOp>,
     },
-    /// BEGIN test1 WHILE test2 WHILE body REPEAT after_repeat ELSE else_body THEN
+    /// BEGIN test1 WHILE test2 WHILE body REPEAT `after_repeat` ELSE `else_body` THEN
     ///
     /// Two nested WHILEs in a single BEGIN loop. When the first WHILE fails,
     /// control goes to `else_body`. When the second WHILE fails, control goes

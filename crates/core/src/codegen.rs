@@ -41,14 +41,14 @@ const TYPE_I32: u32 = 1; // (i32) -> ()
 const EMIT_FUNC: u32 = 0;
 const WORD_FUNC: u32 = 1;
 
-/// Natural-alignment MemArg for 4-byte i32 operations.
+/// Natural-alignment `MemArg` for 4-byte i32 operations.
 const MEM4: MemArg = MemArg {
     offset: 0,
     align: 2, // 2^2 = 4
     memory_index: MEMORY_INDEX,
 };
 
-/// MemArg for single-byte operations.
+/// `MemArg` for single-byte operations.
 const MEM1: MemArg = MemArg {
     offset: 0,
     align: 0, // 2^0 = 1
@@ -81,7 +81,7 @@ pub struct CompiledModule {
 // Instruction-level helpers (free functions that take &mut Function)
 // ---------------------------------------------------------------------------
 
-/// Decrement `$dsp` by CELL_SIZE.
+/// Decrement `$dsp` by `CELL_SIZE`.
 fn dsp_dec(f: &mut Function) {
     f.instruction(&Instruction::GlobalGet(DSP))
         .instruction(&Instruction::I32Const(CELL_SIZE as i32))
@@ -89,7 +89,7 @@ fn dsp_dec(f: &mut Function) {
         .instruction(&Instruction::GlobalSet(DSP));
 }
 
-/// Increment `$dsp` by CELL_SIZE.
+/// Increment `$dsp` by `CELL_SIZE`.
 fn dsp_inc(f: &mut Function) {
     f.instruction(&Instruction::GlobalGet(DSP))
         .instruction(&Instruction::I32Const(CELL_SIZE as i32))

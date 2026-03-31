@@ -5,7 +5,7 @@
 //! - Flags + name length (1 byte)
 //! - Name string (N bytes, padded to cell alignment)
 //! - Code field: function table index (4 bytes)
-//! - Parameter field: data for CREATEd words, DOES> action, etc.
+//! - Parameter field: data for `CREATEd` words, DOES> action, etc.
 
 use crate::error::{WaferError, WaferResult};
 use crate::memory::{DICTIONARY_BASE, INITIAL_PAGES, PAGE_SIZE};
@@ -57,7 +57,7 @@ impl Dictionary {
     }
 
     /// Create a new dictionary entry (like Forth's CREATE).
-    /// Returns the WordId (function table index) assigned to this word.
+    /// Returns the `WordId` (function table index) assigned to this word.
     /// The word starts HIDDEN (will be revealed when compilation completes).
     pub fn create(&mut self, name: &str, immediate: bool) -> WaferResult<WordId> {
         let name_upper = name.to_ascii_uppercase();
@@ -139,7 +139,7 @@ impl Dictionary {
         }
     }
 
-    /// Look up a word by name. Returns (word_address, word_id, is_immediate).
+    /// Look up a word by name. Returns (`word_address`, `word_id`, `is_immediate`).
     /// Searches from LATEST backward through the linked list.
     /// Skips HIDDEN words.
     pub fn find(&self, name: &str) -> Option<(u32, WordId, bool)> {
@@ -347,7 +347,7 @@ impl Dictionary {
     }
 
     /// Write a u32 in little-endian without bounds checking.
-    /// Caller must ensure addr + 4 <= memory.len().
+    /// Caller must ensure addr + 4 <= `memory.len()`.
     fn write_u32_unchecked(&mut self, addr: u32, value: u32) {
         let a = addr as usize;
         let bytes = value.to_le_bytes();
@@ -355,7 +355,7 @@ impl Dictionary {
     }
 
     /// Read a u32 in little-endian without bounds checking.
-    /// Caller must ensure addr + 4 <= memory.len().
+    /// Caller must ensure addr + 4 <= `memory.len()`.
     fn read_u32_unchecked(&self, addr: u32) -> u32 {
         let a = addr as usize;
         u32::from_le_bytes([

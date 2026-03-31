@@ -62,7 +62,7 @@ After this, the dictionary contains all built-in words and the function table ha
 
 ### 3. REPL loop
 
-The CLI enters a `rustyline` loop. The prompt is `> ` in interpret mode and `  ] ` in compile mode. Each line is passed to `vm.evaluate()`, which feeds it to the outer interpreter.
+The CLI enters a `rustyline` loop. The prompt is `>` in interpret mode and `]` in compile mode. Each line is passed to `vm.evaluate()`, which feeds it to the outer interpreter.
 
 ## Memory Layout
 
@@ -141,7 +141,7 @@ The colon handler in `interpret_token()`:
 2. `dictionary.create("square", false)` -- creates a new HIDDEN entry, returns `WordId(N)` where N is the next function table index
 3. Clears `compiling_ir` (the IR accumulator)
 4. Sets `state = -1` (compile mode)
-5. Prompt changes to `  ] `
+5. Prompt changes to `]`
 
 #### Token: `dup` (in compile mode)
 
@@ -221,13 +221,13 @@ table.set(N, exported_fn)                Install in function table
 
 **Step 5 -- Return to interpret mode:**
 
-`state = 0`, prompt returns to `> `.
+`state = 0`, prompt returns to `>`.
 
 ### What happens when you then type `7 square .`
 
 - `7` -- pushed to data stack (same as before)
 - `square` -- `dictionary.find("SQUARE")` returns WordId(N), `execute_word(N)` calls the compiled function, which in turn calls DUP and * via `call_indirect`, leaving 49 on the stack
-- `.` -- pops 49, prints `49 `
+- `.` -- pops 49, prints `49`
 
 Output: `49  ok`
 

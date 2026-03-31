@@ -100,20 +100,20 @@ tests/        Forth 2012 compliance suite (gerryjackson/forth2012-test-suite sub
 
 ### Core (Forth 2012 Section 6.1) -- In Progress
 
-| Category     | Words                                                                                                |
-| ------------ | ---------------------------------------------------------------------------------------------------- |
-| Stack        | `DUP DROP SWAP OVER ROT NIP TUCK 2DUP 2DROP 2SWAP 2OVER ?DUP PICK DEPTH`                             |
+| Category     | Words                                                                                                           |
+| ------------ | --------------------------------------------------------------------------------------------------------------- |
+| Stack        | `DUP DROP SWAP OVER ROT NIP TUCK 2DUP 2DROP 2SWAP 2OVER ?DUP PICK DEPTH`                                        |
 | Arithmetic   | `+ - * / MOD /MOD NEGATE ABS MIN MAX 1+ 1- 2* 2/ */ */MOD M* UM* UM/MOD FM/MOD SM/REM S>D <# # #S #> HOLD SIGN` |
-| Comparison   | `= <> < > U< 0= 0< 0<> 0> WITHIN`                                                                    |
-| Logic        | `AND OR XOR INVERT LSHIFT RSHIFT`                                                                    |
-| Memory       | `@ ! C@ C! +! 2@ 2! HERE ALLOT , C, CELLS CELL+ CHARS CHAR+ ALIGNED ALIGN MOVE FILL CMOVE CMOVE>`   |
-| Control      | `IF ELSE THEN DO LOOP +LOOP I J UNLOOP LEAVE BEGIN UNTIL WHILE REPEAT RECURSE EXIT`                  |
-| Defining     | `: ; VARIABLE CONSTANT CREATE DOES> IMMEDIATE`                                                       |
-| I/O          | `. U. .S CR EMIT SPACE SPACES TYPE ." S" ACCEPT`                                                     |
-| Return stack | `>R R> R@`                                                                                           |
-| System       | `EXECUTE ' CHAR [CHAR] ['] DECIMAL HEX BASE STATE >IN >BODY ENVIRONMENT? SOURCE ABORT TRUE FALSE BL` |
-| Compiler     | `LITERAL POSTPONE [ ] EVALUATE ABORT"`                                                               |
-| Parsing      | `WORD FIND COUNT >NUMBER`                                                                            |
+| Comparison   | `= <> < > U< 0= 0< 0<> 0> WITHIN`                                                                               |
+| Logic        | `AND OR XOR INVERT LSHIFT RSHIFT`                                                                               |
+| Memory       | `@ ! C@ C! +! 2@ 2! HERE ALLOT , C, CELLS CELL+ CHARS CHAR+ ALIGNED ALIGN MOVE FILL CMOVE CMOVE>`               |
+| Control      | `IF ELSE THEN DO LOOP +LOOP I J UNLOOP LEAVE BEGIN UNTIL WHILE REPEAT RECURSE EXIT`                             |
+| Defining     | `: ; VARIABLE CONSTANT CREATE DOES> IMMEDIATE`                                                                  |
+| I/O          | `. U. .S CR EMIT SPACE SPACES TYPE ." S" ACCEPT`                                                                |
+| Return stack | `>R R> R@`                                                                                                      |
+| System       | `EXECUTE ' CHAR [CHAR] ['] DECIMAL HEX BASE STATE >IN >BODY ENVIRONMENT? SOURCE ABORT TRUE FALSE BL`            |
+| Compiler     | `LITERAL POSTPONE [ ] EVALUATE ABORT"`                                                                          |
+| Parsing      | `WORD FIND COUNT >NUMBER`                                                                                       |
 
 ### Not Yet Implemented
 
@@ -123,21 +123,21 @@ All Core and Core Extension words implemented. Exception word set (CATCH/THROW) 
 
 Targeting 100% Forth 2012 compliance via [Gerry Jackson's test suite](https://github.com/gerryjackson/forth2012-test-suite).
 
-| Word Set           | Status             |
-| ------------------ | ------------------ |
+| Word Set           | Status                            |
+| ------------------ | --------------------------------- |
 | Core               | **100%** (0 errors on test suite) |
 | Core Extensions    | **100%** (0 errors on test suite) |
-| Double-Number      | Pending            |
+| Double-Number      | Pending                           |
 | Exception          | **100%** (0 errors on test suite) |
-| Facility           | Pending            |
-| File-Access        | Pending            |
-| Floating-Point     | Pending            |
-| Locals             | Pending            |
-| Memory-Allocation  | Pending            |
-| Programming-Tools  | Pending            |
-| Search-Order       | Pending            |
-| String             | Pending            |
-| Extended-Character | Pending            |
+| Facility           | Pending                           |
+| File-Access        | Pending                           |
+| Floating-Point     | Pending                           |
+| Locals             | Pending                           |
+| Memory-Allocation  | Pending                           |
+| Programming-Tools  | Pending                           |
+| Search-Order       | Pending                           |
+| String             | Pending                           |
+| Extended-Character | Pending                           |
 
 ## License
 
