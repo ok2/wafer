@@ -12,22 +12,22 @@ This document describes every optimization that makes sense for WAFER, why it ma
 
 ## Status Summary
 
-| #  | Optimization             | Level        | Status          | Impact  |
-| -- | ------------------------ | ------------ | --------------- | ------- |
-| 1  | Stack-to-Local Promotion | Codegen      | Not implemented | Highest |
-| 2  | Peephole Optimization    | IR pass      | Not implemented | High    |
-| 3  | Constant Folding         | IR pass      | Not implemented | High    |
-| 4  | Inlining                 | IR pass      | Not implemented | High    |
-| 5  | Strength Reduction       | IR pass      | Not implemented | Medium  |
-| 6  | Dead Code Elimination    | IR pass      | Not implemented | Medium  |
-| 7  | Tail Call Optimization   | IR + Codegen | Partial         | Medium  |
-| 8  | Consolidation            | Architecture | Not implemented | High    |
-| 9  | Compound IR Operations   | IR + Codegen | Not implemented | Medium  |
-| 10 | Codegen Improvements     | Codegen      | Not implemented | Medium  |
-| 11 | wasmtime Configuration   | Runtime      | Not implemented | Low     |
-| 12 | Dictionary Hash Index    | Runtime      | Not implemented | Low     |
-| 13 | Startup Batching         | Architecture | Not implemented | Low     |
-| 14 | Float / Double-Cell      | Codegen      | Not implemented | Future  |
+| #  | Optimization             | Level        | Status      | Impact  |
+| -- | ------------------------ | ------------ | ----------- | ------- |
+| 1  | Stack-to-Local Promotion | Codegen      | Not started | Highest |
+| 2  | Peephole Optimization    | IR pass      | Done        | High    |
+| 3  | Constant Folding         | IR pass      | Done        | High    |
+| 4  | Inlining                 | IR pass      | Done        | High    |
+| 5  | Strength Reduction       | IR pass      | Done        | Medium  |
+| 6  | Dead Code Elimination    | IR pass      | Done        | Medium  |
+| 7  | Tail Call Optimization   | IR + Codegen | Done        | Medium  |
+| 8  | Consolidation            | Architecture | Not started | High    |
+| 9  | Compound IR Operations   | IR + Codegen | Done        | Medium  |
+| 10 | Codegen Improvements     | Codegen      | Partial     | Medium  |
+| 11 | wasmtime Configuration   | Runtime      | Done        | Low     |
+| 12 | Dictionary Hash Index    | Runtime      | Done        | Low     |
+| 13 | Startup Batching         | Architecture | Not started | Low     |
+| 14 | Float / Double-Cell      | Codegen      | Not started | Future  |
 
 ## 1. Stack-to-Local Promotion
 
