@@ -16,7 +16,7 @@ use wasmtime::{
     Table, Val, ValType,
 };
 
-use crate::codegen::{CodegenConfig, CompiledModule, compile_word};
+use crate::codegen::{CodegenConfig, CompiledModule, compile_consolidated_module, compile_word};
 use crate::dictionary::{Dictionary, WordId};
 use crate::ir::IrOp;
 use crate::memory::{
@@ -640,6 +640,7 @@ impl ForthVM {
             "FVARIABLE" => return self.define_fvariable(),
             "FCONSTANT" => return self.define_fconstant(),
             "FVALUE" => return self.define_fvalue(),
+            "CONSOLIDATE" => return self.consolidate(),
             _ => {}
         }
 
@@ -1484,6 +1485,70 @@ impl ForthVM {
         // so that host-function advances (ALLOT, , etc.) are preserved.
         self.refresh_user_here();
         self.sync_here_cell();
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Consolidation
+    // -----------------------------------------------------------------------
+
+    /// Recompile all IR-based words into a single WASM module with direct calls.
+    ///
+    /// After consolidation, `call_indirect` between IR-based words is replaced
+    /// with direct `call` instructions, enabling Cranelift to optimize across
+    /// word boundaries. Host functions are unaffected and still use indirect
+    /// calls.
+    fn consolidate(&mut self) -> anyhow::Result<()> {
+        // Collect all words with IR bodies
+        let mut words: Vec<(WordId, Vec<IrOp>)> = self
+            .ir_bodies
+            .iter()
+            .map(|(&id, body)| (id, body.clone()))
+            .collect();
+        words.sort_by_key(|(id, _)| id.0);
+
+        if words.is_empty() {
+            return Ok(());
+        }
+
+        // Build local function map: WordId -> module-internal function index.
+        // Imported functions: emit (idx 0). Defined functions start at idx 1.
+        let mut local_fn_map = HashMap::new();
+        for (i, (word_id, _)) in words.iter().enumerate() {
+            local_fn_map.insert(*word_id, (i as u32) + 1);
+        }
+
+        let table_size = self.table_size();
+
+        // Compile the consolidated module
+        let module_bytes = compile_consolidated_module(&words, &local_fn_map, table_size)
+            .map_err(|e| anyhow::anyhow!("consolidation codegen error: {e}"))?;
+
+        // Instantiate
+        let module = Module::new(&self.engine, &module_bytes)?;
+        let instance = Instance::new(
+            &mut self.store,
+            &module,
+            &[
+                self.emit_func.into(),
+                self.memory.into(),
+                self.dsp.into(),
+                self.rsp.into(),
+                self.fsp.into(),
+                self.table.into(),
+            ],
+        )?;
+
+        // Update function table with new exports
+        for (i, (word_id, _)) in words.iter().enumerate() {
+            let export_name = format!("fn_{i}");
+            let func = instance
+                .get_func(&mut self.store, &export_name)
+                .ok_or_else(|| anyhow::anyhow!("missing export {export_name}"))?;
+            self.table
+                .set(&mut self.store, word_id.0 as u64, Ref::Func(Some(func)))?;
+        }
 
         Ok(())
     }
@@ -10110,5 +10175,90 @@ mod tests {
         assert_eq!(eval_stack(": T1 1 IF 42 ELSE 0 THEN ; T1"), vec![42]);
         assert_eq!(eval_stack(": T2 0 IF 42 ELSE 0 THEN ; T2"), vec![0]);
         assert_eq!(eval_stack(": SUM 0 SWAP 0 DO I + LOOP ; 10 SUM"), vec![45]);
+    }
+
+    // -- CONSOLIDATE tests --
+
+    #[test]
+    fn consolidate_basic() {
+        assert_eq!(eval_stack(": A 1 ; : B A 2 + ; CONSOLIDATE B"), vec![3]);
+    }
+
+    #[test]
+    fn consolidate_preserves_host_functions() {
+        assert_eq!(
+            eval_output(": HELLO 72 EMIT 73 EMIT ; CONSOLIDATE HELLO"),
+            "HI"
+        );
+    }
+
+    #[test]
+    fn consolidate_no_op_when_empty() {
+        // CONSOLIDATE with no user words should not error
+        let (stack, _) = eval("CONSOLIDATE 42");
+        assert_eq!(stack, vec![42]);
+    }
+
+    #[test]
+    fn consolidate_multiple_words() {
+        assert_eq!(
+            eval_stack(": X 10 ; : Y 20 ; : Z X Y + ; CONSOLIDATE Z"),
+            vec![30]
+        );
+    }
+
+    #[test]
+    fn consolidate_with_control_flow() {
+        assert_eq!(
+            eval_stack(": ABS2 DUP 0< IF NEGATE THEN ; CONSOLIDATE -5 ABS2"),
+            vec![5]
+        );
+    }
+
+    #[test]
+    fn consolidate_with_loop() {
+        assert_eq!(
+            eval_stack(": SUM2 0 SWAP 0 DO I + LOOP ; CONSOLIDATE 5 SUM2"),
+            vec![10]
+        );
+    }
+
+    #[test]
+    fn consolidate_preserves_variables() {
+        assert_eq!(
+            eval_stack("VARIABLE V 42 V ! : RV V @ ; CONSOLIDATE RV"),
+            vec![42]
+        );
+    }
+
+    #[test]
+    fn consolidate_nested_calls() {
+        // A calls B which calls C -- all should use direct calls after consolidation
+        assert_eq!(
+            eval_stack(": C 1 ; : B C C + ; : A B B + ; CONSOLIDATE A"),
+            vec![4]
+        );
+    }
+
+    #[test]
+    fn consolidate_words_still_work_individually() {
+        assert_eq!(eval_stack(": P 3 ; : Q 4 ; CONSOLIDATE P Q +"), vec![7]);
+    }
+
+    #[test]
+    fn consolidate_with_begin_until() {
+        // Countdown: start at 5, subtract 1 until 0
+        assert_eq!(
+            eval_stack(": CD BEGIN 1- DUP 0= UNTIL ; CONSOLIDATE 5 CD"),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn consolidate_with_begin_while_repeat() {
+        assert_eq!(
+            eval_stack(": CW BEGIN DUP WHILE 1- REPEAT ; CONSOLIDATE 3 CW"),
+            vec![0]
+        );
     }
 }

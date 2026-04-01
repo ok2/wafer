@@ -414,8 +414,8 @@ fn inline(ops: Vec<IrOp>, bodies: &HashMap<WordId, Vec<IrOp>>, max_size: usize) 
     for op in ops {
         match &op {
             IrOp::Call(id) => {
-                if let Some(body) = bodies.get(id) {
-                    if body.len() <= max_size && !contains_call_to(body, *id) {
+                if let Some(body) = bodies.get(id)
+                    && body.len() <= max_size && !contains_call_to(body, *id) {
                         // Inline the body, converting TailCall back to Call
                         // (tail position in the callee is not tail position in the caller)
                         for inlined_op in body {
@@ -426,11 +426,12 @@ fn inline(ops: Vec<IrOp>, bodies: &HashMap<WordId, Vec<IrOp>>, max_size: usize) 
                         }
                         continue;
                     }
-                }
                 out.push(op);
             }
             _ => {
-                out.push(apply_to_bodies(op, &|inner| inline(inner, bodies, max_size)));
+                out.push(apply_to_bodies(op, &|inner| {
+                    inline(inner, bodies, max_size)
+                }));
             }
         }
     }
@@ -449,15 +450,12 @@ fn contains_call_to(ops: &[IrOp], target: WordId) -> bool {
                 if contains_call_to(then_body, target) {
                     return true;
                 }
-                if let Some(eb) = else_body {
-                    if contains_call_to(eb, target) {
+                if let Some(eb) = else_body
+                    && contains_call_to(eb, target) {
                         return true;
                     }
-                }
             }
-            IrOp::DoLoop { body, .. }
-            | IrOp::BeginUntil { body }
-            | IrOp::BeginAgain { body } => {
+            IrOp::DoLoop { body, .. } | IrOp::BeginUntil { body } | IrOp::BeginAgain { body } => {
                 if contains_call_to(body, target) {
                     return true;
                 }
@@ -481,11 +479,10 @@ fn contains_call_to(ops: &[IrOp], target: WordId) -> bool {
                 {
                     return true;
                 }
-                if let Some(eb) = else_body {
-                    if contains_call_to(eb, target) {
+                if let Some(eb) = else_body
+                    && contains_call_to(eb, target) {
                         return true;
                     }
-                }
             }
             _ => {}
         }
@@ -567,10 +564,7 @@ mod tests {
         optimize(ops, &config, &HashMap::new())
     }
 
-    fn opt_with_inline(
-        ops: Vec<IrOp>,
-        bodies: &HashMap<WordId, Vec<IrOp>>,
-    ) -> Vec<IrOp> {
+    fn opt_with_inline(ops: Vec<IrOp>, bodies: &HashMap<WordId, Vec<IrOp>>) -> Vec<IrOp> {
         let config = OptConfig {
             peephole: true,
             constant_fold: true,
@@ -754,10 +748,7 @@ mod tests {
         let mut bodies = HashMap::new();
         // SQUARE = DUP *
         bodies.insert(WordId(5), vec![IrOp::Dup, IrOp::Mul]);
-        let result = opt_with_inline(
-            vec![IrOp::PushI32(7), IrOp::Call(WordId(5))],
-            &bodies,
-        );
+        let result = opt_with_inline(vec![IrOp::PushI32(7), IrOp::Call(WordId(5))], &bodies);
         // After inlining: 7 DUP * (Dup isn't folded by constant folder)
         assert_eq!(result, vec![IrOp::PushI32(7), IrOp::Dup, IrOp::Mul]);
     }
@@ -767,10 +758,7 @@ mod tests {
         let mut bodies = HashMap::new();
         // ADD3 = 3 +
         bodies.insert(WordId(5), vec![IrOp::PushI32(3), IrOp::Add]);
-        let result = opt_with_inline(
-            vec![IrOp::PushI32(5), IrOp::Call(WordId(5))],
-            &bodies,
-        );
+        let result = opt_with_inline(vec![IrOp::PushI32(5), IrOp::Call(WordId(5))], &bodies);
         // After inlining: PushI32(5) PushI32(3) Add => folded to PushI32(8)
         assert_eq!(result, vec![IrOp::PushI32(8)]);
     }
@@ -781,7 +769,10 @@ mod tests {
         bodies.insert(WordId(5), vec![IrOp::Dup, IrOp::Call(WordId(5))]);
         let result = opt_with_inline(vec![IrOp::Call(WordId(5))], &bodies);
         // Should NOT inline (recursive), but tail call detect may convert
-        assert!(matches!(result.last(), Some(IrOp::Call(WordId(5))) | Some(IrOp::TailCall(WordId(5)))));
+        assert!(matches!(
+            result.last(),
+            Some(IrOp::Call(WordId(5))) | Some(IrOp::TailCall(WordId(5)))
+        ));
     }
 
     #[test]

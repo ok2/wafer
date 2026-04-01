@@ -7,6 +7,7 @@
 //! remains a global.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 
 use wasm_encoder::{
     BlockType, CodeSection, ConstExpr, ElementSection, Elements, EntityType, ExportKind,
@@ -14,6 +15,7 @@ use wasm_encoder::{
     MemoryType, Module, RefType, TableType, TypeSection, ValType,
 };
 
+use crate::dictionary::WordId;
 use crate::error::{WaferError, WaferResult};
 use crate::ir::IrOp;
 use crate::memory::CELL_SIZE;
@@ -952,6 +954,372 @@ pub fn compile_word(
         bytes,
         fn_index: config.base_fn_index,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Consolidated module generation
+// ---------------------------------------------------------------------------
+
+/// Emit all IR operations, replacing `Call`/`TailCall` with direct calls
+/// when the target word is within the consolidated module.
+fn emit_consolidated_body(f: &mut Function, ops: &[IrOp], local_fn_map: &HashMap<WordId, u32>) {
+    for op in ops {
+        emit_consolidated_op(f, op, local_fn_map);
+    }
+}
+
+/// Emit a single IR operation with consolidated call support.
+///
+/// For `Call` and `TailCall`, emits a direct `call` if the target is in the
+/// consolidated module, otherwise falls back to `call_indirect`. For control
+/// flow with nested bodies, recurses to handle inner calls.
+fn emit_consolidated_op(f: &mut Function, op: &IrOp, local_fn_map: &HashMap<WordId, u32>) {
+    match op {
+        IrOp::Call(word_id) => {
+            if let Some(&fn_idx) = local_fn_map.get(word_id) {
+                dsp_writeback(f);
+                f.instruction(&Instruction::Call(fn_idx));
+                dsp_reload(f);
+            } else {
+                // Fall back to indirect call for host functions
+                dsp_writeback(f);
+                f.instruction(&Instruction::I32Const(word_id.0 as i32))
+                    .instruction(&Instruction::CallIndirect {
+                        type_index: TYPE_VOID,
+                        table_index: TABLE,
+                    });
+                dsp_reload(f);
+            }
+        }
+
+        IrOp::TailCall(word_id) => {
+            if let Some(&fn_idx) = local_fn_map.get(word_id) {
+                dsp_writeback(f);
+                f.instruction(&Instruction::Call(fn_idx));
+                f.instruction(&Instruction::Return);
+            } else {
+                dsp_writeback(f);
+                f.instruction(&Instruction::I32Const(word_id.0 as i32))
+                    .instruction(&Instruction::CallIndirect {
+                        type_index: TYPE_VOID,
+                        table_index: TABLE,
+                    });
+                f.instruction(&Instruction::Return);
+            }
+        }
+
+        // Control flow with nested bodies -- recurse for consolidated calls
+        IrOp::If {
+            then_body,
+            else_body,
+        } => {
+            pop(f);
+            f.instruction(&Instruction::If(BlockType::Empty));
+            emit_consolidated_body(f, then_body, local_fn_map);
+            if let Some(eb) = else_body {
+                f.instruction(&Instruction::Else);
+                emit_consolidated_body(f, eb, local_fn_map);
+            }
+            f.instruction(&Instruction::End);
+        }
+
+        IrOp::DoLoop { body, is_plus_loop } => {
+            emit_consolidated_do_loop(f, body, *is_plus_loop, local_fn_map);
+        }
+
+        IrOp::BeginUntil { body } => {
+            f.instruction(&Instruction::Loop(BlockType::Empty));
+            emit_consolidated_body(f, body, local_fn_map);
+            pop(f);
+            f.instruction(&Instruction::I32Eqz)
+                .instruction(&Instruction::BrIf(0))
+                .instruction(&Instruction::End);
+        }
+
+        IrOp::BeginAgain { body } => {
+            f.instruction(&Instruction::Loop(BlockType::Empty));
+            emit_consolidated_body(f, body, local_fn_map);
+            f.instruction(&Instruction::Br(0))
+                .instruction(&Instruction::End);
+        }
+
+        IrOp::BeginWhileRepeat { test, body } => {
+            f.instruction(&Instruction::Block(BlockType::Empty));
+            f.instruction(&Instruction::Loop(BlockType::Empty));
+            emit_consolidated_body(f, test, local_fn_map);
+            pop(f);
+            f.instruction(&Instruction::I32Eqz)
+                .instruction(&Instruction::BrIf(1));
+            emit_consolidated_body(f, body, local_fn_map);
+            f.instruction(&Instruction::Br(0))
+                .instruction(&Instruction::End)
+                .instruction(&Instruction::End);
+        }
+
+        IrOp::BeginDoubleWhileRepeat {
+            outer_test,
+            inner_test,
+            body,
+            after_repeat,
+            else_body,
+        } => {
+            f.instruction(&Instruction::Block(BlockType::Empty)); // $end
+            f.instruction(&Instruction::Block(BlockType::Empty)); // $else
+            f.instruction(&Instruction::Block(BlockType::Empty)); // $after
+            f.instruction(&Instruction::Loop(BlockType::Empty)); // $begin
+            emit_consolidated_body(f, outer_test, local_fn_map);
+            pop(f);
+            f.instruction(&Instruction::I32Eqz)
+                .instruction(&Instruction::BrIf(2)); // to $else
+            emit_consolidated_body(f, inner_test, local_fn_map);
+            pop(f);
+            f.instruction(&Instruction::I32Eqz)
+                .instruction(&Instruction::BrIf(1)); // to $after
+            emit_consolidated_body(f, body, local_fn_map);
+            f.instruction(&Instruction::Br(0)); // back to $begin
+            f.instruction(&Instruction::End); // end loop
+            f.instruction(&Instruction::End); // end $after block
+            emit_consolidated_body(f, after_repeat, local_fn_map);
+            if else_body.is_some() {
+                f.instruction(&Instruction::Br(1)); // skip else, goto $end
+            }
+            f.instruction(&Instruction::End); // end $else block
+            if let Some(eb) = else_body {
+                emit_consolidated_body(f, eb, local_fn_map);
+            }
+            f.instruction(&Instruction::End); // end $end block
+        }
+
+        // All other ops have no nested bodies with calls -- delegate to emit_op
+        other => emit_op(f, other),
+    }
+}
+
+/// Emit a DO...LOOP / DO...+LOOP with consolidated call support for the body.
+fn emit_consolidated_do_loop(
+    f: &mut Function,
+    body: &[IrOp],
+    is_plus_loop: bool,
+    local_fn_map: &HashMap<WordId, u32>,
+) {
+    // DO ( limit index -- )
+    pop_to(f, SCRATCH_BASE); // index
+    pop_to(f, SCRATCH_BASE + 1); // limit
+
+    // Push limit then index to return stack
+    f.instruction(&Instruction::LocalGet(SCRATCH_BASE + 1));
+    rpush_via_local(f, SCRATCH_BASE + 2);
+    f.instruction(&Instruction::LocalGet(SCRATCH_BASE));
+    rpush_via_local(f, SCRATCH_BASE + 2);
+
+    f.instruction(&Instruction::Block(BlockType::Empty));
+    f.instruction(&Instruction::Loop(BlockType::Empty));
+
+    emit_consolidated_body(f, body, local_fn_map);
+
+    // Pop current index from return stack into scratch local
+    rpop(f);
+
+    if is_plus_loop {
+        f.instruction(&Instruction::LocalSet(SCRATCH_BASE));
+        pop_to(f, SCRATCH_BASE + 2); // step from data stack
+
+        rpeek(f);
+        f.instruction(&Instruction::LocalSet(SCRATCH_BASE + 1));
+
+        f.instruction(&Instruction::LocalGet(SCRATCH_BASE))
+            .instruction(&Instruction::LocalGet(SCRATCH_BASE + 1))
+            .instruction(&Instruction::I32Sub)
+            .instruction(&Instruction::LocalSet(SCRATCH_BASE + 3));
+
+        f.instruction(&Instruction::LocalGet(SCRATCH_BASE))
+            .instruction(&Instruction::LocalGet(SCRATCH_BASE + 2))
+            .instruction(&Instruction::I32Add)
+            .instruction(&Instruction::LocalSet(SCRATCH_BASE));
+
+        f.instruction(&Instruction::LocalGet(SCRATCH_BASE));
+        rpush_via_local(f, SCRATCH_BASE + 2);
+
+        f.instruction(&Instruction::LocalGet(SCRATCH_BASE + 3))
+            .instruction(&Instruction::LocalGet(SCRATCH_BASE))
+            .instruction(&Instruction::LocalGet(SCRATCH_BASE + 1))
+            .instruction(&Instruction::I32Sub)
+            .instruction(&Instruction::I32Xor)
+            .instruction(&Instruction::I32Const(0))
+            .instruction(&Instruction::I32LtS)
+            .instruction(&Instruction::BrIf(1))
+            .instruction(&Instruction::Br(0))
+            .instruction(&Instruction::End)
+            .instruction(&Instruction::End);
+    } else {
+        f.instruction(&Instruction::I32Const(1))
+            .instruction(&Instruction::I32Add)
+            .instruction(&Instruction::LocalSet(SCRATCH_BASE));
+
+        rpeek(f);
+        f.instruction(&Instruction::LocalSet(SCRATCH_BASE + 1));
+
+        f.instruction(&Instruction::LocalGet(SCRATCH_BASE));
+        rpush_via_local(f, SCRATCH_BASE + 2);
+
+        f.instruction(&Instruction::LocalGet(SCRATCH_BASE))
+            .instruction(&Instruction::LocalGet(SCRATCH_BASE + 1))
+            .instruction(&Instruction::I32GeS)
+            .instruction(&Instruction::BrIf(1))
+            .instruction(&Instruction::Br(0))
+            .instruction(&Instruction::End)
+            .instruction(&Instruction::End);
+    }
+
+    // Clean up: pop index and limit from return stack
+    rpop(f);
+    f.instruction(&Instruction::Drop);
+    rpop(f);
+    f.instruction(&Instruction::Drop);
+}
+
+/// Compile all given words into a single consolidated WASM module.
+///
+/// Each word becomes a function in the module. Calls between words within the
+/// module use direct `call` instructions instead of `call_indirect` through the
+/// function table, enabling Cranelift to inline and optimize across word
+/// boundaries.
+///
+/// # Arguments
+///
+/// * `words` - Words to consolidate, sorted by `WordId`. Each entry is
+///   `(WordId, Vec<IrOp>)` containing the word's IR body.
+/// * `local_fn_map` - Maps each `WordId` in the module to its WASM function
+///   index (imported functions come first, so defined functions start at 1).
+/// * `table_size` - Current function table size, used for table import minimum.
+pub fn compile_consolidated_module(
+    words: &[(WordId, Vec<IrOp>)],
+    local_fn_map: &HashMap<WordId, u32>,
+    table_size: u32,
+) -> WaferResult<Vec<u8>> {
+    let mut module = Module::new();
+
+    // -- Type section --
+    let mut types = TypeSection::new();
+    types.ty().function([], []); // type 0: () -> ()
+    types.ty().function([ValType::I32], []); // type 1: (i32) -> ()
+    module.section(&types);
+
+    // -- Import section (same as single-word modules) --
+    let mut imports = ImportSection::new();
+    imports.import("env", "emit", EntityType::Function(TYPE_I32));
+    imports.import(
+        "env",
+        "memory",
+        EntityType::Memory(MemoryType {
+            minimum: 1,
+            maximum: None,
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        }),
+    );
+    imports.import(
+        "env",
+        "dsp",
+        EntityType::Global(GlobalType {
+            val_type: ValType::I32,
+            mutable: true,
+            shared: false,
+        }),
+    );
+    imports.import(
+        "env",
+        "rsp",
+        EntityType::Global(GlobalType {
+            val_type: ValType::I32,
+            mutable: true,
+            shared: false,
+        }),
+    );
+    imports.import(
+        "env",
+        "fsp",
+        EntityType::Global(GlobalType {
+            val_type: ValType::I32,
+            mutable: true,
+            shared: false,
+        }),
+    );
+    imports.import(
+        "env",
+        "table",
+        EntityType::Table(TableType {
+            element_type: RefType::FUNCREF,
+            minimum: table_size as u64,
+            maximum: None,
+            table64: false,
+            shared: false,
+        }),
+    );
+    module.section(&imports);
+
+    // -- Function section: N functions, all type void --
+    let mut functions = FunctionSection::new();
+    for _ in words {
+        functions.function(TYPE_VOID);
+    }
+    module.section(&functions);
+
+    // -- Export section: export each function as "fn_0", "fn_1", etc. --
+    let mut exports = ExportSection::new();
+    for (i, _) in words.iter().enumerate() {
+        let name = format!("fn_{i}");
+        // +1 because emit is imported function index 0
+        exports.export(&name, ExportKind::Func, (i as u32) + 1);
+    }
+    module.section(&exports);
+
+    // -- Element section: place each function in the table at its WordId slot --
+    // Use a single element section with one active segment per word.
+    let mut elements = ElementSection::new();
+    for (i, (word_id, _)) in words.iter().enumerate() {
+        let offset = ConstExpr::i32_const(word_id.0 as i32);
+        let fn_idx = (i as u32) + 1; // +1 for the emit import
+        let indices = [fn_idx];
+        elements.active(
+            Some(TABLE),
+            &offset,
+            Elements::Functions(Cow::Borrowed(&indices)),
+        );
+    }
+    module.section(&elements);
+
+    // -- Code section: emit each function body --
+    let mut code = CodeSection::new();
+    for (_word_id, body) in words {
+        let num_locals = 1 + count_scratch_locals(body);
+        let mut func = Function::new(vec![(num_locals, ValType::I32)]);
+
+        // Prologue: cache $dsp global into local 0
+        func.instruction(&Instruction::GlobalGet(DSP))
+            .instruction(&Instruction::LocalSet(CACHED_DSP_LOCAL));
+
+        // Body with consolidated call support
+        emit_consolidated_body(&mut func, body, local_fn_map);
+
+        // Epilogue: write cached DSP back to the $dsp global
+        func.instruction(&Instruction::LocalGet(CACHED_DSP_LOCAL))
+            .instruction(&Instruction::GlobalSet(DSP));
+
+        func.instruction(&Instruction::End);
+        code.function(&func);
+    }
+    module.section(&code);
+
+    let bytes = module.finish();
+
+    // Validate
+    wasmparser::validate(&bytes).map_err(|e| {
+        WaferError::ValidationError(format!("Consolidated WASM failed validation: {e}"))
+    })?;
+
+    Ok(bytes)
 }
 
 /// Generate the core/bootstrap WASM module.
