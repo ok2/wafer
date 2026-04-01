@@ -782,6 +782,539 @@ fn emit_do_loop(f: &mut Function, body: &[IrOp], is_plus_loop: bool) {
 }
 
 // ---------------------------------------------------------------------------
+// Stack-to-local promotion
+// ---------------------------------------------------------------------------
+
+/// Check if a word body qualifies for stack-to-local promotion.
+///
+/// Phase 1: only straight-line code (no control flow, calls, I/O, return stack).
+fn is_promotable(ops: &[IrOp]) -> bool {
+    if ops.is_empty() {
+        return false;
+    }
+    for op in ops {
+        match op {
+            IrOp::Call(_) | IrOp::TailCall(_) | IrOp::Execute => return false,
+            IrOp::If { .. }
+            | IrOp::DoLoop { .. }
+            | IrOp::BeginUntil { .. }
+            | IrOp::BeginAgain { .. }
+            | IrOp::BeginWhileRepeat { .. }
+            | IrOp::BeginDoubleWhileRepeat { .. } => return false,
+            IrOp::Exit => return false,
+            IrOp::ToR | IrOp::FromR | IrOp::RFetch => return false,
+            IrOp::Emit | IrOp::Dot | IrOp::Cr | IrOp::Type => return false,
+            IrOp::PushI64(_) | IrOp::PushF64(_) => return false,
+            _ => {}
+        }
+    }
+    true
+}
+
+/// Compute the net stack depth change for a single IR operation.
+fn stack_delta(op: &IrOp) -> i32 {
+    match op {
+        IrOp::PushI32(_) | IrOp::Dup | IrOp::Over | IrOp::Tuck => 1,
+        IrOp::Drop | IrOp::Nip => -1,
+        IrOp::Swap | IrOp::Rot => 0,
+        IrOp::Add
+        | IrOp::Sub
+        | IrOp::Mul
+        | IrOp::And
+        | IrOp::Or
+        | IrOp::Xor
+        | IrOp::Lshift
+        | IrOp::Rshift
+        | IrOp::ArithRshift
+        | IrOp::Eq
+        | IrOp::NotEq
+        | IrOp::Lt
+        | IrOp::Gt
+        | IrOp::LtUnsigned => -1,
+        IrOp::DivMod => 0, // 2->2
+        IrOp::Negate | IrOp::Abs | IrOp::Invert | IrOp::ZeroEq | IrOp::ZeroLt => 0,
+        IrOp::Fetch | IrOp::CFetch => 0, // 1->1
+        IrOp::Store | IrOp::CStore | IrOp::PlusStore => -2,
+        IrOp::TwoDup => 2,
+        IrOp::TwoDrop => -2,
+        _ => 0,
+    }
+}
+
+/// Compute how many pre-existing stack items a word body needs.
+///
+/// Returns `(preload_count, net_depth_change)` where `preload_count` is the
+/// number of items that must be loaded from the memory stack before execution.
+///
+/// The key insight: some ops READ existing stack positions without consuming
+/// them (e.g., `Dup` reads the top). We must track the minimum stack position
+/// that any op reads from, not just the net depth after consumption.
+fn compute_stack_needs(ops: &[IrOp]) -> (u32, i32) {
+    let mut depth: i32 = 0;
+    let mut min_accessed: i32 = 0; // most negative position accessed
+
+    for op in ops {
+        // Determine the deepest position this op reads from relative to
+        // current depth. Position 0 = top of stack = depth-1 from base.
+        let reads_from = match op {
+            // These read the top without consuming:
+            IrOp::Dup => depth - 1,
+            // Reads top and second without consuming:
+            IrOp::Over => depth - 2,
+            IrOp::TwoDup => depth - 2,
+            // Reads/rearranges top 2:
+            IrOp::Swap | IrOp::Nip | IrOp::Tuck => depth - 2,
+            // Reads/rearranges top 3:
+            IrOp::Rot => depth - 3,
+            // Binary ops consume 2:
+            IrOp::Add
+            | IrOp::Sub
+            | IrOp::Mul
+            | IrOp::And
+            | IrOp::Or
+            | IrOp::Xor
+            | IrOp::Lshift
+            | IrOp::Rshift
+            | IrOp::ArithRshift
+            | IrOp::Eq
+            | IrOp::NotEq
+            | IrOp::Lt
+            | IrOp::Gt
+            | IrOp::LtUnsigned
+            | IrOp::DivMod
+            | IrOp::Store
+            | IrOp::CStore
+            | IrOp::PlusStore => depth - 2,
+            // Unary ops consume 1:
+            IrOp::Drop
+            | IrOp::Negate
+            | IrOp::Abs
+            | IrOp::Invert
+            | IrOp::ZeroEq
+            | IrOp::ZeroLt
+            | IrOp::Fetch
+            | IrOp::CFetch => depth - 1,
+            IrOp::TwoDrop => depth - 2,
+            // Push ops don't read existing items
+            _ => depth,
+        };
+        min_accessed = min_accessed.min(reads_from);
+        depth += stack_delta(op);
+    }
+    let preload = if min_accessed < 0 {
+        (-min_accessed) as u32
+    } else {
+        0
+    };
+    (preload, depth)
+}
+
+/// Count how many WASM locals the promoted code path needs (excluding cached
+/// DSP and scratch locals). This is an upper bound -- we allocate a fresh
+/// local for each value-producing operation.
+fn count_promoted_locals(ops: &[IrOp], preload: u32) -> u32 {
+    let mut count = preload;
+    for op in ops {
+        match op {
+            IrOp::PushI32(_) => count += 1,
+            IrOp::Add
+            | IrOp::Sub
+            | IrOp::Mul
+            | IrOp::And
+            | IrOp::Or
+            | IrOp::Xor
+            | IrOp::Lshift
+            | IrOp::Rshift
+            | IrOp::ArithRshift
+            | IrOp::Eq
+            | IrOp::NotEq
+            | IrOp::Lt
+            | IrOp::Gt
+            | IrOp::LtUnsigned
+            | IrOp::Negate
+            | IrOp::Abs
+            | IrOp::Invert
+            | IrOp::ZeroEq
+            | IrOp::ZeroLt
+            | IrOp::Fetch
+            | IrOp::CFetch => count += 1,
+            IrOp::DivMod => count += 2,
+            IrOp::Dup | IrOp::Over | IrOp::Tuck | IrOp::TwoDup => {
+                // These reuse existing locals via the simulator, no extra needed
+            }
+            _ => {}
+        }
+    }
+    count
+}
+
+/// Stack simulator: tracks which WASM local holds each conceptual stack slot.
+struct StackSim {
+    /// Conceptual stack: `stack[0]` = bottom, `stack.last()` = top.
+    /// Each entry is a WASM local index.
+    stack: Vec<u32>,
+    /// Next available local index.
+    next_local: u32,
+}
+
+impl StackSim {
+    fn new(first_local: u32) -> Self {
+        Self {
+            stack: Vec::new(),
+            next_local: first_local,
+        }
+    }
+
+    /// Allocate a fresh WASM local and return its index.
+    fn alloc(&mut self) -> u32 {
+        let l = self.next_local;
+        self.next_local += 1;
+        l
+    }
+
+    /// Push a local index onto the conceptual stack.
+    fn push(&mut self, local: u32) {
+        self.stack.push(local);
+    }
+
+    /// Pop the top local index from the conceptual stack.
+    fn pop(&mut self) -> u32 {
+        self.stack.pop().expect("promoted stack underflow")
+    }
+
+    /// Peek at the top of the conceptual stack.
+    fn peek(&self) -> u32 {
+        *self.stack.last().expect("promoted stack empty")
+    }
+
+    /// Peek at a position relative to the top (0 = top, 1 = second, etc.).
+    fn peek_at(&self, from_top: usize) -> u32 {
+        self.stack[self.stack.len() - 1 - from_top]
+    }
+
+    fn swap(&mut self) {
+        let len = self.stack.len();
+        self.stack.swap(len - 1, len - 2);
+    }
+
+    fn rot(&mut self) {
+        // ( a b c -- b c a ) : remove third from top, push to top
+        let len = self.stack.len();
+        let a = self.stack.remove(len - 3);
+        self.stack.push(a);
+    }
+}
+
+/// Emit the promoted prologue: load `preload` items from the memory stack
+/// into WASM locals.
+fn emit_promoted_prologue(f: &mut Function, preload: u32, sim: &mut StackSim) {
+    // Load items: mem[dsp] = top of stack, mem[dsp+4] = second, etc.
+    // We load them top-first, then reverse the sim stack so that
+    // sim.stack[0] = deepest loaded, sim.stack[last] = top.
+    for i in 0..preload {
+        let local = sim.alloc();
+        f.instruction(&Instruction::LocalGet(CACHED_DSP_LOCAL));
+        if i > 0 {
+            f.instruction(&Instruction::I32Const((i * CELL_SIZE) as i32));
+            f.instruction(&Instruction::I32Add);
+        }
+        f.instruction(&Instruction::I32Load(MEM4));
+        f.instruction(&Instruction::LocalSet(local));
+        sim.push(local);
+    }
+    // Reverse so stack[0] = deepest, stack[last] = top
+    sim.stack.reverse();
+
+    // Advance cached DSP past preloaded items
+    if preload > 0 {
+        f.instruction(&Instruction::LocalGet(CACHED_DSP_LOCAL));
+        f.instruction(&Instruction::I32Const((preload * CELL_SIZE) as i32));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalSet(CACHED_DSP_LOCAL));
+    }
+}
+
+/// Emit the promoted epilogue: write remaining stack items back to memory.
+fn emit_promoted_epilogue(f: &mut Function, sim: &mut StackSim) {
+    let remaining = sim.stack.len() as u32;
+    if remaining > 0 {
+        // Decrement cached DSP for the items we're pushing back
+        f.instruction(&Instruction::LocalGet(CACHED_DSP_LOCAL));
+        f.instruction(&Instruction::I32Const((remaining * CELL_SIZE) as i32));
+        f.instruction(&Instruction::I32Sub);
+        f.instruction(&Instruction::LocalSet(CACHED_DSP_LOCAL));
+
+        // Store items: top of sim stack (last in vec) goes to [dsp],
+        // next goes to [dsp+4], etc.
+        for i in 0..remaining {
+            let local = sim.stack[(remaining - 1 - i) as usize]; // top first
+            f.instruction(&Instruction::LocalGet(CACHED_DSP_LOCAL));
+            if i > 0 {
+                f.instruction(&Instruction::I32Const((i * CELL_SIZE) as i32));
+                f.instruction(&Instruction::I32Add);
+            }
+            f.instruction(&Instruction::LocalGet(local));
+            f.instruction(&Instruction::I32Store(MEM4));
+        }
+    }
+}
+
+/// Emit a single promoted IR operation using WASM locals instead of memory.
+///
+/// Stack manipulation ops (Swap, Rot, Dup, Drop, Over, Nip, Tuck) emit zero
+/// WASM instructions -- they just rearrange the simulator's local references.
+/// Arithmetic and memory ops use `local.get` / `local.set` instead of
+/// load/store through the data stack pointer.
+fn emit_promoted_op(f: &mut Function, op: &IrOp, sim: &mut StackSim) {
+    match op {
+        // -- Literals --
+        IrOp::PushI32(n) => {
+            let local = sim.alloc();
+            f.instruction(&Instruction::I32Const(*n));
+            f.instruction(&Instruction::LocalSet(local));
+            sim.push(local);
+        }
+
+        // -- Stack manipulation: zero WASM instructions! --
+        IrOp::Drop => {
+            sim.pop();
+        }
+        IrOp::Dup => {
+            let top = sim.peek();
+            sim.push(top); // same local, aliased
+        }
+        IrOp::Swap => {
+            sim.swap();
+        }
+        IrOp::Over => {
+            let second = sim.peek_at(1);
+            sim.push(second);
+        }
+        IrOp::Rot => {
+            sim.rot();
+        }
+        IrOp::Nip => {
+            // ( a b -- b ) : remove second
+            let top = sim.pop();
+            sim.pop(); // discard second
+            sim.push(top);
+        }
+        IrOp::Tuck => {
+            // ( a b -- b a b ) : insert top below second
+            let b = sim.pop();
+            let a = sim.pop();
+            sim.push(b);
+            sim.push(a);
+            sim.push(b); // aliased, same local
+        }
+        IrOp::TwoDup => {
+            let b = sim.peek_at(0);
+            let a = sim.peek_at(1);
+            sim.push(a);
+            sim.push(b);
+        }
+        IrOp::TwoDrop => {
+            sim.pop();
+            sim.pop();
+        }
+
+        // -- Binary arithmetic (commutative) --
+        IrOp::Add => emit_promoted_binary(f, sim, &Instruction::I32Add),
+        IrOp::Mul => emit_promoted_binary(f, sim, &Instruction::I32Mul),
+        IrOp::And => emit_promoted_binary(f, sim, &Instruction::I32And),
+        IrOp::Or => emit_promoted_binary(f, sim, &Instruction::I32Or),
+        IrOp::Xor => emit_promoted_binary(f, sim, &Instruction::I32Xor),
+
+        // -- Binary arithmetic (ordered: a OP b) --
+        IrOp::Sub => emit_promoted_binary_ordered(f, sim, &Instruction::I32Sub),
+        IrOp::Lshift => emit_promoted_binary_ordered(f, sim, &Instruction::I32Shl),
+        IrOp::Rshift => emit_promoted_binary_ordered(f, sim, &Instruction::I32ShrU),
+        IrOp::ArithRshift => emit_promoted_binary_ordered(f, sim, &Instruction::I32ShrS),
+
+        // -- Comparisons --
+        IrOp::Eq => emit_promoted_cmp(f, sim, &Instruction::I32Eq),
+        IrOp::NotEq => emit_promoted_cmp(f, sim, &Instruction::I32Ne),
+        IrOp::Lt => emit_promoted_cmp(f, sim, &Instruction::I32LtS),
+        IrOp::Gt => emit_promoted_cmp(f, sim, &Instruction::I32GtS),
+        IrOp::LtUnsigned => emit_promoted_cmp(f, sim, &Instruction::I32LtU),
+
+        IrOp::ZeroEq => {
+            let a = sim.pop();
+            let result = sim.alloc();
+            f.instruction(&Instruction::LocalGet(a));
+            f.instruction(&Instruction::I32Eqz);
+            // Convert WASM bool to Forth flag: 0 - result
+            f.instruction(&Instruction::LocalSet(result));
+            f.instruction(&Instruction::I32Const(0));
+            f.instruction(&Instruction::LocalGet(result));
+            f.instruction(&Instruction::I32Sub);
+            f.instruction(&Instruction::LocalSet(result));
+            sim.push(result);
+        }
+        IrOp::ZeroLt => {
+            let a = sim.pop();
+            let result = sim.alloc();
+            f.instruction(&Instruction::LocalGet(a));
+            f.instruction(&Instruction::I32Const(0));
+            f.instruction(&Instruction::I32LtS);
+            // Convert WASM bool to Forth flag
+            f.instruction(&Instruction::LocalSet(result));
+            f.instruction(&Instruction::I32Const(0));
+            f.instruction(&Instruction::LocalGet(result));
+            f.instruction(&Instruction::I32Sub);
+            f.instruction(&Instruction::LocalSet(result));
+            sim.push(result);
+        }
+
+        // -- Unary arithmetic --
+        IrOp::Negate => {
+            let a = sim.pop();
+            let result = sim.alloc();
+            f.instruction(&Instruction::I32Const(0));
+            f.instruction(&Instruction::LocalGet(a));
+            f.instruction(&Instruction::I32Sub);
+            f.instruction(&Instruction::LocalSet(result));
+            sim.push(result);
+        }
+        IrOp::Abs => {
+            let a = sim.pop();
+            let result = sim.alloc();
+            // Copy input to result, then negate if negative
+            f.instruction(&Instruction::LocalGet(a));
+            f.instruction(&Instruction::LocalSet(result));
+            f.instruction(&Instruction::LocalGet(result));
+            f.instruction(&Instruction::I32Const(0));
+            f.instruction(&Instruction::I32LtS);
+            f.instruction(&Instruction::If(BlockType::Empty));
+            f.instruction(&Instruction::I32Const(0));
+            f.instruction(&Instruction::LocalGet(result));
+            f.instruction(&Instruction::I32Sub);
+            f.instruction(&Instruction::LocalSet(result));
+            f.instruction(&Instruction::End);
+            sim.push(result);
+        }
+        IrOp::Invert => {
+            let a = sim.pop();
+            let result = sim.alloc();
+            f.instruction(&Instruction::I32Const(-1));
+            f.instruction(&Instruction::LocalGet(a));
+            f.instruction(&Instruction::I32Xor);
+            f.instruction(&Instruction::LocalSet(result));
+            sim.push(result);
+        }
+
+        // -- DivMod: ( n1 n2 -- rem quot ) --
+        IrOp::DivMod => {
+            let n2 = sim.pop();
+            let n1 = sim.pop();
+            let rem_local = sim.alloc();
+            let quot_local = sim.alloc();
+            // remainder
+            f.instruction(&Instruction::LocalGet(n1));
+            f.instruction(&Instruction::LocalGet(n2));
+            f.instruction(&Instruction::I32RemS);
+            f.instruction(&Instruction::LocalSet(rem_local));
+            // quotient
+            f.instruction(&Instruction::LocalGet(n1));
+            f.instruction(&Instruction::LocalGet(n2));
+            f.instruction(&Instruction::I32DivS);
+            f.instruction(&Instruction::LocalSet(quot_local));
+            sim.push(rem_local);
+            sim.push(quot_local);
+        }
+
+        // -- Memory operations: these still access linear memory --
+        IrOp::Fetch => {
+            let addr = sim.pop();
+            let result = sim.alloc();
+            f.instruction(&Instruction::LocalGet(addr));
+            f.instruction(&Instruction::I32Load(MEM4));
+            f.instruction(&Instruction::LocalSet(result));
+            sim.push(result);
+        }
+        IrOp::CFetch => {
+            let addr = sim.pop();
+            let result = sim.alloc();
+            f.instruction(&Instruction::LocalGet(addr));
+            f.instruction(&Instruction::I32Load8U(MEM1));
+            f.instruction(&Instruction::LocalSet(result));
+            sim.push(result);
+        }
+        IrOp::Store => {
+            // ( x addr -- )
+            let addr = sim.pop();
+            let x = sim.pop();
+            f.instruction(&Instruction::LocalGet(addr));
+            f.instruction(&Instruction::LocalGet(x));
+            f.instruction(&Instruction::I32Store(MEM4));
+        }
+        IrOp::CStore => {
+            let addr = sim.pop();
+            let ch = sim.pop();
+            f.instruction(&Instruction::LocalGet(addr));
+            f.instruction(&Instruction::LocalGet(ch));
+            f.instruction(&Instruction::I32Store8(MEM1));
+        }
+        IrOp::PlusStore => {
+            // ( n addr -- ) : mem[addr] += n
+            let addr = sim.pop();
+            let n = sim.pop();
+            f.instruction(&Instruction::LocalGet(addr));
+            f.instruction(&Instruction::LocalGet(addr));
+            f.instruction(&Instruction::I32Load(MEM4));
+            f.instruction(&Instruction::LocalGet(n));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::I32Store(MEM4));
+        }
+
+        // These should not appear in promotable code (caught by is_promotable),
+        // but handle gracefully by falling back to emit_op.
+        _ => {}
+    }
+}
+
+/// Emit a promoted binary operation (commutative).
+fn emit_promoted_binary(f: &mut Function, sim: &mut StackSim, op: &Instruction<'_>) {
+    let b = sim.pop();
+    let a = sim.pop();
+    let result = sim.alloc();
+    f.instruction(&Instruction::LocalGet(a));
+    f.instruction(&Instruction::LocalGet(b));
+    f.instruction(op);
+    f.instruction(&Instruction::LocalSet(result));
+    sim.push(result);
+}
+
+/// Emit a promoted binary operation (ordered: a OP b).
+fn emit_promoted_binary_ordered(f: &mut Function, sim: &mut StackSim, op: &Instruction<'_>) {
+    let b = sim.pop();
+    let a = sim.pop();
+    let result = sim.alloc();
+    f.instruction(&Instruction::LocalGet(a));
+    f.instruction(&Instruction::LocalGet(b));
+    f.instruction(op);
+    f.instruction(&Instruction::LocalSet(result));
+    sim.push(result);
+}
+
+/// Emit a promoted comparison operation (a CMP b, result is Forth flag).
+fn emit_promoted_cmp(f: &mut Function, sim: &mut StackSim, cmp: &Instruction<'_>) {
+    let b = sim.pop();
+    let a = sim.pop();
+    let result = sim.alloc();
+    f.instruction(&Instruction::LocalGet(a));
+    f.instruction(&Instruction::LocalGet(b));
+    f.instruction(cmp);
+    // Convert WASM bool (0/1) to Forth flag (0/-1): 0 - wasm_bool
+    f.instruction(&Instruction::LocalSet(result));
+    f.instruction(&Instruction::I32Const(0));
+    f.instruction(&Instruction::LocalGet(result));
+    f.instruction(&Instruction::I32Sub);
+    f.instruction(&Instruction::LocalSet(result));
+    sim.push(result);
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -923,15 +1456,35 @@ pub fn compile_word(
     module.section(&elements);
 
     // -- Code section --
-    // Total locals = 1 (cached DSP at index 0) + scratch locals (at SCRATCH_BASE..)
-    let num_locals = 1 + count_scratch_locals(body);
+    // Determine whether to use stack-to-local promotion
+    let promoted = is_promotable(body);
+    let scratch_count = count_scratch_locals(body);
+    let num_locals = if promoted {
+        let (preload, _) = compute_stack_needs(body);
+        let promoted_count = count_promoted_locals(body, preload);
+        // 1 (cached DSP) + promoted locals (scratch locals not needed in promoted path)
+        1 + promoted_count
+    } else {
+        1 + scratch_count
+    };
     let mut func = Function::new(vec![(num_locals, ValType::I32)]);
 
     // Prologue: cache $dsp global into local 0
     func.instruction(&Instruction::GlobalGet(DSP))
         .instruction(&Instruction::LocalSet(CACHED_DSP_LOCAL));
 
-    emit_body(&mut func, body);
+    if promoted {
+        let (preload, _) = compute_stack_needs(body);
+        let first_promoted = SCRATCH_BASE; // promoted locals start right after cached_dsp
+        let mut sim = StackSim::new(first_promoted);
+        emit_promoted_prologue(&mut func, preload, &mut sim);
+        for op in body {
+            emit_promoted_op(&mut func, op, &mut sim);
+        }
+        emit_promoted_epilogue(&mut func, &mut sim);
+    } else {
+        emit_body(&mut func, body);
+    }
 
     // Epilogue: write cached DSP back to the $dsp global
     func.instruction(&Instruction::LocalGet(CACHED_DSP_LOCAL))
@@ -1988,5 +2541,215 @@ mod tests {
             IrOp::Mul,
         ];
         assert_eq!(run_word(&ops), vec![14]);
+    }
+
+    // ===================================================================
+    // Stack-to-local promotion tests
+    // ===================================================================
+
+    #[test]
+    fn promotable_pure_arithmetic() {
+        assert!(is_promotable(&[IrOp::Dup, IrOp::Mul]));
+        assert!(is_promotable(&[IrOp::PushI32(1), IrOp::Add]));
+        assert!(is_promotable(&[IrOp::Swap, IrOp::Over, IrOp::Nip]));
+    }
+
+    #[test]
+    fn not_promotable_with_calls() {
+        assert!(!is_promotable(&[IrOp::Call(WordId(5))]));
+        assert!(!is_promotable(&[IrOp::Emit]));
+        assert!(!is_promotable(&[IrOp::ToR]));
+        assert!(!is_promotable(&[IrOp::If {
+            then_body: vec![],
+            else_body: None,
+        }]));
+        assert!(!is_promotable(&[]));
+    }
+
+    #[test]
+    fn compute_stack_needs_dup_mul() {
+        // DUP * : reads 1 item from caller, net change = 0 (1 in, 1 out via dup*mul)
+        let (preload, net) = compute_stack_needs(&[IrOp::Dup, IrOp::Mul]);
+        assert_eq!(preload, 1);
+        assert_eq!(net, 0);
+    }
+
+    #[test]
+    fn compute_stack_needs_push_add() {
+        // PushI32(1) Add: needs 1 item from caller (Add consumes 2, push provides 1)
+        let (preload, net) = compute_stack_needs(&[IrOp::PushI32(1), IrOp::Add]);
+        assert_eq!(preload, 1); // Add reads depth-2 = -1 when depth=1 after push
+        assert_eq!(net, 0);
+    }
+
+    #[test]
+    fn compute_stack_needs_swap() {
+        // SWAP: reads 2 items, net = 0
+        let (preload, net) = compute_stack_needs(&[IrOp::Swap]);
+        assert_eq!(preload, 2);
+        assert_eq!(net, 0);
+    }
+
+    #[test]
+    fn promoted_dup_mul_executes() {
+        // SQUARE = DUP * (promotable: preload 1 item, no memory stack ops)
+        let ops = vec![IrOp::PushI32(7), IrOp::Dup, IrOp::Mul];
+        assert_eq!(run_word(&ops), vec![49]);
+    }
+
+    #[test]
+    fn promoted_swap_executes() {
+        // Swap two items using promoted path (zero WASM instructions for swap)
+        let ops = vec![IrOp::PushI32(1), IrOp::PushI32(2), IrOp::Swap];
+        assert_eq!(run_word(&ops), vec![1, 2]);
+    }
+
+    #[test]
+    fn promoted_over_add_executes() {
+        // OVER OVER + : promoted, reads 2 items, pushes 1 extra
+        let ops = vec![
+            IrOp::PushI32(3),
+            IrOp::PushI32(4),
+            IrOp::Over,
+            IrOp::Over,
+            IrOp::Add,
+        ];
+        assert_eq!(run_word(&ops), vec![7, 4, 3]);
+    }
+
+    #[test]
+    fn promoted_nip_executes() {
+        let ops = vec![IrOp::PushI32(10), IrOp::PushI32(20), IrOp::Nip];
+        assert_eq!(run_word(&ops), vec![20]);
+    }
+
+    #[test]
+    fn promoted_rot_executes() {
+        let ops = vec![
+            IrOp::PushI32(1),
+            IrOp::PushI32(2),
+            IrOp::PushI32(3),
+            IrOp::Rot,
+        ];
+        assert_eq!(run_word(&ops), vec![1, 3, 2]);
+    }
+
+    #[test]
+    fn promoted_comparison_executes() {
+        let ops = vec![IrOp::PushI32(5), IrOp::PushI32(5), IrOp::Eq];
+        assert_eq!(run_word(&ops), vec![-1]);
+        let ops = vec![IrOp::PushI32(3), IrOp::PushI32(5), IrOp::Lt];
+        assert_eq!(run_word(&ops), vec![-1]);
+    }
+
+    #[test]
+    fn promoted_memory_fetch_store_executes() {
+        let ops = vec![
+            IrOp::PushI32(42),
+            IrOp::PushI32(0x100),
+            IrOp::Store,
+            IrOp::PushI32(0x100),
+            IrOp::Fetch,
+        ];
+        assert_eq!(run_word(&ops), vec![42]);
+    }
+
+    #[test]
+    fn promoted_divmod_executes() {
+        // ( 10 3 -- rem quot ) => top-first: [3, 1]
+        let ops = vec![IrOp::PushI32(10), IrOp::PushI32(3), IrOp::DivMod];
+        assert_eq!(run_word(&ops), vec![3, 1]);
+    }
+
+    #[test]
+    fn promoted_tuck_executes() {
+        // ( 1 2 -- 2 1 2 )
+        let ops = vec![IrOp::PushI32(1), IrOp::PushI32(2), IrOp::Tuck];
+        assert_eq!(run_word(&ops), vec![2, 1, 2]);
+    }
+
+    #[test]
+    fn promoted_two_dup_executes() {
+        let ops = vec![IrOp::PushI32(3), IrOp::PushI32(4), IrOp::TwoDup];
+        assert_eq!(run_word(&ops), vec![4, 3, 4, 3]);
+    }
+
+    #[test]
+    fn promoted_two_drop_executes() {
+        let ops = vec![
+            IrOp::PushI32(1),
+            IrOp::PushI32(2),
+            IrOp::PushI32(3),
+            IrOp::TwoDrop,
+        ];
+        assert_eq!(run_word(&ops), vec![1]);
+    }
+
+    #[test]
+    fn promoted_negate_abs_invert_executes() {
+        assert_eq!(run_word(&[IrOp::PushI32(5), IrOp::Negate]), vec![-5]);
+        assert_eq!(run_word(&[IrOp::PushI32(-42), IrOp::Abs]), vec![42]);
+        assert_eq!(run_word(&[IrOp::PushI32(0), IrOp::Invert]), vec![-1]);
+    }
+
+    #[test]
+    fn promoted_zero_eq_zero_lt_executes() {
+        assert_eq!(run_word(&[IrOp::PushI32(0), IrOp::ZeroEq]), vec![-1]);
+        assert_eq!(run_word(&[IrOp::PushI32(5), IrOp::ZeroEq]), vec![0]);
+        assert_eq!(run_word(&[IrOp::PushI32(-1), IrOp::ZeroLt]), vec![-1]);
+        assert_eq!(run_word(&[IrOp::PushI32(0), IrOp::ZeroLt]), vec![0]);
+    }
+
+    #[test]
+    fn promoted_shift_executes() {
+        assert_eq!(
+            run_word(&[IrOp::PushI32(1), IrOp::PushI32(4), IrOp::Lshift]),
+            vec![16]
+        );
+        assert_eq!(
+            run_word(&[IrOp::PushI32(16), IrOp::PushI32(2), IrOp::Rshift]),
+            vec![4]
+        );
+    }
+
+    #[test]
+    fn promoted_plus_store_executes() {
+        let ops = vec![
+            IrOp::PushI32(10),
+            IrOp::PushI32(0x100),
+            IrOp::Store,
+            IrOp::PushI32(5),
+            IrOp::PushI32(0x100),
+            IrOp::PlusStore,
+            IrOp::PushI32(0x100),
+            IrOp::Fetch,
+        ];
+        assert_eq!(run_word(&ops), vec![15]);
+    }
+
+    #[test]
+    fn promoted_cfetch_cstore_executes() {
+        let ops = vec![
+            IrOp::PushI32(65),
+            IrOp::PushI32(0x200),
+            IrOp::CStore,
+            IrOp::PushI32(0x200),
+            IrOp::CFetch,
+        ];
+        assert_eq!(run_word(&ops), vec![65]);
+    }
+
+    #[test]
+    fn non_promotable_still_works() {
+        // Words with control flow should NOT be promoted, but should still work
+        let ops = vec![
+            IrOp::PushI32(-1),
+            IrOp::If {
+                then_body: vec![IrOp::PushI32(42)],
+                else_body: Some(vec![IrOp::PushI32(0)]),
+            },
+        ];
+        assert!(!is_promotable(&ops));
+        assert_eq!(run_word(&ops), vec![42]);
     }
 }

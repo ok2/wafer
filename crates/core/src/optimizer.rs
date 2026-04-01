@@ -415,17 +415,19 @@ fn inline(ops: Vec<IrOp>, bodies: &HashMap<WordId, Vec<IrOp>>, max_size: usize) 
         match &op {
             IrOp::Call(id) => {
                 if let Some(body) = bodies.get(id)
-                    && body.len() <= max_size && !contains_call_to(body, *id) {
-                        // Inline the body, converting TailCall back to Call
-                        // (tail position in the callee is not tail position in the caller)
-                        for inlined_op in body {
-                            match inlined_op {
-                                IrOp::TailCall(tid) => out.push(IrOp::Call(*tid)),
-                                other => out.push(other.clone()),
-                            }
+                    && body.len() <= max_size
+                    && !contains_call_to(body, *id)
+                {
+                    // Inline the body, converting TailCall back to Call
+                    // (tail position in the callee is not tail position in the caller)
+                    for inlined_op in body {
+                        match inlined_op {
+                            IrOp::TailCall(tid) => out.push(IrOp::Call(*tid)),
+                            other => out.push(other.clone()),
                         }
-                        continue;
                     }
+                    continue;
+                }
                 out.push(op);
             }
             _ => {
@@ -451,9 +453,10 @@ fn contains_call_to(ops: &[IrOp], target: WordId) -> bool {
                     return true;
                 }
                 if let Some(eb) = else_body
-                    && contains_call_to(eb, target) {
-                        return true;
-                    }
+                    && contains_call_to(eb, target)
+                {
+                    return true;
+                }
             }
             IrOp::DoLoop { body, .. } | IrOp::BeginUntil { body } | IrOp::BeginAgain { body } => {
                 if contains_call_to(body, target) {
@@ -480,9 +483,10 @@ fn contains_call_to(ops: &[IrOp], target: WordId) -> bool {
                     return true;
                 }
                 if let Some(eb) = else_body
-                    && contains_call_to(eb, target) {
-                        return true;
-                    }
+                    && contains_call_to(eb, target)
+                {
+                    return true;
+                }
             }
             _ => {}
         }

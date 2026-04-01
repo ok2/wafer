@@ -7393,7 +7393,8 @@ impl ForthVM {
 
                     let flag: i32 = if result { -1 } else { 0 };
                     let dsp_val = dsp.get(&mut caller).unwrap_i32() as u32;
-                    let new_dsp = dsp_val - CELL_SIZE;
+                    let new_dsp = dsp_val.checked_sub(CELL_SIZE)
+                        .ok_or_else(|| wasmtime::Error::msg("data stack overflow in F~"))?;
                     dsp.set(&mut caller, Val::I32(new_dsp as i32)).unwrap();
                     let mem = memory.data_mut(&mut caller);
                     mem[new_dsp as usize..new_dsp as usize + 4]
@@ -10260,5 +10261,113 @@ mod tests {
             eval_stack(": CW BEGIN DUP WHILE 1- REPEAT ; CONSOLIDATE 3 CW"),
             vec![0]
         );
+    }
+
+    // ===================================================================
+    // End-to-end optimization verification tests
+    // ===================================================================
+
+    #[test]
+    fn verify_peephole_active() {
+        // PushI32(0) + Add should be removed by peephole
+        assert_eq!(eval_stack(": T 0 + ; 5 T"), vec![5]);
+    }
+
+    #[test]
+    fn verify_constant_folding_active() {
+        // 3 4 + should fold to 7 at compile time
+        assert_eq!(eval_stack(": T 3 4 + ; T"), vec![7]);
+    }
+
+    #[test]
+    fn verify_strength_reduction_active() {
+        // 4 * should become 2 LSHIFT
+        assert_eq!(eval_stack(": T 4 * ; 3 T"), vec![12]);
+    }
+
+    #[test]
+    fn verify_dce_active() {
+        // Code after EXIT should be eliminated
+        assert_eq!(eval_stack(": T 42 EXIT 99 ; T"), vec![42]);
+    }
+
+    #[test]
+    fn verify_tail_call_active() {
+        // Recursive word in tail position should work (tail call prevents stack overflow)
+        assert_eq!(
+            eval_stack(": DEC1 DUP 0= IF EXIT THEN 1- RECURSE ; 1000 DEC1"),
+            vec![0],
+        );
+    }
+
+    #[test]
+    fn verify_inlining_active() {
+        // Small word should be inlined: 5 + 3 should fold to 8 after inline + fold
+        assert_eq!(eval_stack(": ADD3 3 + ; : T ADD3 ; 5 T"), vec![8]);
+    }
+
+    #[test]
+    fn verify_compound_ops_active() {
+        // 2DUP (Over Over -> TwoDup) should work
+        assert_eq!(eval_stack(": T 2DUP + ; 3 4 T"), vec![7, 4, 3]);
+    }
+
+    #[test]
+    fn verify_dsp_caching_active() {
+        // Complex word should work with DSP caching
+        assert_eq!(
+            eval_stack(": FACT DUP 1 > IF DUP 1- RECURSE * ELSE DROP 1 THEN ; 5 FACT"),
+            vec![120],
+        );
+    }
+
+    #[test]
+    fn verify_consolidation_active() {
+        assert_eq!(
+            eval_stack(": A 10 ; : B 20 ; : C A B + ; CONSOLIDATE C"),
+            vec![30],
+        );
+    }
+
+    #[test]
+    fn verify_stack_promotion_square() {
+        // DUP * is promotable (no control flow, no calls) -- should use locals
+        assert_eq!(eval_stack(": SQUARE DUP * ; 7 SQUARE"), vec![49]);
+    }
+
+    #[test]
+    fn verify_stack_promotion_arithmetic() {
+        // Pure arithmetic promotion
+        assert_eq!(eval_stack(": T OVER OVER + ; 3 4 T"), vec![7, 4, 3]);
+    }
+
+    #[test]
+    fn verify_stack_promotion_swap() {
+        // SWAP is a zero-instruction op in promoted path
+        assert_eq!(eval_stack(": T SWAP ; 1 2 T"), vec![1, 2]);
+    }
+
+    #[test]
+    fn verify_stack_promotion_rot() {
+        // ROT is a zero-instruction op in promoted path
+        assert_eq!(eval_stack(": T ROT ; 1 2 3 T"), vec![1, 3, 2]);
+    }
+
+    #[test]
+    fn verify_stack_promotion_nip_tuck() {
+        assert_eq!(eval_stack(": T NIP ; 1 2 T"), vec![2]);
+        assert_eq!(eval_stack(": T TUCK ; 1 2 T"), vec![2, 1, 2]);
+    }
+
+    #[test]
+    fn verify_stack_promotion_memory_ops() {
+        // Memory fetch/store should work in promoted path
+        assert_eq!(eval_stack("VARIABLE X 42 X ! : T X @ 10 + ; T"), vec![52],);
+    }
+
+    #[test]
+    fn verify_stack_promotion_comparison() {
+        assert_eq!(eval_stack(": T = ; 5 5 T"), vec![-1]);
+        assert_eq!(eval_stack(": T < ; 3 5 T"), vec![-1]);
     }
 }
