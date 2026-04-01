@@ -6,12 +6,12 @@ An optimizing Forth 2012 compiler targeting WebAssembly.
 
 ## Status
 
-WAFER is a working Forth system. It JIT-compiles each word definition to a separate WASM module and executes via `wasmtime`. 272 tests passing (261 unit + 11 compliance), **0 errors on all 11 tested Forth 2012 word sets**.
+WAFER is a working Forth system. It JIT-compiles each word definition to a separate WASM module and executes via `wasmtime`. 310 tests passing (299 unit + 11 compliance), **0 errors on all 12 tested Forth 2012 word sets** including Floating-Point.
 
 **Working features:**
 
 - Colon definitions with full control flow (IF/ELSE/THEN, DO/LOOP/+LOOP, BEGIN/UNTIL, BEGIN/WHILE/REPEAT)
-- 130+ words: stack, arithmetic, comparison, logic, memory, I/O, defining words, system, exceptions, double-cell, strings
+- 200+ words: stack, arithmetic, comparison, logic, memory, I/O, defining words, system, exceptions, double-cell, strings, floating-point (70+ float words)
 - Recursion (RECURSE), nested control structures, loop counters (I, J)
 - VARIABLE, CONSTANT, CREATE, DOES>
 - Number bases (HEX, DECIMAL), number prefixes ($hex, #dec, %bin)
@@ -131,7 +131,7 @@ Targeting 100% Forth 2012 compliance via [Gerry Jackson's test suite](https://gi
 | Exception          | **100%** (0 errors on test suite) |
 | Facility           | **100%** (0 errors on test suite) |
 | File-Access        | Pending (requires WASI)           |
-| Floating-Point     | Pending                           |
+| Floating-Point     | **100%** (0 errors on ak-fp-test) |
 | Locals             | **100%** (0 errors on test suite) |
 | Memory-Allocation  | **100%** (0 errors on test suite) |
 | Programming-Tools  | **100%** (0 errors on test suite) |
