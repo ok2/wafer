@@ -260,6 +260,33 @@ fn emit_op(f: &mut Function, op: &IrOp) {
             push_via_local(f, 2);
         }
 
+        IrOp::TwoDup => {
+            // ( a b -- a b a b ) : read top two cells, push copies
+            // Read b (at dsp) into local 0
+            f.instruction(&Instruction::GlobalGet(DSP))
+                .instruction(&Instruction::I32Load(MEM4))
+                .instruction(&Instruction::LocalSet(0));
+            // Read a (at dsp + 4) into local 1
+            f.instruction(&Instruction::GlobalGet(DSP))
+                .instruction(&Instruction::I32Const(CELL_SIZE as i32))
+                .instruction(&Instruction::I32Add)
+                .instruction(&Instruction::I32Load(MEM4))
+                .instruction(&Instruction::LocalSet(1));
+            // Push a then b
+            f.instruction(&Instruction::LocalGet(1));
+            push_via_local(f, 2);
+            f.instruction(&Instruction::LocalGet(0));
+            push_via_local(f, 2);
+        }
+
+        IrOp::TwoDrop => {
+            // ( a b -- ) : increment dsp by 2 cells
+            f.instruction(&Instruction::GlobalGet(DSP))
+                .instruction(&Instruction::I32Const(CELL_SIZE as i32 * 2))
+                .instruction(&Instruction::I32Add)
+                .instruction(&Instruction::GlobalSet(DSP));
+        }
+
         // -- Arithmetic -----------------------------------------------------
         IrOp::Add => emit_binary_commutative(f, &Instruction::I32Add),
         IrOp::Mul => emit_binary_commutative(f, &Instruction::I32Mul),

@@ -24,6 +24,10 @@ pub enum IrOp {
     Rot,
     Nip,
     Tuck,
+    /// Two-item duplication: ( a b -- a b a b )
+    TwoDup,
+    /// Two-item drop: ( a b -- )
+    TwoDrop,
 
     // -- Arithmetic --
     Add,

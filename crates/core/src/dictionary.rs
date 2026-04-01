@@ -7,6 +7,8 @@
 //! - Code field: function table index (4 bytes)
 //! - Parameter field: data for `CREATEd` words, DOES> action, etc.
 
+use std::collections::HashMap;
+
 use crate::error::{WaferError, WaferResult};
 use crate::memory::{DICTIONARY_BASE, INITIAL_PAGES, PAGE_SIZE};
 
@@ -36,6 +38,8 @@ pub struct Dictionary {
     here: u32,
     /// Next available function table index.
     next_fn_index: u32,
+    /// Hash index for O(1) word lookup: name -> (`word_addr`, `fn_index`, `is_immediate`).
+    index: HashMap<String, (u32, u32, bool)>,
 }
 
 /// Align an address upward to a 4-byte boundary.
@@ -53,6 +57,7 @@ impl Dictionary {
             latest: 0,
             here: DICTIONARY_BASE,
             next_fn_index: 0,
+            index: HashMap::new(),
         }
     }
 
@@ -127,6 +132,7 @@ impl Dictionary {
         let flags_addr = (self.latest + 4) as usize;
         if flags_addr < self.memory.len() {
             self.memory[flags_addr] &= !flags::HIDDEN;
+            self.update_index(self.latest);
         }
     }
 
@@ -135,6 +141,7 @@ impl Dictionary {
         let flags_addr = (word_addr + 4) as usize;
         if flags_addr < self.memory.len() {
             self.memory[flags_addr] &= !flags::HIDDEN;
+            self.update_index(word_addr);
         }
     }
 
@@ -142,14 +149,26 @@ impl Dictionary {
     pub fn set_code_field(&mut self, word_addr: u32, fn_index: u32) {
         if let Ok(code_addr) = self.code_field_addr(word_addr) {
             self.write_u32_unchecked(code_addr, fn_index);
+            // Update the index if the word is visible
+            let flags_addr = (word_addr + 4) as usize;
+            if flags_addr < self.memory.len() && self.memory[flags_addr] & flags::HIDDEN == 0 {
+                self.update_index(word_addr);
+            }
         }
     }
 
     /// Look up a word by name. Returns (`word_address`, `word_id`, `is_immediate`).
-    /// Searches from LATEST backward through the linked list.
+    /// Uses the hash index for O(1) lookup, with linked-list fallback.
     /// Skips HIDDEN words.
     pub fn find(&self, name: &str) -> Option<(u32, WordId, bool)> {
         let search_name = name.to_ascii_uppercase();
+
+        // Fast path: hash index lookup
+        if let Some(&(word_addr, fn_index, is_immediate)) = self.index.get(&search_name) {
+            return Some((word_addr, WordId(fn_index), is_immediate));
+        }
+
+        // Fallback: linked-list walk (for words not yet in the index)
         let search_bytes = search_name.as_bytes();
         let search_len = search_bytes.len();
 
@@ -326,6 +345,10 @@ impl Dictionary {
             return Err(WaferError::InvalidAddress(self.latest + 4));
         }
         self.memory[flags_addr] ^= flags::IMMEDIATE;
+        // Update the index if the word is visible (not hidden)
+        if self.memory[flags_addr] & flags::HIDDEN == 0 {
+            self.update_index(self.latest);
+        }
         Ok(())
     }
 
@@ -340,6 +363,27 @@ impl Dictionary {
     }
 
     // -- Private helpers --
+
+    /// Insert or update the hash index entry for the word at `word_addr`.
+    /// Reads the name, `fn_index`, and immediate flag from the memory buffer.
+    fn update_index(&mut self, word_addr: u32) {
+        let flags_addr = (word_addr + 4) as usize;
+        if flags_addr >= self.memory.len() {
+            return;
+        }
+        let flags_byte = self.memory[flags_addr];
+        let name_len = (flags_byte & flags::LENGTH_MASK) as usize;
+        let name_start = (word_addr + 5) as usize;
+        let name_end = name_start + name_len;
+        if name_end > self.memory.len() {
+            return;
+        }
+        let name = String::from_utf8_lossy(&self.memory[name_start..name_end]).to_string();
+        let is_immediate = flags_byte & flags::IMMEDIATE != 0;
+        let code_addr = align4(word_addr + 5 + name_len as u32);
+        let fn_index = self.read_u32_unchecked(code_addr);
+        self.index.insert(name, (word_addr, fn_index, is_immediate));
+    }
 
     /// Compute the address of the code field for the word at `word_addr`.
     fn code_field_addr(&self, word_addr: u32) -> WaferResult<u32> {

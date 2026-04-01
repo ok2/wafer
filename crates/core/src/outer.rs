@@ -24,6 +24,7 @@ use crate::memory::{
     INPUT_BUFFER_SIZE, RETURN_STACK_TOP, SYSVAR_BASE_VAR, SYSVAR_NUM_TIB, SYSVAR_STATE,
     SYSVAR_TO_IN,
 };
+use crate::optimizer::{OptConfig, optimize};
 
 // ---------------------------------------------------------------------------
 // Control-flow compilation state
@@ -234,7 +235,11 @@ pub struct ForthVM {
 impl ForthVM {
     /// Boot a new Forth VM with all primitives registered.
     pub fn new() -> anyhow::Result<Self> {
-        let engine = Engine::default();
+        let mut config = wasmtime::Config::new();
+        config.cranelift_nan_canonicalization(false);
+        // Best-effort module caching
+        let _ = config.cache_config_load_default();
+        let engine = Engine::new(&config)?;
         let output = Arc::new(Mutex::new(String::new()));
 
         let host = VmHost {
@@ -1421,6 +1426,18 @@ impl ForthVM {
         Ok(())
     }
 
+    /// Run all enabled optimization passes on an IR sequence.
+    fn optimize_ir(ir: Vec<IrOp>) -> Vec<IrOp> {
+        let config = OptConfig {
+            peephole: true,
+            constant_fold: true,
+            tail_call: true,
+            strength_reduce: true,
+            dce: true,
+        };
+        optimize(ir, &config)
+    }
+
     fn finish_colon_def(&mut self) -> anyhow::Result<()> {
         if self.state == 0 {
             anyhow::bail!("not in compile mode");
@@ -1438,6 +1455,7 @@ impl ForthVM {
             .take()
             .ok_or_else(|| anyhow::anyhow!("no word being compiled"))?;
         let ir = std::mem::take(&mut self.compiling_ir);
+        let ir = Self::optimize_ir(ir);
 
         // Compile to WASM
         let config = CodegenConfig {
@@ -1753,6 +1771,7 @@ impl ForthVM {
         immediate: bool,
         ir_body: Vec<IrOp>,
     ) -> anyhow::Result<WordId> {
+        let ir_body = Self::optimize_ir(ir_body);
         let word_id = self
             .dictionary
             .create(name, immediate)
@@ -10069,5 +10088,19 @@ mod tests {
         // Absolute comparison
         assert_eq!(eval_stack("1E 1.5E 1E F~"), vec![-1]); // |1-1.5| < 1
         assert_eq!(eval_stack("1E 2.5E 1E F~"), vec![0]); // |1-2.5| = 1.5 >= 1
+    }
+
+    #[test]
+    fn optimizer_doesnt_break_basic_arithmetic() {
+        assert_eq!(eval_stack("5 3 +"), vec![8]);
+        assert_eq!(eval_stack("10 3 -"), vec![7]);
+        assert_eq!(eval_stack(": SQUARE DUP * ; 7 SQUARE"), vec![49]);
+    }
+
+    #[test]
+    fn optimizer_doesnt_break_control_flow() {
+        assert_eq!(eval_stack(": T1 1 IF 42 ELSE 0 THEN ; T1"), vec![42]);
+        assert_eq!(eval_stack(": T2 0 IF 42 ELSE 0 THEN ; T2"), vec![0]);
+        assert_eq!(eval_stack(": SUM 0 SWAP 0 DO I + LOOP ; 10 SUM"), vec![45]);
     }
 }
