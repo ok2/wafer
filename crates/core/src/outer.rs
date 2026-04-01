@@ -230,6 +230,8 @@ pub struct ForthVM {
     fvalue_words: std::collections::HashSet<u32>,
     // Float I/O precision (default 6)
     float_precision: Arc<Mutex<usize>>,
+    /// Stored IR bodies for inlining optimization.
+    ir_bodies: HashMap<WordId, Vec<IrOp>>,
 }
 
 impl ForthVM {
@@ -345,6 +347,7 @@ impl ForthVM {
             two_value_words: std::collections::HashSet::new(),
             fvalue_words: std::collections::HashSet::new(),
             float_precision: Arc::new(Mutex::new(6)),
+            ir_bodies: HashMap::new(),
         };
 
         vm.register_primitives()?;
@@ -1427,15 +1430,16 @@ impl ForthVM {
     }
 
     /// Run all enabled optimization passes on an IR sequence.
-    fn optimize_ir(ir: Vec<IrOp>) -> Vec<IrOp> {
+    fn optimize_ir(ir: Vec<IrOp>, bodies: &HashMap<WordId, Vec<IrOp>>) -> Vec<IrOp> {
         let config = OptConfig {
             peephole: true,
             constant_fold: true,
             tail_call: true,
             strength_reduce: true,
             dce: true,
+            inline: true,
         };
-        optimize(ir, &config)
+        optimize(ir, &config, bodies)
     }
 
     fn finish_colon_def(&mut self) -> anyhow::Result<()> {
@@ -1455,7 +1459,9 @@ impl ForthVM {
             .take()
             .ok_or_else(|| anyhow::anyhow!("no word being compiled"))?;
         let ir = std::mem::take(&mut self.compiling_ir);
-        let ir = Self::optimize_ir(ir);
+        let bodies = self.ir_bodies.clone();
+        let ir = Self::optimize_ir(ir, &bodies);
+        self.ir_bodies.insert(word_id, ir.clone());
 
         // Compile to WASM
         let config = CodegenConfig {
@@ -1771,11 +1777,13 @@ impl ForthVM {
         immediate: bool,
         ir_body: Vec<IrOp>,
     ) -> anyhow::Result<WordId> {
-        let ir_body = Self::optimize_ir(ir_body);
+        let bodies = self.ir_bodies.clone();
+        let ir_body = Self::optimize_ir(ir_body, &bodies);
         let word_id = self
             .dictionary
             .create(name, immediate)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
+        self.ir_bodies.insert(word_id, ir_body.clone());
 
         let config = CodegenConfig {
             base_fn_index: word_id.0,
