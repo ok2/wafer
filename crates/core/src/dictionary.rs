@@ -111,6 +111,12 @@ impl Dictionary {
         Ok(WordId(fn_index))
     }
 
+    /// Reserve a function index without creating a dictionary entry.
+    /// Used for anonymous host functions (e.g., float literals during compilation).
+    pub fn reserve_fn_index(&mut self) {
+        self.next_fn_index += 1;
+    }
+
     /// Reveal the most recent word (remove HIDDEN flag).
     /// Called after `: ... ;` completes compilation.
     pub fn reveal(&mut self) {

@@ -29,6 +29,10 @@ const DSP: u32 = 0;
 /// Index of the `$rsp` global (return stack pointer).
 const RSP: u32 = 1;
 
+/// Index of the `$fsp` global (float stack pointer).
+#[allow(dead_code)]
+const FSP: u32 = 2;
+
 /// Index of the imported function table.
 const TABLE: u32 = 0;
 
@@ -797,6 +801,15 @@ pub fn compile_word(
     );
     imports.import(
         "env",
+        "fsp",
+        EntityType::Global(GlobalType {
+            val_type: ValType::I32,
+            mutable: true,
+            shared: false,
+        }),
+    );
+    imports.import(
+        "env",
         "table",
         EntityType::Table(TableType {
             element_type: RefType::FUNCREF,
@@ -871,7 +884,7 @@ mod tests {
     use super::*;
     use crate::dictionary::WordId;
     use crate::ir::IrOp;
-    use crate::memory::{DATA_STACK_TOP, RETURN_STACK_TOP};
+    use crate::memory::{DATA_STACK_TOP, FLOAT_STACK_TOP, RETURN_STACK_TOP};
 
     fn default_config() -> CodegenConfig {
         CodegenConfig {
@@ -1133,6 +1146,13 @@ mod tests {
         )
         .unwrap();
 
+        let fsp = Global::new(
+            &mut store,
+            wasmtime::GlobalType::new(ValType::I32, Mutability::Var),
+            Val::I32(FLOAT_STACK_TOP as i32),
+        )
+        .unwrap();
+
         let table = Table::new(
             &mut store,
             wasmtime::TableType::new(RefType::FUNCREF, 16, None),
@@ -1152,6 +1172,7 @@ mod tests {
                 memory.into(),
                 dsp.into(),
                 rsp.into(),
+                fsp.into(),
                 table.into(),
             ],
         )
