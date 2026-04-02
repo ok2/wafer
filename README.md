@@ -118,21 +118,21 @@ tests/        Forth 2012 compliance suite (git submodule)
 
 Tested against [Gerry Jackson's Forth 2012 test suite](https://github.com/gerryjackson/forth2012-test-suite). 12 of 14 word sets pass at 100%.
 
-| Word Set           | Status                            |
-| ------------------ | --------------------------------- |
-| Core               | **100%** (0 errors) |
-| Core Extensions    | **100%** (0 errors) |
-| Double-Number      | **100%** (0 errors) |
-| Exception          | **100%** (0 errors) |
-| Facility           | **100%** (0 errors) |
-| Floating-Point     | **100%** (0 errors) |
-| Locals             | **100%** (0 errors) |
-| Memory-Allocation  | **100%** (0 errors) |
-| Programming-Tools  | **100%** (0 errors) |
-| Search-Order       | **100%** (0 errors) |
-| String             | **100%** (0 errors) |
+| Word Set           | Status                                  |
+| ------------------ | --------------------------------------- |
+| Core               | **100%** (0 errors)                     |
+| Core Extensions    | **100%** (0 errors)                     |
+| Double-Number      | **100%** (0 errors)                     |
+| Exception          | **100%** (0 errors)                     |
+| Facility           | **100%** (0 errors)                     |
+| Floating-Point     | **100%** (0 errors)                     |
+| Locals             | **100%** (0 errors)                     |
+| Memory-Allocation  | **100%** (0 errors)                     |
+| Programming-Tools  | **100%** (0 errors)                     |
+| Search-Order       | **100%** (0 errors)                     |
+| String             | **100%** (0 errors)                     |
 | File-Access        | Not started (requires WASI integration) |
-| Extended-Character | Not started |
+| Extended-Character | Not started                             |
 
 ## Implemented Words
 
@@ -153,9 +153,9 @@ Over 200 words are implemented across the following categories:
 | Compiler     | `LITERAL POSTPONE [ ] EVALUATE ABORT"`                                                                          |
 | Parsing      | `WORD FIND COUNT >NUMBER`                                                                                       |
 | Exceptions   | `CATCH THROW`                                                                                                   |
-| Double-cell  | `D+ D- D. D.R DNEGATE DABS D= D< D0= D0< D>S 2CONSTANT 2VARIABLE 2LITERAL M+ M*/`                             |
-| Strings      | `COMPARE SEARCH SLITERAL REPLACES SUBSTITUTE UNESCAPE`                                                         |
-| Floating-Pt  | `F+ F- F* F/ FABS FNEGATE FSQRT FSIN FCOS FTAN FEXP FLOG FMIN FMAX` and 55+ more                               |
+| Double-cell  | `D+ D- D. D.R DNEGATE DABS D= D< D0= D0< D>S 2CONSTANT 2VARIABLE 2LITERAL M+ M*/`                               |
+| Strings      | `COMPARE SEARCH SLITERAL REPLACES SUBSTITUTE UNESCAPE`                                                          |
+| Floating-Pt  | `F+ F- F* F/ FABS FNEGATE FSQRT FSIN FCOS FTAN FEXP FLOG FMIN FMAX` and 55+ more                                |
 | Case         | `CASE OF ENDOF ENDCASE`                                                                                         |
 
 ## Roadmap
