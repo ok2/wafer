@@ -34,7 +34,6 @@ const DSP: u32 = 0;
 const RSP: u32 = 1;
 
 /// Index of the `$fsp` global (float stack pointer).
-#[allow(dead_code)]
 const FSP: u32 = 2;
 
 /// Index of the imported function table.
@@ -71,6 +70,13 @@ const MEM4: MemArg = MemArg {
 const MEM1: MemArg = MemArg {
     offset: 0,
     align: 0, // 2^0 = 1
+    memory_index: MEMORY_INDEX,
+};
+
+/// Natural-alignment `MemArg` for 8-byte f64 operations.
+const MEM8: MemArg = MemArg {
+    offset: 0,
+    align: 3, // 2^3 = 8
     memory_index: MEMORY_INDEX,
 };
 
@@ -215,23 +221,118 @@ fn bool_to_forth_flag(f: &mut Function, tmp: u32) {
 }
 
 // ---------------------------------------------------------------------------
+// Float stack helpers
+// ---------------------------------------------------------------------------
+
+/// Carries f64 scratch local indices for float codegen.
+struct EmitCtx {
+    f64_local_0: u32,
+    f64_local_1: u32,
+}
+
+/// Decrement the FSP global by 8 (allocate space for one f64).
+fn fsp_dec(f: &mut Function) {
+    f.instruction(&Instruction::GlobalGet(FSP))
+        .instruction(&Instruction::I32Const(8))
+        .instruction(&Instruction::I32Sub)
+        .instruction(&Instruction::GlobalSet(FSP));
+}
+
+/// Increment the FSP global by 8 (free space for one f64).
+fn fsp_inc(f: &mut Function) {
+    f.instruction(&Instruction::GlobalGet(FSP))
+        .instruction(&Instruction::I32Const(8))
+        .instruction(&Instruction::I32Add)
+        .instruction(&Instruction::GlobalSet(FSP));
+}
+
+/// Save an f64 from the WASM operand stack into `tmp`, decrement FSP,
+/// then store the f64 at [FSP].
+fn fpush_via_local(f: &mut Function, tmp: u32) {
+    f.instruction(&Instruction::LocalSet(tmp));
+    fsp_dec(f);
+    f.instruction(&Instruction::GlobalGet(FSP))
+        .instruction(&Instruction::LocalGet(tmp))
+        .instruction(&Instruction::F64Store(MEM8));
+}
+
+/// Decrement FSP, then store the f64 from local `src` at [FSP].
+fn fpush_from_local(f: &mut Function, src: u32) {
+    fsp_dec(f);
+    f.instruction(&Instruction::GlobalGet(FSP))
+        .instruction(&Instruction::LocalGet(src))
+        .instruction(&Instruction::F64Store(MEM8));
+}
+
+/// Load f64 from [FSP] onto the WASM operand stack, then increment FSP.
+fn fpop(f: &mut Function) {
+    f.instruction(&Instruction::GlobalGet(FSP))
+        .instruction(&Instruction::F64Load(MEM8));
+    fsp_inc(f);
+}
+
+/// Load f64 from [FSP] onto the WASM operand stack without popping.
+fn fpeek(f: &mut Function) {
+    f.instruction(&Instruction::GlobalGet(FSP))
+        .instruction(&Instruction::F64Load(MEM8));
+}
+
+/// Pop two floats (b then a), apply binary op, push result.
+fn emit_float_binary(f: &mut Function, ctx: &EmitCtx, wasm_op: &Instruction<'_>) {
+    fpop(f);
+    f.instruction(&Instruction::LocalSet(ctx.f64_local_0));
+    fpop(f);
+    f.instruction(&Instruction::LocalSet(ctx.f64_local_1));
+    f.instruction(&Instruction::LocalGet(ctx.f64_local_1))
+        .instruction(&Instruction::LocalGet(ctx.f64_local_0))
+        .instruction(wasm_op);
+    fpush_via_local(f, ctx.f64_local_0);
+}
+
+/// Pop one float, apply unary op, push result.
+fn emit_float_unary(f: &mut Function, ctx: &EmitCtx, wasm_op: &Instruction<'_>) {
+    fpop(f);
+    f.instruction(wasm_op);
+    fpush_via_local(f, ctx.f64_local_0);
+}
+
+/// Pop two floats, compare, push Forth flag to data stack.
+fn emit_float_cmp(f: &mut Function, ctx: &EmitCtx, wasm_cmp: &Instruction<'_>) {
+    fpop(f);
+    f.instruction(&Instruction::LocalSet(ctx.f64_local_0));
+    fpop(f);
+    f.instruction(&Instruction::LocalSet(ctx.f64_local_1));
+    f.instruction(&Instruction::LocalGet(ctx.f64_local_1))
+        .instruction(&Instruction::LocalGet(ctx.f64_local_0))
+        .instruction(wasm_cmp);
+    bool_to_forth_flag(f, SCRATCH_BASE);
+    push_via_local(f, SCRATCH_BASE + 1);
+}
+
+// ---------------------------------------------------------------------------
 // IR emission
 // ---------------------------------------------------------------------------
 
 /// Emit all IR operations in `ops` into the WASM function body `f`.
-fn emit_body(f: &mut Function, ops: &[IrOp]) {
+fn emit_body(f: &mut Function, ops: &[IrOp], ctx: &EmitCtx) {
     for op in ops {
-        emit_op(f, op);
+        emit_op(f, op, ctx);
     }
 }
 
 /// Emit a single IR operation.
 #[allow(clippy::too_many_lines)]
-fn emit_op(f: &mut Function, op: &IrOp) {
+fn emit_op(f: &mut Function, op: &IrOp, ctx: &EmitCtx) {
     match op {
         // -- Literals -------------------------------------------------------
         IrOp::PushI32(n) => push_const(f, *n),
-        IrOp::PushI64(_) | IrOp::PushF64(_) => { /* TODO: double / float stacks */ }
+        IrOp::PushI64(_) => { /* TODO: double-cell */ }
+        IrOp::PushF64(val) => {
+            fsp_dec(f);
+            f.instruction(&Instruction::GlobalGet(FSP))
+                .instruction(&Instruction::F64Const(*val))
+                .instruction(&Instruction::F64Store(MEM8));
+        }
 
         // -- Stack manipulation ---------------------------------------------
         IrOp::Drop => dsp_inc(f),
@@ -460,21 +561,21 @@ fn emit_op(f: &mut Function, op: &IrOp) {
         } => {
             pop(f);
             f.instruction(&Instruction::If(BlockType::Empty));
-            emit_body(f, then_body);
+            emit_body(f, then_body, ctx);
             if let Some(eb) = else_body {
                 f.instruction(&Instruction::Else);
-                emit_body(f, eb);
+                emit_body(f, eb, ctx);
             }
             f.instruction(&Instruction::End);
         }
 
         IrOp::DoLoop { body, is_plus_loop } => {
-            emit_do_loop(f, body, *is_plus_loop);
+            emit_do_loop(f, body, *is_plus_loop, ctx);
         }
 
         IrOp::BeginUntil { body } => {
             f.instruction(&Instruction::Loop(BlockType::Empty));
-            emit_body(f, body);
+            emit_body(f, body, ctx);
             pop(f);
             f.instruction(&Instruction::I32Eqz)
                 .instruction(&Instruction::BrIf(0))
@@ -483,7 +584,7 @@ fn emit_op(f: &mut Function, op: &IrOp) {
 
         IrOp::BeginAgain { body } => {
             f.instruction(&Instruction::Loop(BlockType::Empty));
-            emit_body(f, body);
+            emit_body(f, body, ctx);
             f.instruction(&Instruction::Br(0))
                 .instruction(&Instruction::End);
         }
@@ -491,11 +592,11 @@ fn emit_op(f: &mut Function, op: &IrOp) {
         IrOp::BeginWhileRepeat { test, body } => {
             f.instruction(&Instruction::Block(BlockType::Empty));
             f.instruction(&Instruction::Loop(BlockType::Empty));
-            emit_body(f, test);
+            emit_body(f, test, ctx);
             pop(f);
             f.instruction(&Instruction::I32Eqz)
                 .instruction(&Instruction::BrIf(1)); // break to outer block
-            emit_body(f, body);
+            emit_body(f, body, ctx);
             f.instruction(&Instruction::Br(0)) // continue loop
                 .instruction(&Instruction::End) // end loop
                 .instruction(&Instruction::End); // end block
@@ -530,25 +631,25 @@ fn emit_op(f: &mut Function, op: &IrOp) {
             f.instruction(&Instruction::Block(BlockType::Empty)); // $else
             f.instruction(&Instruction::Block(BlockType::Empty)); // $after
             f.instruction(&Instruction::Loop(BlockType::Empty)); // $begin
-            emit_body(f, outer_test);
+            emit_body(f, outer_test, ctx);
             pop(f);
             f.instruction(&Instruction::I32Eqz)
                 .instruction(&Instruction::BrIf(2)); // to $else
-            emit_body(f, inner_test);
+            emit_body(f, inner_test, ctx);
             pop(f);
             f.instruction(&Instruction::I32Eqz)
                 .instruction(&Instruction::BrIf(1)); // to $after
-            emit_body(f, body);
+            emit_body(f, body, ctx);
             f.instruction(&Instruction::Br(0)); // back to $begin
             f.instruction(&Instruction::End); // end loop
             f.instruction(&Instruction::End); // end $after block
-            emit_body(f, after_repeat);
+            emit_body(f, after_repeat, ctx);
             if else_body.is_some() {
                 f.instruction(&Instruction::Br(1)); // skip else, goto $end
             }
             f.instruction(&Instruction::End); // end $else block
             if let Some(eb) = else_body {
-                emit_body(f, eb);
+                emit_body(f, eb, ctx);
             }
             f.instruction(&Instruction::End); // end $end block
         }
@@ -647,6 +748,90 @@ fn emit_op(f: &mut Function, op: &IrOp) {
                 .instruction(&Instruction::I32Add)
                 .instruction(&Instruction::LocalSet(CACHED_DSP_LOCAL));
         }
+
+        // -- Float stack ops -----------------------------------------------
+        IrOp::FDrop => fsp_inc(f),
+        IrOp::FDup => {
+            fpeek(f);
+            fpush_via_local(f, ctx.f64_local_0);
+        }
+        IrOp::FSwap => {
+            fpop(f);
+            f.instruction(&Instruction::LocalSet(ctx.f64_local_0));
+            fpop(f);
+            f.instruction(&Instruction::LocalSet(ctx.f64_local_1));
+            fpush_from_local(f, ctx.f64_local_0);
+            fpush_from_local(f, ctx.f64_local_1);
+        }
+        IrOp::FOver => {
+            f.instruction(&Instruction::GlobalGet(FSP))
+                .instruction(&Instruction::I32Const(8))
+                .instruction(&Instruction::I32Add)
+                .instruction(&Instruction::F64Load(MEM8));
+            fpush_via_local(f, ctx.f64_local_0);
+        }
+
+        // -- Float arithmetic ----------------------------------------------
+        IrOp::FAdd => emit_float_binary(f, ctx, &Instruction::F64Add),
+        IrOp::FSub => emit_float_binary(f, ctx, &Instruction::F64Sub),
+        IrOp::FMul => emit_float_binary(f, ctx, &Instruction::F64Mul),
+        IrOp::FDiv => emit_float_binary(f, ctx, &Instruction::F64Div),
+        IrOp::FMin => emit_float_binary(f, ctx, &Instruction::F64Min),
+        IrOp::FMax => emit_float_binary(f, ctx, &Instruction::F64Max),
+        IrOp::FNegate => emit_float_unary(f, ctx, &Instruction::F64Neg),
+        IrOp::FAbs => emit_float_unary(f, ctx, &Instruction::F64Abs),
+        IrOp::FSqrt => emit_float_unary(f, ctx, &Instruction::F64Sqrt),
+        IrOp::FFloor => emit_float_unary(f, ctx, &Instruction::F64Floor),
+        IrOp::FRound => emit_float_unary(f, ctx, &Instruction::F64Nearest),
+
+        // -- Float comparisons (cross-stack) --------------------------------
+        IrOp::FZeroEq => {
+            fpop(f);
+            f.instruction(&Instruction::F64Const(0.0))
+                .instruction(&Instruction::F64Eq);
+            bool_to_forth_flag(f, SCRATCH_BASE);
+            push_via_local(f, SCRATCH_BASE + 1);
+        }
+        IrOp::FZeroLt => {
+            fpop(f);
+            f.instruction(&Instruction::F64Const(0.0))
+                .instruction(&Instruction::F64Lt);
+            bool_to_forth_flag(f, SCRATCH_BASE);
+            push_via_local(f, SCRATCH_BASE + 1);
+        }
+        IrOp::FEq => emit_float_cmp(f, ctx, &Instruction::F64Eq),
+        IrOp::FLt => emit_float_cmp(f, ctx, &Instruction::F64Lt),
+
+        // -- Float memory (cross-stack) ------------------------------------
+        IrOp::FetchFloat => {
+            // ( addr -- ) ( F: -- r )
+            pop(f); // addr on operand stack
+            f.instruction(&Instruction::F64Load(MEM8));
+            fpush_via_local(f, ctx.f64_local_0);
+        }
+        IrOp::StoreFloat => {
+            // ( addr -- ) ( F: r -- )
+            pop_to(f, SCRATCH_BASE); // addr
+            fpop(f);
+            f.instruction(&Instruction::LocalSet(ctx.f64_local_0));
+            f.instruction(&Instruction::LocalGet(SCRATCH_BASE))
+                .instruction(&Instruction::LocalGet(ctx.f64_local_0))
+                .instruction(&Instruction::F64Store(MEM8));
+        }
+
+        // -- Float/integer conversions (cross-stack) -----------------------
+        IrOp::StoF => {
+            // ( n -- ) ( F: -- r )
+            pop(f);
+            f.instruction(&Instruction::F64ConvertI32S);
+            fpush_via_local(f, ctx.f64_local_0);
+        }
+        IrOp::FtoS => {
+            // ( F: r -- ) ( -- n )
+            fpop(f);
+            f.instruction(&Instruction::I32TruncF64S);
+            push_via_local(f, SCRATCH_BASE);
+        }
     }
 }
 
@@ -684,7 +869,7 @@ fn emit_cmp(f: &mut Function, cmp: &Instruction<'_>) {
 }
 
 /// Emit a DO...LOOP / DO...+LOOP construct.
-fn emit_do_loop(f: &mut Function, body: &[IrOp], is_plus_loop: bool) {
+fn emit_do_loop(f: &mut Function, body: &[IrOp], is_plus_loop: bool, ctx: &EmitCtx) {
     // DO ( limit index -- )
     pop_to(f, SCRATCH_BASE); // index
     pop_to(f, SCRATCH_BASE + 1); // limit
@@ -704,7 +889,7 @@ fn emit_do_loop(f: &mut Function, body: &[IrOp], is_plus_loop: bool) {
     f.instruction(&Instruction::Block(BlockType::Empty));
     f.instruction(&Instruction::Loop(BlockType::Empty));
 
-    emit_body(f, body);
+    emit_body(f, body, ctx);
 
     // Pop current index from return stack into scratch local
     rpop(f);
@@ -807,6 +992,29 @@ fn is_promotable(ops: &[IrOp]) -> bool {
             IrOp::ToR | IrOp::FromR | IrOp::RFetch => return false,
             IrOp::Emit | IrOp::Dot | IrOp::Cr | IrOp::Type => return false,
             IrOp::PushI64(_) | IrOp::PushF64(_) => return false,
+            IrOp::FDup
+            | IrOp::FDrop
+            | IrOp::FSwap
+            | IrOp::FOver
+            | IrOp::FAdd
+            | IrOp::FSub
+            | IrOp::FMul
+            | IrOp::FDiv
+            | IrOp::FNegate
+            | IrOp::FAbs
+            | IrOp::FSqrt
+            | IrOp::FMin
+            | IrOp::FMax
+            | IrOp::FFloor
+            | IrOp::FRound
+            | IrOp::FZeroEq
+            | IrOp::FZeroLt
+            | IrOp::FEq
+            | IrOp::FLt
+            | IrOp::FetchFloat
+            | IrOp::StoreFloat
+            | IrOp::StoF
+            | IrOp::FtoS => return false,
             _ => {}
         }
     }
@@ -839,6 +1047,27 @@ fn stack_delta(op: &IrOp) -> i32 {
         IrOp::Store | IrOp::CStore | IrOp::PlusStore => -2,
         IrOp::TwoDup => 2,
         IrOp::TwoDrop => -2,
+        // Float-only ops: no data stack change
+        IrOp::PushF64(_)
+        | IrOp::FDup
+        | IrOp::FDrop
+        | IrOp::FSwap
+        | IrOp::FOver
+        | IrOp::FAdd
+        | IrOp::FSub
+        | IrOp::FMul
+        | IrOp::FDiv
+        | IrOp::FNegate
+        | IrOp::FAbs
+        | IrOp::FSqrt
+        | IrOp::FMin
+        | IrOp::FMax
+        | IrOp::FFloor
+        | IrOp::FRound => 0,
+        // Cross-stack: push to data stack
+        IrOp::FZeroEq | IrOp::FZeroLt | IrOp::FEq | IrOp::FLt | IrOp::FtoS => 1,
+        // Cross-stack: pop from data stack
+        IrOp::FetchFloat | IrOp::StoreFloat | IrOp::StoF => -1,
         _ => 0,
     }
 }
@@ -897,7 +1126,9 @@ fn compute_stack_needs(ops: &[IrOp]) -> (u32, i32) {
             | IrOp::Fetch
             | IrOp::CFetch => depth - 1,
             IrOp::TwoDrop => depth - 2,
-            // Push ops don't read existing items
+            // Cross-stack ops that pop from data stack
+            IrOp::FetchFloat | IrOp::StoreFloat | IrOp::StoF => depth - 1,
+            // Push ops and float-only ops don't read data stack items
             _ => depth,
         };
         min_accessed = min_accessed.min(reads_from);
@@ -1320,6 +1551,83 @@ fn emit_promoted_cmp(f: &mut Function, sim: &mut StackSim, cmp: &Instruction<'_>
 // Public API
 // ---------------------------------------------------------------------------
 
+/// Check if an IR body (recursively) contains any float ops that need f64 locals.
+fn needs_f64_locals(ops: &[IrOp]) -> bool {
+    for op in ops {
+        match op {
+            IrOp::PushF64(_)
+            | IrOp::FDup
+            | IrOp::FDrop
+            | IrOp::FSwap
+            | IrOp::FOver
+            | IrOp::FAdd
+            | IrOp::FSub
+            | IrOp::FMul
+            | IrOp::FDiv
+            | IrOp::FNegate
+            | IrOp::FAbs
+            | IrOp::FSqrt
+            | IrOp::FMin
+            | IrOp::FMax
+            | IrOp::FFloor
+            | IrOp::FRound
+            | IrOp::FZeroEq
+            | IrOp::FZeroLt
+            | IrOp::FEq
+            | IrOp::FLt
+            | IrOp::FetchFloat
+            | IrOp::StoreFloat
+            | IrOp::StoF
+            | IrOp::FtoS => return true,
+            IrOp::If {
+                then_body,
+                else_body,
+            } => {
+                if needs_f64_locals(then_body) {
+                    return true;
+                }
+                if let Some(eb) = else_body
+                    && needs_f64_locals(eb)
+                {
+                    return true;
+                }
+            }
+            IrOp::DoLoop { body, .. } | IrOp::BeginUntil { body } | IrOp::BeginAgain { body } => {
+                if needs_f64_locals(body) {
+                    return true;
+                }
+            }
+            IrOp::BeginWhileRepeat { test, body } => {
+                if needs_f64_locals(test) || needs_f64_locals(body) {
+                    return true;
+                }
+            }
+            IrOp::BeginDoubleWhileRepeat {
+                outer_test,
+                inner_test,
+                body,
+                after_repeat,
+                else_body,
+            } => {
+                if needs_f64_locals(outer_test)
+                    || needs_f64_locals(inner_test)
+                    || needs_f64_locals(body)
+                    || needs_f64_locals(after_repeat)
+                {
+                    return true;
+                }
+                if let Some(eb) = else_body
+                    && needs_f64_locals(eb)
+                {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Estimate scratch locals a function body needs (not counting cached DSP).
 fn count_scratch_locals(ops: &[IrOp]) -> u32 {
     let mut max: u32 = 4; // baseline scratch space (indices SCRATCH_BASE..SCRATCH_BASE+3)
@@ -1469,7 +1777,17 @@ pub fn compile_word(
     } else {
         1 + scratch_count
     };
-    let mut func = Function::new(vec![(num_locals, ValType::I32)]);
+    let has_floats = needs_f64_locals(body);
+    let num_f64: u32 = if has_floats { 2 } else { 0 };
+    let mut locals_decl = vec![(num_locals, ValType::I32)];
+    if num_f64 > 0 {
+        locals_decl.push((num_f64, ValType::F64));
+    }
+    let mut func = Function::new(locals_decl);
+    let ctx = EmitCtx {
+        f64_local_0: num_locals,
+        f64_local_1: num_locals + 1,
+    };
 
     // Prologue: cache $dsp global into local 0
     func.instruction(&Instruction::GlobalGet(DSP))
@@ -1485,7 +1803,7 @@ pub fn compile_word(
         }
         emit_promoted_epilogue(&mut func, &mut sim);
     } else {
-        emit_body(&mut func, body);
+        emit_body(&mut func, body, &ctx);
     }
 
     // Epilogue: write cached DSP back to the $dsp global
@@ -1517,9 +1835,14 @@ pub fn compile_word(
 
 /// Emit all IR operations, replacing `Call`/`TailCall` with direct calls
 /// when the target word is within the consolidated module.
-fn emit_consolidated_body(f: &mut Function, ops: &[IrOp], local_fn_map: &HashMap<WordId, u32>) {
+fn emit_consolidated_body(
+    f: &mut Function,
+    ops: &[IrOp],
+    local_fn_map: &HashMap<WordId, u32>,
+    ctx: &EmitCtx,
+) {
     for op in ops {
-        emit_consolidated_op(f, op, local_fn_map);
+        emit_consolidated_op(f, op, local_fn_map, ctx);
     }
 }
 
@@ -1528,7 +1851,12 @@ fn emit_consolidated_body(f: &mut Function, ops: &[IrOp], local_fn_map: &HashMap
 /// For `Call` and `TailCall`, emits a direct `call` if the target is in the
 /// consolidated module, otherwise falls back to `call_indirect`. For control
 /// flow with nested bodies, recurses to handle inner calls.
-fn emit_consolidated_op(f: &mut Function, op: &IrOp, local_fn_map: &HashMap<WordId, u32>) {
+fn emit_consolidated_op(
+    f: &mut Function,
+    op: &IrOp,
+    local_fn_map: &HashMap<WordId, u32>,
+    ctx: &EmitCtx,
+) {
     match op {
         IrOp::Call(word_id) => {
             if let Some(&fn_idx) = local_fn_map.get(word_id) {
@@ -1570,21 +1898,21 @@ fn emit_consolidated_op(f: &mut Function, op: &IrOp, local_fn_map: &HashMap<Word
         } => {
             pop(f);
             f.instruction(&Instruction::If(BlockType::Empty));
-            emit_consolidated_body(f, then_body, local_fn_map);
+            emit_consolidated_body(f, then_body, local_fn_map, ctx);
             if let Some(eb) = else_body {
                 f.instruction(&Instruction::Else);
-                emit_consolidated_body(f, eb, local_fn_map);
+                emit_consolidated_body(f, eb, local_fn_map, ctx);
             }
             f.instruction(&Instruction::End);
         }
 
         IrOp::DoLoop { body, is_plus_loop } => {
-            emit_consolidated_do_loop(f, body, *is_plus_loop, local_fn_map);
+            emit_consolidated_do_loop(f, body, *is_plus_loop, local_fn_map, ctx);
         }
 
         IrOp::BeginUntil { body } => {
             f.instruction(&Instruction::Loop(BlockType::Empty));
-            emit_consolidated_body(f, body, local_fn_map);
+            emit_consolidated_body(f, body, local_fn_map, ctx);
             pop(f);
             f.instruction(&Instruction::I32Eqz)
                 .instruction(&Instruction::BrIf(0))
@@ -1593,7 +1921,7 @@ fn emit_consolidated_op(f: &mut Function, op: &IrOp, local_fn_map: &HashMap<Word
 
         IrOp::BeginAgain { body } => {
             f.instruction(&Instruction::Loop(BlockType::Empty));
-            emit_consolidated_body(f, body, local_fn_map);
+            emit_consolidated_body(f, body, local_fn_map, ctx);
             f.instruction(&Instruction::Br(0))
                 .instruction(&Instruction::End);
         }
@@ -1601,11 +1929,11 @@ fn emit_consolidated_op(f: &mut Function, op: &IrOp, local_fn_map: &HashMap<Word
         IrOp::BeginWhileRepeat { test, body } => {
             f.instruction(&Instruction::Block(BlockType::Empty));
             f.instruction(&Instruction::Loop(BlockType::Empty));
-            emit_consolidated_body(f, test, local_fn_map);
+            emit_consolidated_body(f, test, local_fn_map, ctx);
             pop(f);
             f.instruction(&Instruction::I32Eqz)
                 .instruction(&Instruction::BrIf(1));
-            emit_consolidated_body(f, body, local_fn_map);
+            emit_consolidated_body(f, body, local_fn_map, ctx);
             f.instruction(&Instruction::Br(0))
                 .instruction(&Instruction::End)
                 .instruction(&Instruction::End);
@@ -1622,31 +1950,31 @@ fn emit_consolidated_op(f: &mut Function, op: &IrOp, local_fn_map: &HashMap<Word
             f.instruction(&Instruction::Block(BlockType::Empty)); // $else
             f.instruction(&Instruction::Block(BlockType::Empty)); // $after
             f.instruction(&Instruction::Loop(BlockType::Empty)); // $begin
-            emit_consolidated_body(f, outer_test, local_fn_map);
+            emit_consolidated_body(f, outer_test, local_fn_map, ctx);
             pop(f);
             f.instruction(&Instruction::I32Eqz)
                 .instruction(&Instruction::BrIf(2)); // to $else
-            emit_consolidated_body(f, inner_test, local_fn_map);
+            emit_consolidated_body(f, inner_test, local_fn_map, ctx);
             pop(f);
             f.instruction(&Instruction::I32Eqz)
                 .instruction(&Instruction::BrIf(1)); // to $after
-            emit_consolidated_body(f, body, local_fn_map);
+            emit_consolidated_body(f, body, local_fn_map, ctx);
             f.instruction(&Instruction::Br(0)); // back to $begin
             f.instruction(&Instruction::End); // end loop
             f.instruction(&Instruction::End); // end $after block
-            emit_consolidated_body(f, after_repeat, local_fn_map);
+            emit_consolidated_body(f, after_repeat, local_fn_map, ctx);
             if else_body.is_some() {
                 f.instruction(&Instruction::Br(1)); // skip else, goto $end
             }
             f.instruction(&Instruction::End); // end $else block
             if let Some(eb) = else_body {
-                emit_consolidated_body(f, eb, local_fn_map);
+                emit_consolidated_body(f, eb, local_fn_map, ctx);
             }
             f.instruction(&Instruction::End); // end $end block
         }
 
         // All other ops have no nested bodies with calls -- delegate to emit_op
-        other => emit_op(f, other),
+        other => emit_op(f, other, ctx),
     }
 }
 
@@ -1656,6 +1984,7 @@ fn emit_consolidated_do_loop(
     body: &[IrOp],
     is_plus_loop: bool,
     local_fn_map: &HashMap<WordId, u32>,
+    ctx: &EmitCtx,
 ) {
     // DO ( limit index -- )
     pop_to(f, SCRATCH_BASE); // index
@@ -1670,7 +1999,7 @@ fn emit_consolidated_do_loop(
     f.instruction(&Instruction::Block(BlockType::Empty));
     f.instruction(&Instruction::Loop(BlockType::Empty));
 
-    emit_consolidated_body(f, body, local_fn_map);
+    emit_consolidated_body(f, body, local_fn_map, ctx);
 
     // Pop current index from return stack into scratch local
     rpop(f);
@@ -1849,14 +2178,24 @@ pub fn compile_consolidated_module(
     let mut code = CodeSection::new();
     for (_word_id, body) in words {
         let num_locals = 1 + count_scratch_locals(body);
-        let mut func = Function::new(vec![(num_locals, ValType::I32)]);
+        let has_floats = needs_f64_locals(body);
+        let num_f64: u32 = if has_floats { 2 } else { 0 };
+        let mut locals_decl = vec![(num_locals, ValType::I32)];
+        if num_f64 > 0 {
+            locals_decl.push((num_f64, ValType::F64));
+        }
+        let mut func = Function::new(locals_decl);
+        let ctx = EmitCtx {
+            f64_local_0: num_locals,
+            f64_local_1: num_locals + 1,
+        };
 
         // Prologue: cache $dsp global into local 0
         func.instruction(&Instruction::GlobalGet(DSP))
             .instruction(&Instruction::LocalSet(CACHED_DSP_LOCAL));
 
         // Body with consolidated call support
-        emit_consolidated_body(&mut func, body, local_fn_map);
+        emit_consolidated_body(&mut func, body, local_fn_map, &ctx);
 
         // Epilogue: write cached DSP back to the $dsp global
         func.instruction(&Instruction::LocalGet(CACHED_DSP_LOCAL))
@@ -2745,5 +3084,247 @@ mod tests {
         ];
         assert!(!is_promotable(&ops));
         assert_eq!(run_word(&ops), vec![42]);
+    }
+
+    // ===================================================================
+    // Float IR tests
+    // ===================================================================
+
+    /// Run a compiled word and return the float stack (top first).
+    fn run_float_word(ops: &[IrOp]) -> Vec<f64> {
+        use wasmtime::*;
+
+        let compiled = compile_word("test", ops, &default_config()).unwrap();
+        let engine = Engine::default();
+        let mut store = Store::new(&engine, ());
+
+        let memory = Memory::new(&mut store, MemoryType::new(16, None)).unwrap();
+
+        let dsp = Global::new(
+            &mut store,
+            wasmtime::GlobalType::new(ValType::I32, Mutability::Var),
+            Val::I32(DATA_STACK_TOP as i32),
+        )
+        .unwrap();
+
+        let rsp = Global::new(
+            &mut store,
+            wasmtime::GlobalType::new(ValType::I32, Mutability::Var),
+            Val::I32(RETURN_STACK_TOP as i32),
+        )
+        .unwrap();
+
+        let fsp = Global::new(
+            &mut store,
+            wasmtime::GlobalType::new(ValType::I32, Mutability::Var),
+            Val::I32(FLOAT_STACK_TOP as i32),
+        )
+        .unwrap();
+
+        let table = Table::new(
+            &mut store,
+            wasmtime::TableType::new(RefType::FUNCREF, 16, None),
+            Ref::Func(None),
+        )
+        .unwrap();
+
+        let emit_ty = FuncType::new(&engine, [ValType::I32], []);
+        let emit = Func::new(&mut store, emit_ty, |_caller, _params, _results| Ok(()));
+
+        let module = wasmtime::Module::new(&engine, &compiled.bytes).unwrap();
+        let instance = Instance::new(
+            &mut store,
+            &module,
+            &[
+                emit.into(),
+                memory.into(),
+                dsp.into(),
+                rsp.into(),
+                fsp.into(),
+                table.into(),
+            ],
+        )
+        .unwrap();
+
+        instance
+            .get_func(&mut store, "fn")
+            .unwrap()
+            .call(&mut store, &[], &mut [])
+            .unwrap();
+
+        // Read float stack
+        let sp = fsp.get(&mut store).unwrap_i32() as u32;
+        let data = memory.data(&store);
+        let mut stack = Vec::new();
+        let mut addr = sp;
+        while addr < FLOAT_STACK_TOP {
+            let b: [u8; 8] = data[addr as usize..addr as usize + 8].try_into().unwrap();
+            stack.push(f64::from_le_bytes(b));
+            addr += 8;
+        }
+        stack
+    }
+
+    #[test]
+    fn compile_push_f64_validates() {
+        let m = compile_word("test", &[IrOp::PushF64(3.14)], &default_config()).unwrap();
+        validate_wasm(&m.bytes).unwrap();
+    }
+
+    #[test]
+    fn compile_float_arithmetic_validates() {
+        let ops = vec![IrOp::PushF64(1.0), IrOp::PushF64(2.0), IrOp::FAdd];
+        let m = compile_word("fadd", &ops, &default_config()).unwrap();
+        validate_wasm(&m.bytes).unwrap();
+    }
+
+    #[test]
+    fn compile_float_cross_stack_validates() {
+        let ops = vec![IrOp::PushI32(42), IrOp::StoF, IrOp::FtoS];
+        let m = compile_word("cross", &ops, &default_config()).unwrap();
+        validate_wasm(&m.bytes).unwrap();
+    }
+
+    #[test]
+    fn execute_push_f64() {
+        assert_eq!(run_float_word(&[IrOp::PushF64(3.14)]), vec![3.14]);
+    }
+
+    #[test]
+    fn execute_float_add() {
+        let ops = vec![IrOp::PushF64(1.0), IrOp::PushF64(2.0), IrOp::FAdd];
+        assert_eq!(run_float_word(&ops), vec![3.0]);
+    }
+
+    #[test]
+    fn execute_float_sub() {
+        let ops = vec![IrOp::PushF64(5.0), IrOp::PushF64(3.0), IrOp::FSub];
+        assert_eq!(run_float_word(&ops), vec![2.0]);
+    }
+
+    #[test]
+    fn execute_float_mul() {
+        let ops = vec![IrOp::PushF64(3.0), IrOp::PushF64(4.0), IrOp::FMul];
+        assert_eq!(run_float_word(&ops), vec![12.0]);
+    }
+
+    #[test]
+    fn execute_float_div() {
+        let ops = vec![IrOp::PushF64(10.0), IrOp::PushF64(4.0), IrOp::FDiv];
+        assert_eq!(run_float_word(&ops), vec![2.5]);
+    }
+
+    #[test]
+    fn execute_float_negate() {
+        let ops = vec![IrOp::PushF64(3.0), IrOp::FNegate];
+        assert_eq!(run_float_word(&ops), vec![-3.0]);
+    }
+
+    #[test]
+    fn execute_float_abs() {
+        let ops = vec![IrOp::PushF64(-7.0), IrOp::FAbs];
+        assert_eq!(run_float_word(&ops), vec![7.0]);
+    }
+
+    #[test]
+    fn execute_float_sqrt() {
+        let ops = vec![IrOp::PushF64(9.0), IrOp::FSqrt];
+        assert_eq!(run_float_word(&ops), vec![3.0]);
+    }
+
+    #[test]
+    fn execute_float_floor() {
+        let ops = vec![IrOp::PushF64(3.7), IrOp::FFloor];
+        assert_eq!(run_float_word(&ops), vec![3.0]);
+    }
+
+    #[test]
+    fn execute_float_round() {
+        let ops = vec![IrOp::PushF64(2.5), IrOp::FRound];
+        assert_eq!(run_float_word(&ops), vec![2.0]); // round ties even
+    }
+
+    #[test]
+    fn execute_float_min_max() {
+        let ops = vec![IrOp::PushF64(3.0), IrOp::PushF64(5.0), IrOp::FMin];
+        assert_eq!(run_float_word(&ops), vec![3.0]);
+        let ops = vec![IrOp::PushF64(3.0), IrOp::PushF64(5.0), IrOp::FMax];
+        assert_eq!(run_float_word(&ops), vec![5.0]);
+    }
+
+    #[test]
+    fn execute_fdup() {
+        let ops = vec![IrOp::PushF64(7.0), IrOp::FDup];
+        assert_eq!(run_float_word(&ops), vec![7.0, 7.0]);
+    }
+
+    #[test]
+    fn execute_fdrop() {
+        let ops = vec![IrOp::PushF64(1.0), IrOp::PushF64(2.0), IrOp::FDrop];
+        assert_eq!(run_float_word(&ops), vec![1.0]);
+    }
+
+    #[test]
+    fn execute_fswap() {
+        let ops = vec![IrOp::PushF64(1.0), IrOp::PushF64(2.0), IrOp::FSwap];
+        assert_eq!(run_float_word(&ops), vec![1.0, 2.0]);
+    }
+
+    #[test]
+    fn execute_fover() {
+        let ops = vec![IrOp::PushF64(1.0), IrOp::PushF64(2.0), IrOp::FOver];
+        assert_eq!(run_float_word(&ops), vec![1.0, 2.0, 1.0]);
+    }
+
+    #[test]
+    fn execute_float_zero_eq() {
+        let ops = vec![IrOp::PushF64(0.0), IrOp::FZeroEq];
+        assert_eq!(run_word(&ops), vec![-1]);
+        let ops = vec![IrOp::PushF64(1.0), IrOp::FZeroEq];
+        assert_eq!(run_word(&ops), vec![0]);
+    }
+
+    #[test]
+    fn execute_float_zero_lt() {
+        let ops = vec![IrOp::PushF64(-1.0), IrOp::FZeroLt];
+        assert_eq!(run_word(&ops), vec![-1]);
+        let ops = vec![IrOp::PushF64(1.0), IrOp::FZeroLt];
+        assert_eq!(run_word(&ops), vec![0]);
+    }
+
+    #[test]
+    fn execute_float_eq() {
+        let ops = vec![IrOp::PushF64(3.0), IrOp::PushF64(3.0), IrOp::FEq];
+        assert_eq!(run_word(&ops), vec![-1]);
+        let ops = vec![IrOp::PushF64(3.0), IrOp::PushF64(4.0), IrOp::FEq];
+        assert_eq!(run_word(&ops), vec![0]);
+    }
+
+    #[test]
+    fn execute_float_lt() {
+        let ops = vec![IrOp::PushF64(2.0), IrOp::PushF64(3.0), IrOp::FLt];
+        assert_eq!(run_word(&ops), vec![-1]);
+        let ops = vec![IrOp::PushF64(3.0), IrOp::PushF64(2.0), IrOp::FLt];
+        assert_eq!(run_word(&ops), vec![0]);
+    }
+
+    #[test]
+    fn execute_stof_ftos() {
+        // ( 42 -- ) ( F: -- 42.0 ) then ( F: 42.0 -- ) ( -- 42 )
+        let ops = vec![IrOp::PushI32(42), IrOp::StoF, IrOp::FtoS];
+        assert_eq!(run_word(&ops), vec![42]);
+    }
+
+    #[test]
+    fn execute_fetch_store_float() {
+        // Store 3.14 at address 0x100, then fetch it back
+        let ops = vec![
+            IrOp::PushF64(3.14),
+            IrOp::PushI32(0x100),
+            IrOp::StoreFloat,
+            IrOp::PushI32(0x100),
+            IrOp::FetchFloat,
+        ];
+        assert_eq!(run_float_word(&ops), vec![3.14]);
     }
 }

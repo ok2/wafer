@@ -133,6 +133,62 @@ pub enum IrOp {
     // -- System --
     /// Execute word by function table index: ( xt -- )
     Execute,
+
+    // -- Float stack manipulation --
+    /// Float duplicate: ( F: r -- r r )
+    FDup,
+    /// Float drop: ( F: r -- )
+    FDrop,
+    /// Float swap: ( F: r1 r2 -- r2 r1 )
+    FSwap,
+    /// Float over: ( F: r1 r2 -- r1 r2 r1 )
+    FOver,
+
+    // -- Float arithmetic --
+    /// Float add: ( F: r1 r2 -- r1+r2 )
+    FAdd,
+    /// Float subtract: ( F: r1 r2 -- r1-r2 )
+    FSub,
+    /// Float multiply: ( F: r1 r2 -- r1*r2 )
+    FMul,
+    /// Float divide: ( F: r1 r2 -- r1/r2 )
+    FDiv,
+    /// Float negate: ( F: r -- -r )
+    FNegate,
+    /// Float absolute value: ( F: r -- |r| )
+    FAbs,
+    /// Float square root: ( F: r -- sqrt(r) )
+    FSqrt,
+    /// Float minimum: ( F: r1 r2 -- min(r1,r2) )
+    FMin,
+    /// Float maximum: ( F: r1 r2 -- max(r1,r2) )
+    FMax,
+    /// Float floor: ( F: r -- floor(r) )
+    FFloor,
+    /// Float round to nearest even: ( F: r -- round(r) )
+    FRound,
+
+    // -- Float comparisons (cross-stack: pop float, push data) --
+    /// Float zero equal: ( F: r -- ) ( -- flag )
+    FZeroEq,
+    /// Float zero less-than: ( F: r -- ) ( -- flag )
+    FZeroLt,
+    /// Float equal: ( F: r1 r2 -- ) ( -- flag )
+    FEq,
+    /// Float less-than: ( F: r1 r2 -- ) ( -- flag )
+    FLt,
+
+    // -- Float memory (cross-stack) --
+    /// Float fetch: ( addr -- ) ( F: -- r )
+    FetchFloat,
+    /// Float store: ( addr -- ) ( F: r -- )
+    StoreFloat,
+
+    // -- Float/integer conversions (cross-stack) --
+    /// Single to float: ( n -- ) ( F: -- r )
+    StoF,
+    /// Float to single: ( F: r -- ) ( -- n )
+    FtoS,
 }
 
 /// A compiled word definition as IR.

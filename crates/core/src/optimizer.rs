@@ -194,6 +194,26 @@ fn peephole_one_pass(ops: Vec<IrOp>) -> Vec<IrOp> {
                     out.pop();
                     continue;
                 }
+                // PushF64, FDrop => remove both
+                (IrOp::PushF64(_), IrOp::FDrop) => {
+                    out.pop();
+                    continue;
+                }
+                // FDup, FDrop => remove both
+                (IrOp::FDup, IrOp::FDrop) => {
+                    out.pop();
+                    continue;
+                }
+                // FSwap, FSwap => remove both
+                (IrOp::FSwap, IrOp::FSwap) => {
+                    out.pop();
+                    continue;
+                }
+                // FNegate, FNegate => remove both
+                (IrOp::FNegate, IrOp::FNegate) => {
+                    out.pop();
+                    continue;
+                }
                 // Over, Over => TwoDup
                 (IrOp::Over, IrOp::Over) => {
                     out.pop();
@@ -236,12 +256,32 @@ fn constant_fold(ops: Vec<IrOp>) -> Vec<IrOp> {
             continue;
         }
 
+        // Try float binary fold: last two outputs are PushF64
+        if out.len() >= 2
+            && let Some(result) =
+                try_float_binary_fold(&out[out.len() - 2], &out[out.len() - 1], &op)
+        {
+            out.pop();
+            out.pop();
+            out.push(IrOp::PushF64(result));
+            continue;
+        }
+
         // Try unary fold: last output is PushI32, current op is foldable
         if !out.is_empty()
             && let Some(result) = try_unary_fold(&out[out.len() - 1], &op)
         {
             out.pop();
             out.push(IrOp::PushI32(result));
+            continue;
+        }
+
+        // Try float unary fold: last output is PushF64
+        if !out.is_empty()
+            && let Some(result) = try_float_unary_fold(&out[out.len() - 1], &op)
+        {
+            out.pop();
+            out.push(IrOp::PushF64(result));
             continue;
         }
 
@@ -313,6 +353,53 @@ fn try_unary_fold(n_op: &IrOp, op: &IrOp) -> Option<i32> {
         IrOp::Invert => Some(!n),
         IrOp::ZeroEq => Some(if n == 0 { -1 } else { 0 }),
         IrOp::ZeroLt => Some(if n < 0 { -1 } else { 0 }),
+        _ => None,
+    }
+}
+
+/// Try to fold a binary float operation on two constants.
+fn try_float_binary_fold(a_op: &IrOp, b_op: &IrOp, op: &IrOp) -> Option<f64> {
+    let (a, b) = match (a_op, b_op) {
+        (IrOp::PushF64(a), IrOp::PushF64(b)) => (*a, *b),
+        _ => return None,
+    };
+
+    match op {
+        IrOp::FAdd => Some(a + b),
+        IrOp::FSub => Some(a - b),
+        IrOp::FMul => Some(a * b),
+        IrOp::FDiv => {
+            if b != 0.0 {
+                Some(a / b)
+            } else {
+                None
+            }
+        }
+        IrOp::FMin => Some(a.min(b)),
+        IrOp::FMax => Some(a.max(b)),
+        _ => None,
+    }
+}
+
+/// Try to fold a unary float operation on a constant.
+fn try_float_unary_fold(n_op: &IrOp, op: &IrOp) -> Option<f64> {
+    let n = match n_op {
+        IrOp::PushF64(n) => *n,
+        _ => return None,
+    };
+
+    match op {
+        IrOp::FNegate => Some(-n),
+        IrOp::FAbs => Some(n.abs()),
+        IrOp::FSqrt => {
+            if n >= 0.0 {
+                Some(n.sqrt())
+            } else {
+                None
+            }
+        }
+        IrOp::FFloor => Some(n.floor()),
+        IrOp::FRound => Some(n.round_ties_even()),
         _ => None,
     }
 }
@@ -777,6 +864,52 @@ mod tests {
             result.last(),
             Some(IrOp::Call(WordId(5))) | Some(IrOp::TailCall(WordId(5)))
         ));
+    }
+
+    // Float peephole tests
+    #[test]
+    fn float_push_fdrop_removed() {
+        assert_eq!(opt(vec![IrOp::PushF64(1.0), IrOp::FDrop]), vec![]);
+    }
+
+    #[test]
+    fn float_fdup_fdrop_removed() {
+        assert_eq!(opt(vec![IrOp::FDup, IrOp::FDrop]), vec![]);
+    }
+
+    #[test]
+    fn float_fswap_fswap_removed() {
+        assert_eq!(opt(vec![IrOp::FSwap, IrOp::FSwap]), vec![]);
+    }
+
+    #[test]
+    fn float_fnegate_fnegate_removed() {
+        assert_eq!(opt(vec![IrOp::FNegate, IrOp::FNegate]), vec![]);
+    }
+
+    // Float constant folding tests
+    #[test]
+    fn float_constant_fold_add() {
+        assert_eq!(
+            opt(vec![IrOp::PushF64(1.5), IrOp::PushF64(2.5), IrOp::FAdd]),
+            vec![IrOp::PushF64(4.0)]
+        );
+    }
+
+    #[test]
+    fn float_constant_fold_negate() {
+        assert_eq!(
+            opt(vec![IrOp::PushF64(3.0), IrOp::FNegate]),
+            vec![IrOp::PushF64(-3.0)]
+        );
+    }
+
+    #[test]
+    fn float_constant_fold_sqrt() {
+        assert_eq!(
+            opt(vec![IrOp::PushF64(9.0), IrOp::FSqrt]),
+            vec![IrOp::PushF64(3.0)]
+        );
     }
 
     #[test]

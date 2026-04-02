@@ -7148,95 +7148,10 @@ impl ForthVM {
 
     /// Float stack manipulation words.
     fn register_float_stack_ops(&mut self) -> anyhow::Result<()> {
-        // FDROP ( F: r -- )
-        {
-            let fsp = self.fsp;
-            let func = Func::new(
-                &mut self.store,
-                FuncType::new(&self.engine, [], []),
-                move |mut caller, _, _| {
-                    let sp = fsp.get(&mut caller).unwrap_i32() as u32;
-                    if sp >= FLOAT_STACK_TOP {
-                        return Err(wasmtime::Error::msg("float stack underflow"));
-                    }
-                    fsp.set(&mut caller, Val::I32((sp + 8) as i32)).unwrap();
-                    Ok(())
-                },
-            );
-            self.register_host_primitive("FDROP", false, func)?;
-        }
-
-        // FDUP ( F: r -- r r )
-        {
-            let memory = self.memory;
-            let fsp = self.fsp;
-            let func = Func::new(
-                &mut self.store,
-                FuncType::new(&self.engine, [], []),
-                move |mut caller, _, _| {
-                    let sp = fsp.get(&mut caller).unwrap_i32() as u32;
-                    if sp >= FLOAT_STACK_TOP {
-                        return Err(wasmtime::Error::msg("float stack underflow"));
-                    }
-                    let new_sp = sp - 8;
-                    if new_sp < FLOAT_STACK_BASE {
-                        return Err(wasmtime::Error::msg("float stack overflow"));
-                    }
-                    let mem = memory.data(&caller);
-                    let bytes: [u8; 8] = mem[sp as usize..sp as usize + 8].try_into().unwrap();
-                    fsp.set(&mut caller, Val::I32(new_sp as i32)).unwrap();
-                    let mem = memory.data_mut(&mut caller);
-                    mem[new_sp as usize..new_sp as usize + 8].copy_from_slice(&bytes);
-                    Ok(())
-                },
-            );
-            self.register_host_primitive("FDUP", false, func)?;
-        }
-
-        // FSWAP ( F: r1 r2 -- r2 r1 )
-        {
-            let memory = self.memory;
-            let fsp = self.fsp;
-            let func = Func::new(
-                &mut self.store,
-                FuncType::new(&self.engine, [], []),
-                move |mut caller, _, _| {
-                    let sp = fsp.get(&mut caller).unwrap_i32() as u32;
-                    let mem = memory.data(&caller);
-                    let b: [u8; 8] = mem[sp as usize..sp as usize + 8].try_into().unwrap();
-                    let a: [u8; 8] = mem[sp as usize + 8..sp as usize + 16].try_into().unwrap();
-                    let mem = memory.data_mut(&mut caller);
-                    mem[sp as usize..sp as usize + 8].copy_from_slice(&a);
-                    mem[sp as usize + 8..sp as usize + 16].copy_from_slice(&b);
-                    Ok(())
-                },
-            );
-            self.register_host_primitive("FSWAP", false, func)?;
-        }
-
-        // FOVER ( F: r1 r2 -- r1 r2 r1 )
-        {
-            let memory = self.memory;
-            let fsp = self.fsp;
-            let func = Func::new(
-                &mut self.store,
-                FuncType::new(&self.engine, [], []),
-                move |mut caller, _, _| {
-                    let sp = fsp.get(&mut caller).unwrap_i32() as u32;
-                    let mem = memory.data(&caller);
-                    let a: [u8; 8] = mem[sp as usize + 8..sp as usize + 16].try_into().unwrap();
-                    let new_sp = sp - 8;
-                    if new_sp < FLOAT_STACK_BASE {
-                        return Err(wasmtime::Error::msg("float stack overflow"));
-                    }
-                    fsp.set(&mut caller, Val::I32(new_sp as i32)).unwrap();
-                    let mem = memory.data_mut(&mut caller);
-                    mem[new_sp as usize..new_sp as usize + 8].copy_from_slice(&a);
-                    Ok(())
-                },
-            );
-            self.register_host_primitive("FOVER", false, func)?;
-        }
+        self.register_primitive("FDROP", false, vec![IrOp::FDrop])?;
+        self.register_primitive("FDUP", false, vec![IrOp::FDup])?;
+        self.register_primitive("FSWAP", false, vec![IrOp::FSwap])?;
+        self.register_primitive("FOVER", false, vec![IrOp::FOver])?;
 
         // FROT ( F: r1 r2 r3 -- r2 r3 r1 )
         {
@@ -7288,166 +7203,35 @@ impl ForthVM {
             self.register_host_primitive("FDEPTH", false, func)?;
         }
 
-        // FNIP ( F: r1 r2 -- r2 )
-        {
-            let memory = self.memory;
-            let fsp = self.fsp;
-            let func = Func::new(
-                &mut self.store,
-                FuncType::new(&self.engine, [], []),
-                move |mut caller, _, _| {
-                    let sp = fsp.get(&mut caller).unwrap_i32() as u32;
-                    let mem = memory.data(&caller);
-                    let top: [u8; 8] = mem[sp as usize..sp as usize + 8].try_into().unwrap();
-                    let new_sp = sp + 8;
-                    fsp.set(&mut caller, Val::I32(new_sp as i32)).unwrap();
-                    let mem = memory.data_mut(&mut caller);
-                    mem[new_sp as usize..new_sp as usize + 8].copy_from_slice(&top);
-                    Ok(())
-                },
-            );
-            self.register_host_primitive("FNIP", false, func)?;
-        }
-
-        // FTUCK ( F: r1 r2 -- r2 r1 r2 )
-        {
-            let memory = self.memory;
-            let fsp = self.fsp;
-            let func = Func::new(
-                &mut self.store,
-                FuncType::new(&self.engine, [], []),
-                move |mut caller, _, _| {
-                    let sp = fsp.get(&mut caller).unwrap_i32() as u32;
-                    let mem = memory.data(&caller);
-                    let r2: [u8; 8] = mem[sp as usize..sp as usize + 8].try_into().unwrap();
-                    let r1: [u8; 8] = mem[sp as usize + 8..sp as usize + 16].try_into().unwrap();
-                    let new_sp = sp - 8;
-                    if new_sp < FLOAT_STACK_BASE {
-                        return Err(wasmtime::Error::msg("float stack overflow"));
-                    }
-                    fsp.set(&mut caller, Val::I32(new_sp as i32)).unwrap();
-                    let mem = memory.data_mut(&mut caller);
-                    // r2 r1 r2 (bottom to top)
-                    mem[new_sp as usize..new_sp as usize + 8].copy_from_slice(&r2);
-                    mem[new_sp as usize + 8..new_sp as usize + 16].copy_from_slice(&r1);
-                    mem[new_sp as usize + 16..new_sp as usize + 24].copy_from_slice(&r2);
-                    Ok(())
-                },
-            );
-            self.register_host_primitive("FTUCK", false, func)?;
-        }
+        self.register_primitive("FNIP", false, vec![IrOp::FSwap, IrOp::FDrop])?;
+        self.register_primitive("FTUCK", false, vec![IrOp::FSwap, IrOp::FOver])?;
 
         Ok(())
     }
 
     /// Float arithmetic words.
     fn register_float_arithmetic(&mut self) -> anyhow::Result<()> {
-        self.register_float_binary("F+", |a, b| a + b)?;
-        self.register_float_binary("F-", |a, b| a - b)?;
-        self.register_float_binary("F*", |a, b| a * b)?;
-        self.register_float_binary("F/", |a, b| a / b)?;
-        self.register_float_unary("FNEGATE", |a| -a)?;
-        self.register_float_unary("FABS", f64::abs)?;
-        self.register_float_binary("FMAX", f64::max)?;
-        self.register_float_binary("FMIN", f64::min)?;
-        self.register_float_unary("FSQRT", f64::sqrt)?;
-        self.register_float_unary("FLOOR", f64::floor)?;
-        self.register_float_unary("FROUND", f64::round_ties_even)?;
+        self.register_primitive("F+", false, vec![IrOp::FAdd])?;
+        self.register_primitive("F-", false, vec![IrOp::FSub])?;
+        self.register_primitive("F*", false, vec![IrOp::FMul])?;
+        self.register_primitive("F/", false, vec![IrOp::FDiv])?;
+        self.register_primitive("FNEGATE", false, vec![IrOp::FNegate])?;
+        self.register_primitive("FABS", false, vec![IrOp::FAbs])?;
+        self.register_primitive("FMAX", false, vec![IrOp::FMax])?;
+        self.register_primitive("FMIN", false, vec![IrOp::FMin])?;
+        self.register_primitive("FSQRT", false, vec![IrOp::FSqrt])?;
+        self.register_primitive("FLOOR", false, vec![IrOp::FFloor])?;
+        self.register_primitive("FROUND", false, vec![IrOp::FRound])?;
         self.register_float_binary("F**", f64::powf)?;
         Ok(())
     }
 
     /// Float comparison words. Results go on the DATA stack.
     fn register_float_comparisons(&mut self) -> anyhow::Result<()> {
-        // F0= ( -- flag ) ( F: r -- )
-        {
-            let memory = self.memory;
-            let dsp = self.dsp;
-            let fsp = self.fsp;
-            let func = Func::new(
-                &mut self.store,
-                FuncType::new(&self.engine, [], []),
-                move |mut caller, _, _| {
-                    let sp = fsp.get(&mut caller).unwrap_i32() as u32;
-                    let mem = memory.data(&caller);
-                    let bytes: [u8; 8] = mem[sp as usize..sp as usize + 8].try_into().unwrap();
-                    let val = f64::from_le_bytes(bytes);
-                    fsp.set(&mut caller, Val::I32((sp + 8) as i32)).unwrap();
-                    let flag: i32 = if val == 0.0 { -1 } else { 0 };
-                    let dsp_val = dsp.get(&mut caller).unwrap_i32() as u32;
-                    let new_dsp = dsp_val - CELL_SIZE;
-                    dsp.set(&mut caller, Val::I32(new_dsp as i32)).unwrap();
-                    let mem = memory.data_mut(&mut caller);
-                    mem[new_dsp as usize..new_dsp as usize + 4]
-                        .copy_from_slice(&flag.to_le_bytes());
-                    Ok(())
-                },
-            );
-            self.register_host_primitive("F0=", false, func)?;
-        }
-
-        // F0< ( -- flag ) ( F: r -- )
-        {
-            let memory = self.memory;
-            let dsp = self.dsp;
-            let fsp = self.fsp;
-            let func = Func::new(
-                &mut self.store,
-                FuncType::new(&self.engine, [], []),
-                move |mut caller, _, _| {
-                    let sp = fsp.get(&mut caller).unwrap_i32() as u32;
-                    let mem = memory.data(&caller);
-                    let bytes: [u8; 8] = mem[sp as usize..sp as usize + 8].try_into().unwrap();
-                    let val = f64::from_le_bytes(bytes);
-                    fsp.set(&mut caller, Val::I32((sp + 8) as i32)).unwrap();
-                    let flag: i32 = if val < 0.0 { -1 } else { 0 };
-                    let dsp_val = dsp.get(&mut caller).unwrap_i32() as u32;
-                    let new_dsp = dsp_val - CELL_SIZE;
-                    dsp.set(&mut caller, Val::I32(new_dsp as i32)).unwrap();
-                    let mem = memory.data_mut(&mut caller);
-                    mem[new_dsp as usize..new_dsp as usize + 4]
-                        .copy_from_slice(&flag.to_le_bytes());
-                    Ok(())
-                },
-            );
-            self.register_host_primitive("F0<", false, func)?;
-        }
-
-        // Helper for binary float comparisons that pop two floats and push a flag
-        let register_float_cmp =
-            |vm: &mut Self, name: &str, cmp: fn(f64, f64) -> bool| -> anyhow::Result<()> {
-                let memory = vm.memory;
-                let dsp = vm.dsp;
-                let fsp = vm.fsp;
-                let func = Func::new(
-                    &mut vm.store,
-                    FuncType::new(&vm.engine, [], []),
-                    move |mut caller, _, _| {
-                        let sp = fsp.get(&mut caller).unwrap_i32() as u32;
-                        let mem = memory.data(&caller);
-                        let b_bytes: [u8; 8] =
-                            mem[sp as usize..sp as usize + 8].try_into().unwrap();
-                        let a_bytes: [u8; 8] =
-                            mem[sp as usize + 8..sp as usize + 16].try_into().unwrap();
-                        let b = f64::from_le_bytes(b_bytes);
-                        let a = f64::from_le_bytes(a_bytes);
-                        fsp.set(&mut caller, Val::I32((sp + 16) as i32)).unwrap();
-                        let flag: i32 = if cmp(a, b) { -1 } else { 0 };
-                        let dsp_val = dsp.get(&mut caller).unwrap_i32() as u32;
-                        let new_dsp = dsp_val - CELL_SIZE;
-                        dsp.set(&mut caller, Val::I32(new_dsp as i32)).unwrap();
-                        let mem = memory.data_mut(&mut caller);
-                        mem[new_dsp as usize..new_dsp as usize + 4]
-                            .copy_from_slice(&flag.to_le_bytes());
-                        Ok(())
-                    },
-                );
-                vm.register_host_primitive(name, false, func)?;
-                Ok(())
-            };
-
-        register_float_cmp(self, "F=", |a, b| a == b)?;
-        register_float_cmp(self, "F<", |a, b| a < b)?;
+        self.register_primitive("F0=", false, vec![IrOp::FZeroEq])?;
+        self.register_primitive("F0<", false, vec![IrOp::FZeroLt])?;
+        self.register_primitive("F=", false, vec![IrOp::FEq])?;
+        self.register_primitive("F<", false, vec![IrOp::FLt])?;
 
         // F~ ( -- flag ) ( F: r1 r2 r3 -- ) approximate float comparison
         // If r3 > 0: true if |r1-r2| < r3
@@ -7502,76 +7286,8 @@ impl ForthVM {
 
     /// Float memory words.
     fn register_float_memory(&mut self) -> anyhow::Result<()> {
-        // F@ ( f-addr -- ) ( F: -- r ) fetch a float from memory
-        {
-            let memory = self.memory;
-            let dsp = self.dsp;
-            let fsp = self.fsp;
-            let func = Func::new(
-                &mut self.store,
-                FuncType::new(&self.engine, [], []),
-                move |mut caller, _, _| {
-                    // Read all we need from memory first
-                    let sp = dsp.get(&mut caller).unwrap_i32() as u32;
-                    let fsp_val = fsp.get(&mut caller).unwrap_i32() as u32;
-                    let (addr, val) = {
-                        let mem = memory.data(&caller);
-                        let addr_bytes: [u8; 4] =
-                            mem[sp as usize..sp as usize + 4].try_into().unwrap();
-                        let addr = u32::from_le_bytes(addr_bytes) as usize;
-                        let float_bytes: [u8; 8] = mem[addr..addr + 8].try_into().unwrap();
-                        (addr, f64::from_le_bytes(float_bytes))
-                    };
-                    let _ = addr;
-                    // Update stack pointers
-                    dsp.set(&mut caller, Val::I32((sp + CELL_SIZE) as i32))
-                        .unwrap();
-                    let new_fsp = fsp_val - FLOAT_SIZE;
-                    fsp.set(&mut caller, Val::I32(new_fsp as i32)).unwrap();
-                    // Write float to float stack
-                    let mem = memory.data_mut(&mut caller);
-                    mem[new_fsp as usize..new_fsp as usize + 8].copy_from_slice(&val.to_le_bytes());
-                    Ok(())
-                },
-            );
-            self.register_host_primitive("F@", false, func)?;
-        }
-
-        // F! ( f-addr -- ) ( F: r -- ) store a float to memory
-        {
-            let memory = self.memory;
-            let dsp = self.dsp;
-            let fsp = self.fsp;
-            let func = Func::new(
-                &mut self.store,
-                FuncType::new(&self.engine, [], []),
-                move |mut caller, _, _| {
-                    // Read all we need first
-                    let sp = dsp.get(&mut caller).unwrap_i32() as u32;
-                    let fsp_val = fsp.get(&mut caller).unwrap_i32() as u32;
-                    let (addr, float_bytes) = {
-                        let mem = memory.data(&caller);
-                        let addr_bytes: [u8; 4] =
-                            mem[sp as usize..sp as usize + 4].try_into().unwrap();
-                        let addr = u32::from_le_bytes(addr_bytes) as usize;
-                        let float_bytes: [u8; 8] = mem[fsp_val as usize..fsp_val as usize + 8]
-                            .try_into()
-                            .unwrap();
-                        (addr, float_bytes)
-                    };
-                    // Update stack pointers
-                    dsp.set(&mut caller, Val::I32((sp + CELL_SIZE) as i32))
-                        .unwrap();
-                    fsp.set(&mut caller, Val::I32((fsp_val + FLOAT_SIZE) as i32))
-                        .unwrap();
-                    // Store float at addr
-                    let mem = memory.data_mut(&mut caller);
-                    mem[addr..addr + 8].copy_from_slice(&float_bytes);
-                    Ok(())
-                },
-            );
-            self.register_host_primitive("F!", false, func)?;
-        }
+        self.register_primitive("F@", false, vec![IrOp::FetchFloat])?;
+        self.register_primitive("F!", false, vec![IrOp::StoreFloat])?;
 
         // FLOAT+ ( f-addr1 -- f-addr2 ) add float size to address
         self.register_primitive(
@@ -7742,61 +7458,8 @@ impl ForthVM {
             self.register_host_primitive("F>D", false, func)?;
         }
 
-        // S>F ( n -- ) ( F: -- r ) convert single-cell integer to float
-        {
-            let memory = self.memory;
-            let dsp = self.dsp;
-            let fsp = self.fsp;
-            let func = Func::new(
-                &mut self.store,
-                FuncType::new(&self.engine, [], []),
-                move |mut caller, _, _| {
-                    let sp = dsp.get(&mut caller).unwrap_i32() as u32;
-                    let mem = memory.data(&caller);
-                    let b: [u8; 4] = mem[sp as usize..sp as usize + 4].try_into().unwrap();
-                    let n = i32::from_le_bytes(b);
-                    dsp.set(&mut caller, Val::I32((sp + CELL_SIZE) as i32))
-                        .unwrap();
-                    let f = n as f64;
-                    let fsp_val = fsp.get(&mut caller).unwrap_i32() as u32;
-                    let new_fsp = fsp_val - FLOAT_SIZE;
-                    fsp.set(&mut caller, Val::I32(new_fsp as i32)).unwrap();
-                    let mem = memory.data_mut(&mut caller);
-                    mem[new_fsp as usize..new_fsp as usize + 8].copy_from_slice(&f.to_le_bytes());
-                    Ok(())
-                },
-            );
-            self.register_host_primitive("S>F", false, func)?;
-        }
-
-        // F>S ( -- n ) ( F: r -- ) convert float to single-cell integer
-        {
-            let memory = self.memory;
-            let dsp = self.dsp;
-            let fsp = self.fsp;
-            let func = Func::new(
-                &mut self.store,
-                FuncType::new(&self.engine, [], []),
-                move |mut caller, _, _| {
-                    let fsp_val = fsp.get(&mut caller).unwrap_i32() as u32;
-                    let mem = memory.data(&caller);
-                    let bytes: [u8; 8] = mem[fsp_val as usize..fsp_val as usize + 8]
-                        .try_into()
-                        .unwrap();
-                    let f = f64::from_le_bytes(bytes);
-                    fsp.set(&mut caller, Val::I32((fsp_val + FLOAT_SIZE) as i32))
-                        .unwrap();
-                    let n = f as i32;
-                    let sp = dsp.get(&mut caller).unwrap_i32() as u32;
-                    let new_sp = sp - CELL_SIZE;
-                    dsp.set(&mut caller, Val::I32(new_sp as i32)).unwrap();
-                    let mem = memory.data_mut(&mut caller);
-                    mem[new_sp as usize..new_sp as usize + 4].copy_from_slice(&n.to_le_bytes());
-                    Ok(())
-                },
-            );
-            self.register_host_primitive("F>S", false, func)?;
-        }
+        self.register_primitive("S>F", false, vec![IrOp::StoF])?;
+        self.register_primitive("F>S", false, vec![IrOp::FtoS])?;
 
         Ok(())
     }
@@ -8361,27 +8024,9 @@ impl ForthVM {
     }
 
     /// Compile a float literal for use inside a colon definition.
-    /// Creates a tiny host function that pushes the given f64 onto the float stack.
+    /// Emits `PushF64` IR op which compiles directly to WASM f64.const + float stack push.
     fn compile_float_literal(&mut self, val: f64) -> anyhow::Result<()> {
-        let memory = self.memory;
-        let fsp = self.fsp;
-        let func = Func::new(
-            &mut self.store,
-            FuncType::new(&self.engine, [], []),
-            move |mut caller, _, _| {
-                let sp = fsp.get(&mut caller).unwrap_i32() as u32;
-                let new_sp = sp - FLOAT_SIZE;
-                if new_sp < FLOAT_STACK_BASE {
-                    return Err(wasmtime::Error::msg("float stack overflow"));
-                }
-                fsp.set(&mut caller, Val::I32(new_sp as i32)).unwrap();
-                let mem = memory.data_mut(&mut caller);
-                mem[new_sp as usize..new_sp as usize + 8].copy_from_slice(&val.to_le_bytes());
-                Ok(())
-            },
-        );
-        let word_id = self.install_anon_func(func)?;
-        self.push_ir(IrOp::Call(word_id));
+        self.push_ir(IrOp::PushF64(val));
         Ok(())
     }
 
@@ -10462,5 +10107,60 @@ mod tests {
     fn verify_stack_promotion_comparison() {
         assert_eq!(eval_stack(": T = ; 5 5 T"), vec![-1]);
         assert_eq!(eval_stack(": T < ; 3 5 T"), vec![-1]);
+    }
+
+    // ===================================================================
+    // Float IR tests
+    // ===================================================================
+
+    #[test]
+    fn float_ir_add() {
+        assert_eq!(eval_output("1E 2E F+ F."), "3.000000 ");
+    }
+
+    #[test]
+    fn float_ir_literal_in_colon() {
+        assert_eq!(eval_output(": T 1.5E0 2.5E0 F+ F. ; T"), "4.000000 ");
+    }
+
+    #[test]
+    fn float_ir_conversions() {
+        assert_eq!(eval_stack("42 S>F F>S"), vec![42]);
+    }
+
+    #[test]
+    fn float_ir_memory() {
+        assert_eq!(eval_output("FVARIABLE X 3.14E0 X F! X F@ F."), "3.140000 ");
+    }
+
+    #[test]
+    fn float_ir_comparisons() {
+        assert_eq!(eval_stack("1E 2E F<"), vec![-1]);
+        assert_eq!(eval_stack("2E 1E F<"), vec![0]);
+        assert_eq!(eval_stack("3E 3E F="), vec![-1]);
+        assert_eq!(eval_stack("0E F0="), vec![-1]);
+        assert_eq!(eval_stack("1E F0="), vec![0]);
+        assert_eq!(eval_stack("-1E F0<"), vec![-1]);
+        assert_eq!(eval_stack("1E F0<"), vec![0]);
+    }
+
+    #[test]
+    fn float_ir_stack_ops() {
+        assert_eq!(eval_output("1E FDUP F. F."), "1.000000 1.000000 ");
+        assert_eq!(eval_output("1E 2E FSWAP F. F."), "1.000000 2.000000 ");
+        assert_eq!(
+            eval_output("1E 2E FOVER F. F. F."),
+            "1.000000 2.000000 1.000000 "
+        );
+    }
+
+    #[test]
+    fn float_ir_arithmetic() {
+        assert_eq!(eval_output("10E 3E F- F."), "7.000000 ");
+        assert_eq!(eval_output("3E 4E F* F."), "12.000000 ");
+        assert_eq!(eval_output("10E 4E F/ F."), "2.500000 ");
+        assert_eq!(eval_output("3E FNEGATE F."), "-3.000000 ");
+        assert_eq!(eval_output("-7E FABS F."), "7.000000 ");
+        assert_eq!(eval_output("9E FSQRT F."), "3.000000 ");
     }
 }
