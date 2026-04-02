@@ -1877,16 +1877,6 @@ pub fn compile_consolidated_module(
     Ok(bytes)
 }
 
-/// Generate the core/bootstrap WASM module.
-///
-/// Not yet implemented -- will be built in a future step.
-pub fn compile_core_module(primitives: &[(String, Vec<IrOp>)]) -> WaferResult<Vec<u8>> {
-    let _ = primitives;
-    Err(WaferError::CodegenError(
-        "compile_core_module not yet implemented".to_string(),
-    ))
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

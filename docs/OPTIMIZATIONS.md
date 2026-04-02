@@ -26,7 +26,7 @@ This document describes every optimization that makes sense for WAFER, why it ma
 | 10 | Codegen Improvements     | Codegen      | Done        | Medium  |
 | 11 | wasmtime Configuration   | Runtime      | Done        | Low     |
 | 12 | Dictionary Hash Index    | Runtime      | Done        | Low     |
-| 13 | Startup Batching         | Architecture | Not started | Low     |
+| 13 | Startup Batching         | Architecture | Done        | Low     |
 | 14 | Float / Double-Cell      | Codegen      | Not started | Future  |
 
 ## 1. Stack-to-Local Promotion
@@ -422,7 +422,7 @@ This affects **compile time** (word lookup during parsing), not runtime (compile
 
 ## 13. Startup Batching
 
-**Status: Not started.** `compile_core_module()` stub exists in `codegen.rs`.
+**Status: Done.** All IR primitives batch-compiled into a single WASM module at boot via `compile_consolidated_module()`. Reduces boot from ~7.7ms to ~0.6ms (12x faster). The `compile_core_module()` stub has been removed.
 
 Currently, each of the 80+ primitives registered at boot creates a separate WASM module: `wasm-encoder` builds it, `wasmparser` validates it, Cranelift compiles it, and wasmtime instantiates it. This happens 80+ times sequentially.
 

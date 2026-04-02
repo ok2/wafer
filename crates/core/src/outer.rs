@@ -237,6 +237,10 @@ pub struct ForthVM {
     config: WaferConfig,
     /// Total WASM module bytes compiled.
     total_module_bytes: u64,
+    /// When true, `register_primitive` defers WASM compilation for batch processing.
+    batch_mode: bool,
+    /// IR primitives deferred during `batch_mode` for single-module compilation.
+    deferred_ir: Vec<(WordId, Vec<IrOp>)>,
 }
 
 impl ForthVM {
@@ -360,6 +364,8 @@ impl ForthVM {
             ir_bodies: HashMap::new(),
             config: wafer_config,
             total_module_bytes: 0,
+            batch_mode: false,
+            deferred_ir: Vec::new(),
         };
 
         vm.register_primitives()?;
@@ -1563,6 +1569,50 @@ impl ForthVM {
         Ok(())
     }
 
+    /// Batch-compile all deferred IR primitives into a single WASM module.
+    fn batch_compile_deferred(&mut self) -> anyhow::Result<()> {
+        let words = std::mem::take(&mut self.deferred_ir);
+        if words.is_empty() {
+            return Ok(());
+        }
+
+        let mut local_fn_map = HashMap::new();
+        for (i, (word_id, _)) in words.iter().enumerate() {
+            local_fn_map.insert(*word_id, (i as u32) + 1);
+        }
+
+        self.ensure_table_size(self.next_table_index)?;
+        let table_size = self.table_size();
+
+        let module_bytes = compile_consolidated_module(&words, &local_fn_map, table_size)
+            .map_err(|e| anyhow::anyhow!("batch compile error: {e}"))?;
+
+        self.total_module_bytes += module_bytes.len() as u64;
+        let module = Module::new(&self.engine, &module_bytes)?;
+        let instance = Instance::new(
+            &mut self.store,
+            &module,
+            &[
+                self.emit_func.into(),
+                self.memory.into(),
+                self.dsp.into(),
+                self.rsp.into(),
+                self.fsp.into(),
+                self.table.into(),
+            ],
+        )?;
+
+        for (i, (word_id, _)) in words.iter().enumerate() {
+            let func = instance
+                .get_func(&mut self.store, &format!("fn_{i}"))
+                .ok_or_else(|| anyhow::anyhow!("missing batch export fn_{i}"))?;
+            self.table
+                .set(&mut self.store, word_id.0 as u64, Ref::Func(Some(func)))?;
+        }
+
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // WASM instantiation
     // -----------------------------------------------------------------------
@@ -1860,19 +1910,23 @@ impl ForthVM {
             .create(name, immediate)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         self.ir_bodies.insert(word_id, ir_body.clone());
-
-        let config = CodegenConfig {
-            base_fn_index: word_id.0,
-            table_size: self.table_size(),
-            stack_to_local_promotion: self.config.codegen.stack_to_local_promotion,
-        };
-        let compiled = compile_word(name, &ir_body, &config)
-            .map_err(|e| anyhow::anyhow!("codegen error for {name}: {e}"))?;
-
-        self.instantiate_and_install(&compiled, word_id)?;
         self.dictionary.reveal();
         self.sync_word_lookup(name, word_id, immediate);
         self.next_table_index = self.next_table_index.max(word_id.0 + 1);
+
+        if self.batch_mode {
+            // Defer WASM compilation for batch processing
+            self.deferred_ir.push((word_id, ir_body));
+        } else {
+            let config = CodegenConfig {
+                base_fn_index: word_id.0,
+                table_size: self.table_size(),
+                stack_to_local_promotion: self.config.codegen.stack_to_local_promotion,
+            };
+            let compiled = compile_word(name, &ir_body, &config)
+                .map_err(|e| anyhow::anyhow!("codegen error for {name}: {e}"))?;
+            self.instantiate_and_install(&compiled, word_id)?;
+        }
 
         Ok(word_id)
     }
@@ -1901,6 +1955,8 @@ impl ForthVM {
 
     /// Register all built-in primitive words.
     fn register_primitives(&mut self) -> anyhow::Result<()> {
+        self.batch_mode = true;
+
         // -- Stack manipulation --
         self.register_primitive("DUP", false, vec![IrOp::Dup])?;
         self.register_primitive("DROP", false, vec![IrOp::Drop])?;
@@ -2186,6 +2242,10 @@ impl ForthVM {
 
         // -- Floating-Point word set --
         self.register_float_words()?;
+
+        // Batch-compile all deferred IR primitives into a single WASM module
+        self.batch_mode = false;
+        self.batch_compile_deferred()?;
 
         Ok(())
     }
