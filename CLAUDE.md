@@ -2,7 +2,7 @@
 
 ## What is WAFER?
 
-WAFER (WebAssembly Forth Engine in Rust) is an optimizing Forth 2012 compiler targeting WebAssembly. Currently a working Forth system with 130+ words, JIT compilation, and 11 word sets at 100% compliance.
+WAFER (WebAssembly Forth Engine in Rust) is an optimizing Forth 2012 compiler targeting WebAssembly. Currently a working Forth system with 200+ words, JIT compilation, 12 word sets at 100% compliance, and a full optimization pipeline (peephole, constant folding, inlining, strength reduction, DCE, tail calls, stack-to-local promotion, consolidation).
 
 ## Architecture
 
@@ -19,6 +19,9 @@ WAFER (WebAssembly Forth Engine in Rust) is an optimizing Forth 2012 compiler ta
 - `crates/core/src/dictionary.rs` -- Dictionary data structure with create/find/reveal
 - `crates/core/src/ir.rs` -- IrOp enum (the intermediate representation)
 - `crates/core/src/memory.rs` -- Memory layout constants (stack regions, dictionary base, etc.)
+- `crates/core/src/optimizer.rs` -- IR optimization passes (peephole, fold, inline, DCE, etc.)
+- `crates/core/src/config.rs` -- WaferConfig: unified optimization configuration
+- `crates/core/src/consolidate.rs` -- Consolidation recompiler (single-module direct calls)
 - `crates/cli/src/main.rs` -- CLI REPL with rustyline
 
 ## Adding a New Word
@@ -51,7 +54,7 @@ Handle in `interpret_token_immediate()` or `compile_token()` as a special case.
 
 ## Testing
 
-- Run `cargo test --workspace` before committing (currently 261 unit + 11 compliance tests)
+- Run `cargo test --workspace` before committing (currently 392 tests: 380 unit + 1 benchmark + 11 compliance)
 - Forth 2012 compliance: `cargo test -p wafer-core --test compliance`
 - Test helper in outer.rs: `eval_output("forth code")` returns printed output as String
 - Test helper: `eval_stack("forth code")` returns data stack as Vec<i32>

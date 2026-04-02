@@ -31,7 +31,7 @@ This document describes every optimization that makes sense for WAFER, why it ma
 
 ## 1. Stack-to-Local Promotion
 
-**Status: Not implemented.** Type infrastructure exists (`crates/core/src/types.rs`) but is not wired into codegen.
+**Status: Phase 1 done.** Straight-line words (no control flow, calls, or I/O) use WASM locals instead of memory stack. Stack manipulation ops (Swap, Rot, Nip, Tuck, Dup, Drop) emit zero WASM instructions. Switchable via `WaferConfig::codegen.stack_to_local_promotion`.
 
 ### The Problem
 
@@ -105,7 +105,7 @@ When the compiler can statically determine the types and lifetimes of values on 
 
 ## 2. Peephole Optimization
 
-**Status: Not implemented.**
+**Status: Done.** Implemented in `optimizer.rs::peephole()`. Runs as fixpoint loop.
 
 A peephole optimizer scans adjacent IR operations and replaces recognized patterns with cheaper equivalents. This is the lowest-effort, highest-return IR pass because Forth's postfix style generates many redundant sequences.
 
@@ -134,7 +134,7 @@ A single function `fn peephole(ops: Vec<IrOp>) -> Vec<IrOp>` that makes repeated
 
 ## 3. Constant Folding
 
-**Status: Not implemented.**
+**Status: Done.** Implemented in `optimizer.rs::constant_fold()`. Folds binary and unary ops on known constants.
 
 When both operands of an operation are compile-time constants, compute the result at compile time.
 
@@ -163,7 +163,7 @@ A function `fn constant_fold(ops: Vec<IrOp>) -> Vec<IrOp>` that simulates a comp
 
 ## 4. Inlining
 
-**Status: Not implemented.**
+**Status: Done.** Implemented in `optimizer.rs::inline()`. Inlines word bodies <= 8 ops, non-recursive. TailCall converted back to Call when inlining. IR bodies stored in `ForthVM::ir_bodies`.
 
 Replace `Call(WordId)` with the callee's IR body, avoiding the `call_indirect` overhead and enabling further optimization of the combined code.
 
@@ -212,7 +212,7 @@ PushI32(34)
 
 ## 5. Strength Reduction
 
-**Status: Not implemented.**
+**Status: Done.** Implemented in `optimizer.rs::strength_reduce()`. Power-of-2 multiply to shift, zero comparisons to ZeroEq/ZeroLt.
 
 Replace expensive operations with cheaper equivalents when one operand is a known constant.
 
@@ -231,7 +231,7 @@ The most common case is `CELLS` which is defined as `PushI32(4), Mul`. Strength 
 
 ## 6. Dead Code Elimination
 
-**Status: Not implemented.**
+**Status: Done.** Implemented in `optimizer.rs::dce()`. Truncates after Exit, eliminates constant-conditional branches.
 
 Remove IR operations that can never execute or whose results are never used.
 
@@ -246,7 +246,7 @@ DCE should run after constant folding, since folding can create new constant con
 
 ## 7. Tail Call Optimization
 
-**Status: Partial.** `IrOp::TailCall(WordId)` exists in `ir.rs` and codegen handles it in `codegen.rs`, but the compiler never generates it.
+**Status: Done.** `optimizer.rs::tail_call_detect()` converts the last `Call` to `TailCall` when return stack is balanced. Codegen emits `call_indirect + return`.
 
 ### What Exists
 
@@ -272,7 +272,7 @@ Detection rule: if the last IR op in a word body (or in a branch of an `If`) is 
 
 ## 8. Consolidation
 
-**Status: Not implemented.** Stub exists at `crates/core/src/consolidate.rs`.
+**Status: Done.** `CONSOLIDATE` word recompiles all IR-based words into a single WASM module with direct `call` instructions. Implemented in `codegen.rs::compile_consolidated_module()` and `outer.rs::consolidate()`.
 
 ### The Idea
 
@@ -300,7 +300,7 @@ After interactive development, `CONSOLIDATE` recompiles all defined words into a
 
 ## 9. Compound IR Operations
 
-**Status: Not implemented.**
+**Status: Done.** `TwoDup` and `TwoDrop` IrOp variants with optimized codegen. Peephole converts `Over, Over -> TwoDup` and `Drop, Drop -> TwoDrop`.
 
 Some common multi-op sequences have more efficient WASM implementations than emitting each op individually.
 
@@ -342,7 +342,7 @@ These can be added as new `IrOp` variants recognized by peephole and emitted by 
 
 ## 10. Codegen Improvements
 
-**Status: Not implemented.**
+**Status: Done (DSP caching).** `$dsp` cached in WASM local 0, written back before calls and at function exit. Commutative optimization and loop index in local are future work.
 
 These are improvements within `codegen.rs` `emit_op()` that do not require new IR operations.
 
@@ -394,7 +394,7 @@ i32.add               ;; result on wasm stack
 
 ## 11. wasmtime Configuration
 
-**Status: Not implemented.** Currently using `Engine::default()`.
+**Status: Done.** NaN canonicalization disabled, module caching enabled via `cache_config_load_default()`.
 
 ### Available Knobs
 
@@ -410,7 +410,7 @@ Module caching is the most impactful: `wasmtime::Config::cache_config_load_defau
 
 ## 12. Dictionary Hash Index
 
-**Status: Not implemented.**
+**Status: Done.** `HashMap<String, (u32, u32, bool)>` in Dictionary struct. `find()` uses O(1) hash lookup with linked-list fallback. Updated on `reveal()` and `toggle_immediate()`.
 
 The dictionary lookup (`dictionary.rs` `find()`) walks a linked list from the most recent entry backward, comparing names character by character. After registering 80+ primitives plus user words, every lookup during compilation scans the full list.
 
@@ -422,7 +422,7 @@ This affects **compile time** (word lookup during parsing), not runtime (compile
 
 ## 13. Startup Batching
 
-**Status: Not implemented.** `compile_core_module()` stub exists in `codegen.rs`.
+**Status: Not started.** `compile_core_module()` stub exists in `codegen.rs`.
 
 Currently, each of the 80+ primitives registered at boot creates a separate WASM module: `wasm-encoder` builds it, `wasmparser` validates it, Cranelift compiles it, and wasmtime instantiates it. This happens 80+ times sequentially.
 
@@ -432,7 +432,7 @@ Batch all IR-based primitives into a single WASM module with multiple exported f
 
 ## 14. Float and Double-Cell Stack
 
-**Status: Not implemented.** `PushI64` and `PushF64` exist as IR ops but are stubs in codegen.
+**Status: Not started.** `PushI64` and `PushF64` exist as IR ops but are stubs in codegen. Float stack operations are currently all host functions.
 
 The float stack lives in its own memory region (0x2540--0x2D40). Float operations will have the same memory-based overhead as integer operations, but worse: `f64` values are 8 bytes, doubling the memory traffic per push/pop. Stack-to-local promotion (section 1) is even more impactful for floats because WASM has native `f64` locals and operand stack support.
 

@@ -8,10 +8,14 @@ WAFER (WebAssembly Forth Engine in Rust) is a Forth 2012 compiler that JIT-compi
 crates/
   core/src/
     outer.rs          ForthVM: outer interpreter, compiler, all primitives
-    codegen.rs        IR-to-WASM translation, module generation
-    dictionary.rs     Dictionary (linked list in Vec<u8>)
+    codegen.rs        IR-to-WASM translation, module generation, stack-to-local promotion
+    dictionary.rs     Dictionary (linked list in Vec<u8>, hash index for O(1) lookup)
     ir.rs             IrOp enum -- the intermediate representation
+    optimizer.rs      IR optimization passes (peephole, fold, inline, DCE, etc.)
+    config.rs         WaferConfig: unified optimization configuration
+    consolidate.rs    Consolidation recompiler (single-module direct calls)
     memory.rs         Memory layout constants (addresses, sizes)
+    types.rs          Stack type inference infrastructure
     error.rs          Error types
   cli/src/
     main.rs           CLI REPL (rustyline), file execution
@@ -23,7 +27,7 @@ tests/
     forth2012-test-suite/   Forth 2012 compliance test suite (submodule)
 ```
 
-The entire compiler and runtime lives in `outer.rs` (~5200 lines). Codegen is in `codegen.rs` (~1500 lines). Everything else is supporting infrastructure.
+The compiler and runtime lives in `outer.rs` (~10,400 lines). Codegen is in `codegen.rs` (~2,800 lines). The optimizer is in `optimizer.rs` (~800 lines). Everything else is supporting infrastructure.
 
 ## What Happens When You Start WAFER
 
@@ -39,6 +43,7 @@ wasmtime Store           Runtime state container
 Linear Memory            16 pages (1 MiB), expandable to 256 pages (16 MiB)
 Global: DSP              Data stack pointer, initialized to 0x1540
 Global: RSP              Return stack pointer, initialized to 0x2540
+Global: FSP              Float stack pointer, initialized to 0x2D40
 Function Table           256 funcref entries (grows as needed)
 ```
 

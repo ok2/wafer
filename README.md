@@ -6,7 +6,7 @@ An optimizing Forth 2012 compiler targeting WebAssembly.
 
 ## Status
 
-WAFER is a working Forth system. It JIT-compiles each word definition to a separate WASM module and executes via `wasmtime`. 310 tests passing (299 unit + 11 compliance), **0 errors on all 12 tested Forth 2012 word sets** including Floating-Point.
+WAFER is a working Forth system with an optimizing compiler. It JIT-compiles each word definition to a separate WASM module and executes via `wasmtime`. 392 tests passing (380 unit + 1 benchmark + 11 compliance), **0 errors on all 12 tested Forth 2012 word sets** including Floating-Point.
 
 **Working features:**
 
@@ -50,7 +50,7 @@ Forth Source -> Outer Interpreter -> IR -> [Optimize] -> WASM Codegen (wasm-enco
 
 - **Subroutine threading** via WASM function tables and `call_indirect`
 - **JIT mode**: each new word compiles to a separate WASM module linked to shared memory/globals/table
-- **IR-based pipeline** enables future optimization passes before WASM emission
+- **IR-based pipeline** with 6 optimization passes (peephole, constant folding, strength reduction, DCE, tail call detection, inlining) plus stack-to-local promotion and consolidation
 - **Dictionary**: linked-list word headers in simulated linear memory
 
 ## Building
@@ -75,11 +75,14 @@ echo ': SQUARE DUP * ; 7 SQUARE .' | cargo run -p wafer
 ## Testing
 
 ```bash
-# All tests (185 currently passing)
+# All tests (392 currently passing)
 cargo test --workspace
 
 # Forth 2012 compliance dashboard
 cargo test -p wafer-core --test compliance
+
+# Optimization benchmark report
+cargo test -p wafer-core --test benchmark_report -- --nocapture --ignored
 
 # Lints
 cargo clippy --workspace
@@ -117,7 +120,7 @@ tests/        Forth 2012 compliance suite (gerryjackson/forth2012-test-suite sub
 
 ### Not Yet Implemented
 
-11 word sets at 100% compliance: Core, Core Ext, Core Plus, Exception, Double-Number, String, Search-Order, Memory-Allocation, Programming-Tools, Facility, Locals. 130+ words including VALUE, DEFER, CASE, DOES>, CATCH/THROW, double-cell arithmetic, string operations.
+12 word sets at 100% compliance: Core, Core Ext, Core Plus, Exception, Double-Number, String, Search-Order, Memory-Allocation, Programming-Tools, Facility, Locals, Floating-Point. 200+ words including VALUE, DEFER, CASE, DOES>, CATCH/THROW, double-cell arithmetic, string operations, and 70+ floating-point words.
 
 ## Compliance Status
 
