@@ -18,6 +18,7 @@
 
 pub mod codegen;
 pub mod compiler;
+pub mod config;
 pub mod consolidate;
 pub mod dictionary;
 pub mod error;

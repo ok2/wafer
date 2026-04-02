@@ -85,6 +85,8 @@ pub struct CodegenConfig {
     pub base_fn_index: u32,
     /// Number of functions already in the table.
     pub table_size: u32,
+    /// Enable stack-to-local promotion for straight-line words.
+    pub stack_to_local_promotion: bool,
 }
 
 /// Result of compiling a word to WASM.
@@ -1457,7 +1459,7 @@ pub fn compile_word(
 
     // -- Code section --
     // Determine whether to use stack-to-local promotion
-    let promoted = is_promotable(body);
+    let promoted = config.stack_to_local_promotion && is_promotable(body);
     let scratch_count = count_scratch_locals(body);
     let num_locals = if promoted {
         let (preload, _) = compute_stack_needs(body);
@@ -1900,6 +1902,7 @@ mod tests {
         CodegenConfig {
             base_fn_index: 0,
             table_size: 16,
+            stack_to_local_promotion: true,
         }
     }
 
@@ -2123,6 +2126,7 @@ mod tests {
         let cfg = CodegenConfig {
             base_fn_index: 7,
             table_size: 16,
+            stack_to_local_promotion: true,
         };
         let m = compile_word("t", &[IrOp::PushI32(1)], &cfg).unwrap();
         assert_eq!(m.fn_index, 7);

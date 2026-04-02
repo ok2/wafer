@@ -39,6 +39,10 @@ run file:
 bench:
     cargo bench --workspace
 
+# Run optimization benchmark report
+bench-opts:
+    cargo test -p wafer-core --test benchmark_report -- --nocapture --ignored
+
 # Check dependency licenses and advisories
 deny:
     cargo deny check

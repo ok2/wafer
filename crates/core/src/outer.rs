@@ -17,6 +17,7 @@ use wasmtime::{
 };
 
 use crate::codegen::{CodegenConfig, CompiledModule, compile_consolidated_module, compile_word};
+use crate::config::WaferConfig;
 use crate::dictionary::{Dictionary, WordId};
 use crate::ir::IrOp;
 use crate::memory::{
@@ -24,7 +25,7 @@ use crate::memory::{
     INPUT_BUFFER_SIZE, RETURN_STACK_TOP, SYSVAR_BASE_VAR, SYSVAR_NUM_TIB, SYSVAR_STATE,
     SYSVAR_TO_IN,
 };
-use crate::optimizer::{OptConfig, optimize};
+use crate::optimizer::optimize;
 
 // ---------------------------------------------------------------------------
 // Control-flow compilation state
@@ -232,11 +233,20 @@ pub struct ForthVM {
     float_precision: Arc<Mutex<usize>>,
     /// Stored IR bodies for inlining optimization.
     ir_bodies: HashMap<WordId, Vec<IrOp>>,
+    /// Optimization configuration.
+    config: WaferConfig,
+    /// Total WASM module bytes compiled.
+    total_module_bytes: u64,
 }
 
 impl ForthVM {
     /// Boot a new Forth VM with all primitives registered.
     pub fn new() -> anyhow::Result<Self> {
+        Self::new_with_config(WaferConfig::default())
+    }
+
+    /// Boot a new Forth VM with custom optimization configuration.
+    pub fn new_with_config(wafer_config: WaferConfig) -> anyhow::Result<Self> {
         let mut config = wasmtime::Config::new();
         config.cranelift_nan_canonicalization(false);
         // Best-effort module caching
@@ -348,6 +358,8 @@ impl ForthVM {
             fvalue_words: std::collections::HashSet::new(),
             float_precision: Arc::new(Mutex::new(6)),
             ir_bodies: HashMap::new(),
+            config: wafer_config,
+            total_module_bytes: 0,
         };
 
         vm.register_primitives()?;
@@ -422,6 +434,11 @@ impl ForthVM {
             addr += CELL_SIZE;
         }
         stack
+    }
+
+    /// Total WASM module bytes compiled so far.
+    pub fn total_module_bytes(&self) -> u64 {
+        self.total_module_bytes
     }
 
     // -----------------------------------------------------------------------
@@ -1431,16 +1448,8 @@ impl ForthVM {
     }
 
     /// Run all enabled optimization passes on an IR sequence.
-    fn optimize_ir(ir: Vec<IrOp>, bodies: &HashMap<WordId, Vec<IrOp>>) -> Vec<IrOp> {
-        let config = OptConfig {
-            peephole: true,
-            constant_fold: true,
-            tail_call: true,
-            strength_reduce: true,
-            dce: true,
-            inline: true,
-        };
-        optimize(ir, &config, bodies)
+    fn optimize_ir(&self, ir: Vec<IrOp>, bodies: &HashMap<WordId, Vec<IrOp>>) -> Vec<IrOp> {
+        optimize(ir, &self.config.opt, bodies)
     }
 
     fn finish_colon_def(&mut self) -> anyhow::Result<()> {
@@ -1461,13 +1470,14 @@ impl ForthVM {
             .ok_or_else(|| anyhow::anyhow!("no word being compiled"))?;
         let ir = std::mem::take(&mut self.compiling_ir);
         let bodies = self.ir_bodies.clone();
-        let ir = Self::optimize_ir(ir, &bodies);
+        let ir = self.optimize_ir(ir, &bodies);
         self.ir_bodies.insert(word_id, ir.clone());
 
         // Compile to WASM
         let config = CodegenConfig {
             base_fn_index: word_id.0,
             table_size: self.table_size(),
+            stack_to_local_promotion: self.config.codegen.stack_to_local_promotion,
         };
         let compiled =
             compile_word(&name, &ir, &config).map_err(|e| anyhow::anyhow!("codegen error: {e}"))?;
@@ -1580,6 +1590,7 @@ impl ForthVM {
         word_id: WordId,
     ) -> anyhow::Result<()> {
         self.ensure_table_size(word_id.0)?;
+        self.total_module_bytes += compiled.bytes.len() as u64;
 
         let module = Module::new(&self.engine, &compiled.bytes)?;
         let instance = Instance::new(
@@ -1843,7 +1854,7 @@ impl ForthVM {
         ir_body: Vec<IrOp>,
     ) -> anyhow::Result<WordId> {
         let bodies = self.ir_bodies.clone();
-        let ir_body = Self::optimize_ir(ir_body, &bodies);
+        let ir_body = self.optimize_ir(ir_body, &bodies);
         let word_id = self
             .dictionary
             .create(name, immediate)
@@ -1853,6 +1864,7 @@ impl ForthVM {
         let config = CodegenConfig {
             base_fn_index: word_id.0,
             table_size: self.table_size(),
+            stack_to_local_promotion: self.config.codegen.stack_to_local_promotion,
         };
         let compiled = compile_word(name, &ir_body, &config)
             .map_err(|e| anyhow::anyhow!("codegen error for {name}: {e}"))?;
@@ -2380,6 +2392,7 @@ impl ForthVM {
         let config = CodegenConfig {
             base_fn_index: word_id.0,
             table_size: self.table_size(),
+            stack_to_local_promotion: self.config.codegen.stack_to_local_promotion,
         };
         let compiled = compile_word(&name, &ir_body, &config)
             .map_err(|e| anyhow::anyhow!("codegen error for VARIABLE {name}: {e}"))?;
@@ -2410,6 +2423,7 @@ impl ForthVM {
         let config = CodegenConfig {
             base_fn_index: word_id.0,
             table_size: self.table_size(),
+            stack_to_local_promotion: self.config.codegen.stack_to_local_promotion,
         };
         let compiled = compile_word(&name, &ir_body, &config)
             .map_err(|e| anyhow::anyhow!("codegen error for CONSTANT {name}: {e}"))?;
@@ -2445,6 +2459,7 @@ impl ForthVM {
         let config = CodegenConfig {
             base_fn_index: word_id.0,
             table_size: self.table_size(),
+            stack_to_local_promotion: self.config.codegen.stack_to_local_promotion,
         };
         let compiled = compile_word(&name, &ir_body, &config)
             .map_err(|e| anyhow::anyhow!("codegen error for CREATE {name}: {e}"))?;
@@ -2490,6 +2505,7 @@ impl ForthVM {
         let config = CodegenConfig {
             base_fn_index: word_id.0,
             table_size: self.table_size(),
+            stack_to_local_promotion: self.config.codegen.stack_to_local_promotion,
         };
         let compiled = compile_word(&name, &ir_body, &config)
             .map_err(|e| anyhow::anyhow!("codegen error for VALUE {name}: {e}"))?;
@@ -2533,6 +2549,7 @@ impl ForthVM {
         let config = CodegenConfig {
             base_fn_index: word_id.0,
             table_size: self.table_size(),
+            stack_to_local_promotion: self.config.codegen.stack_to_local_promotion,
         };
         let compiled = compile_word(&name, &ir_body, &config)
             .map_err(|e| anyhow::anyhow!("codegen error for DEFER {name}: {e}"))?;
@@ -2570,6 +2587,7 @@ impl ForthVM {
         let config = CodegenConfig {
             base_fn_index: word_id.0,
             table_size: self.table_size(),
+            stack_to_local_promotion: self.config.codegen.stack_to_local_promotion,
         };
         let compiled = compile_word(&name, &ir_body, &config)
             .map_err(|e| anyhow::anyhow!("codegen error for BUFFER: {name}: {e}"))?;
@@ -2601,6 +2619,7 @@ impl ForthVM {
         let config = CodegenConfig {
             base_fn_index: word_id.0,
             table_size: self.table_size(),
+            stack_to_local_promotion: self.config.codegen.stack_to_local_promotion,
         };
         let compiled = compile_word(&name, &ir_body, &config)
             .map_err(|e| anyhow::anyhow!("codegen error for MARKER {name}: {e}"))?;
@@ -3838,6 +3857,7 @@ impl ForthVM {
         let config = CodegenConfig {
             base_fn_index: word_id.0,
             table_size: self.table_size(),
+            stack_to_local_promotion: self.config.codegen.stack_to_local_promotion,
         };
         let name = self
             .dictionary
@@ -3931,6 +3951,7 @@ impl ForthVM {
             let config = CodegenConfig {
                 base_fn_index: second_word_id.0,
                 table_size: self.table_size(),
+                stack_to_local_promotion: self.config.codegen.stack_to_local_promotion,
             };
             let compiled = compile_word("_does_action2_", &second_ir, &config)
                 .map_err(|e| anyhow::anyhow!("codegen error for DOES> body 2: {e}"))?;
@@ -3981,6 +4002,7 @@ impl ForthVM {
         let config = CodegenConfig {
             base_fn_index: does_word_id.0,
             table_size: self.table_size(),
+            stack_to_local_promotion: self.config.codegen.stack_to_local_promotion,
         };
         let compiled = compile_word("_does_action_", &does_ir, &config)
             .map_err(|e| anyhow::anyhow!("codegen error for DOES> body: {e}"))?;
@@ -4007,6 +4029,7 @@ impl ForthVM {
         let config = CodegenConfig {
             base_fn_index: defining_word_id.0,
             table_size: self.table_size(),
+            stack_to_local_promotion: self.config.codegen.stack_to_local_promotion,
         };
         let compiled = compile_word(&defining_name, &[], &config)
             .map_err(|e| anyhow::anyhow!("codegen error for defining word: {e}"))?;
@@ -4066,6 +4089,7 @@ impl ForthVM {
             let config = CodegenConfig {
                 base_fn_index: new_word_id.0,
                 table_size: self.table_size(),
+                stack_to_local_promotion: self.config.codegen.stack_to_local_promotion,
             };
             let compiled = compile_word(&name, &ir_body, &config)
                 .map_err(|e| anyhow::anyhow!("codegen: {e}"))?;
@@ -4089,6 +4113,7 @@ impl ForthVM {
             let config = CodegenConfig {
                 base_fn_index: tmp_word_id.0,
                 table_size: self.table_size(),
+                stack_to_local_promotion: self.config.codegen.stack_to_local_promotion,
             };
             let compiled = compile_word("_create_part_", &create_ir, &config)
                 .map_err(|e| anyhow::anyhow!("codegen: {e}"))?;
@@ -4101,6 +4126,7 @@ impl ForthVM {
             let config = CodegenConfig {
                 base_fn_index: new_word_id.0,
                 table_size: self.table_size(),
+                stack_to_local_promotion: self.config.codegen.stack_to_local_promotion,
             };
             let compiled = compile_word(&name, &patched_ir, &config)
                 .map_err(|e| anyhow::anyhow!("DOES> patch codegen: {e}"))?;
@@ -4128,6 +4154,7 @@ impl ForthVM {
             let config = CodegenConfig {
                 base_fn_index: target_word_id.0,
                 table_size: self.table_size(),
+                stack_to_local_promotion: self.config.codegen.stack_to_local_promotion,
             };
             let compiled = compile_word(&name, &patched_ir, &config)
                 .map_err(|e| anyhow::anyhow!("DOES> patch codegen: {e}"))?;
@@ -5053,6 +5080,7 @@ impl ForthVM {
             let config = CodegenConfig {
                 base_fn_index: target_word_id.0,
                 table_size: self.table_size(),
+                stack_to_local_promotion: self.config.codegen.stack_to_local_promotion,
             };
             let compiled = compile_word(&name, &patched_ir, &config)
                 .map_err(|e| anyhow::anyhow!("runtime DOES> patch codegen: {e}"))?;
@@ -6589,6 +6617,7 @@ impl ForthVM {
         let config = CodegenConfig {
             base_fn_index: word_id.0,
             table_size: self.table_size(),
+            stack_to_local_promotion: self.config.codegen.stack_to_local_promotion,
         };
         let compiled = compile_word(&name, &ir, &config)
             .map_err(|e| anyhow::anyhow!("2CONSTANT codegen: {e}"))?;
@@ -6618,6 +6647,7 @@ impl ForthVM {
         let config = CodegenConfig {
             base_fn_index: word_id.0,
             table_size: self.table_size(),
+            stack_to_local_promotion: self.config.codegen.stack_to_local_promotion,
         };
         let compiled = compile_word(&name, &ir, &config)
             .map_err(|e| anyhow::anyhow!("2VARIABLE codegen: {e}"))?;
@@ -6660,6 +6690,7 @@ impl ForthVM {
         let config = CodegenConfig {
             base_fn_index: word_id.0,
             table_size: self.table_size(),
+            stack_to_local_promotion: self.config.codegen.stack_to_local_promotion,
         };
         let compiled = compile_word(&name, &ir, &config)
             .map_err(|e| anyhow::anyhow!("2VALUE codegen: {e}"))?;
@@ -7393,7 +7424,8 @@ impl ForthVM {
 
                     let flag: i32 = if result { -1 } else { 0 };
                     let dsp_val = dsp.get(&mut caller).unwrap_i32() as u32;
-                    let new_dsp = dsp_val.checked_sub(CELL_SIZE)
+                    let new_dsp = dsp_val
+                        .checked_sub(CELL_SIZE)
                         .ok_or_else(|| wasmtime::Error::msg("data stack overflow in F~"))?;
                     dsp.set(&mut caller, Val::I32(new_dsp as i32)).unwrap();
                     let mem = memory.data_mut(&mut caller);
@@ -8340,6 +8372,7 @@ impl ForthVM {
         let config = CodegenConfig {
             base_fn_index: word_id.0,
             table_size: self.table_size(),
+            stack_to_local_promotion: self.config.codegen.stack_to_local_promotion,
         };
         let compiled = compile_word(&name, &ir_body, &config)
             .map_err(|e| anyhow::anyhow!("codegen error for FVARIABLE {name}: {e}"))?;
