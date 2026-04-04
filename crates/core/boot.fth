@@ -105,3 +105,11 @@
 
 \ DU< ( ud1 ud2 -- flag )  unsigned double-cell less-than
 : DU<  ROT 2DUP = IF 2DROP U< ELSE U< NIP NIP THEN ;
+
+\ ---------------------------------------------------------------
+\ Phase 3: Mixed arithmetic (built on M* and UM/MOD host primitives)
+\ ---------------------------------------------------------------
+
+\ Phase 3 words (SM/REM, FM/MOD, */, */MOD) kept as Rust host functions
+\ for now due to return-stack depth interactions with DABS/DNEGATE.
+\ TODO: replace once return-stack nesting issue is resolved.
