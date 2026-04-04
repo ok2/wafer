@@ -172,7 +172,7 @@ fn collect_external_calls(ops: &[IrOp], ir_ids: &HashSet<WordId>, host_ids: &mut
 }
 
 /// Serialize export metadata to JSON (hand-rolled, no serde dependency).
-fn serialize_metadata(m: &ExportMetadata) -> String {
+pub fn serialize_metadata(m: &ExportMetadata) -> String {
     let mut s = String::from("{\n");
     let _ = writeln!(s, "  \"version\": {},", m.version);
     match m.entry_table_index {

@@ -1523,6 +1523,7 @@ dependencies = [
  "clap",
  "rustyline",
  "wafer-core",
+ "wasmtime",
 ]
 
 [[package]]

@@ -1,11 +1,17 @@
 //! WAFER CLI: Interactive REPL, AOT compiler, and WASM runner for WAFER Forth.
 
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use clap::{Parser, Subcommand};
-use wafer_core::export::{ExportConfig, export_module};
+use wafer_core::export::{ExportConfig, export_module, serialize_metadata};
 use wafer_core::outer::ForthVM;
-use wafer_core::runner::run_wasm_file;
+use wafer_core::runner::{run_precompiled_bytes, run_wasm_file};
+
+/// 8-byte magic trailer identifying a native WAFER executable.
+const NATIVE_MAGIC: &[u8; 8] = b"WAFEREXE";
+/// Size of the trailer: `payload_len`(8) + `metadata_len`(8) + magic(8).
+const TRAILER_SIZE: u64 = 24;
 
 /// WAFER: WebAssembly Forth Engine in Rust
 #[derive(Parser, Debug)]
@@ -25,7 +31,7 @@ enum Commands {
         /// Input Forth source file
         file: String,
 
-        /// Output .wasm file (default: input with .wasm extension)
+        /// Output file (default: input stem + .wasm, or no extension with --native)
         #[arg(short, long)]
         output: Option<String>,
 
@@ -36,6 +42,10 @@ enum Commands {
         /// Also generate a JS loader and HTML page for browser execution
         #[arg(long)]
         js: bool,
+
+        /// Produce a standalone native executable (AOT-compiled)
+        #[arg(long)]
+        native: bool,
     },
 
     /// Run a pre-compiled WASM module
@@ -46,6 +56,15 @@ enum Commands {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Check for embedded payload before CLI parsing. If this binary has
+    // an appended WASM payload (produced by --native), run it directly.
+    if let Some(output) = check_embedded_payload()? {
+        if !output.is_empty() {
+            print!("{output}");
+        }
+        return Ok(());
+    }
+
     let cli = Cli::parse();
 
     match cli.command {
@@ -54,7 +73,8 @@ fn main() -> anyhow::Result<()> {
             output,
             entry,
             js,
-        }) => cmd_build(&file, output.as_deref(), entry, js),
+            native,
+        }) => cmd_build(&file, output.as_deref(), entry, js, native),
 
         Some(Commands::Run { file }) => cmd_run(&file),
 
@@ -62,12 +82,57 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-/// `wafer build program.fth -o program.wasm`
+/// Check if this executable has an appended WAFER payload.
+///
+/// Returns `Some(output)` if a payload was found and executed,
+/// `None` if this is a normal wafer binary.
+fn check_embedded_payload() -> anyhow::Result<Option<String>> {
+    let Ok(exe_path) = std::env::current_exe() else {
+        return Ok(None);
+    };
+    let Ok(mut file) = std::fs::File::open(&exe_path) else {
+        return Ok(None);
+    };
+    let file_len = file.seek(SeekFrom::End(0))?;
+    if file_len < TRAILER_SIZE {
+        return Ok(None);
+    }
+
+    // Read the 24-byte trailer.
+    file.seek(SeekFrom::End(-(TRAILER_SIZE as i64)))?;
+    let mut trailer = [0u8; TRAILER_SIZE as usize];
+    file.read_exact(&mut trailer)?;
+
+    // Check magic.
+    if &trailer[16..24] != NATIVE_MAGIC {
+        return Ok(None);
+    }
+
+    let payload_len = u64::from_le_bytes(trailer[0..8].try_into().unwrap());
+    let metadata_len = u64::from_le_bytes(trailer[8..16].try_into().unwrap());
+
+    // Read the payload and metadata.
+    let data_start = file_len - TRAILER_SIZE - metadata_len - payload_len;
+    file.seek(SeekFrom::Start(data_start))?;
+
+    let mut payload = vec![0u8; payload_len as usize];
+    file.read_exact(&mut payload)?;
+
+    let mut metadata_bytes = vec![0u8; metadata_len as usize];
+    file.read_exact(&mut metadata_bytes)?;
+
+    let metadata_json = String::from_utf8_lossy(&metadata_bytes);
+    let output = run_precompiled_bytes(&payload, &metadata_json)?;
+    Ok(Some(output))
+}
+
+/// `wafer build program.fth -o program.wasm [--native]`
 fn cmd_build(
     file: &str,
     output: Option<&str>,
     entry: Option<String>,
     js: bool,
+    native: bool,
 ) -> anyhow::Result<()> {
     let source = std::fs::read_to_string(file)?;
 
@@ -92,18 +157,25 @@ fn cmd_build(
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("out");
-            format!("{stem}.wasm")
+            if native {
+                stem.to_string()
+            } else {
+                format!("{stem}.wasm")
+            }
         }
     };
 
-    std::fs::write(&out_path, &wasm_bytes)?;
-
-    let word_count = vm.ir_words().len();
-    let host_count = metadata.host_functions.len();
-    eprintln!(
-        "Wrote {out_path} ({} bytes, {word_count} words, {host_count} host functions)",
-        wasm_bytes.len()
-    );
+    if native {
+        build_native(&wasm_bytes, &metadata, &out_path)?;
+    } else {
+        std::fs::write(&out_path, &wasm_bytes)?;
+        let word_count = vm.ir_words().len();
+        let host_count = metadata.host_functions.len();
+        eprintln!(
+            "Wrote {out_path} ({} bytes, {word_count} words, {host_count} host functions)",
+            wasm_bytes.len()
+        );
+    }
 
     if js {
         let out = Path::new(&out_path);
@@ -125,6 +197,55 @@ fn cmd_build(
         std::fs::write(&html_path, &html_code)?;
         eprintln!("Wrote {} and {}", js_path.display(), html_path.display());
     }
+
+    Ok(())
+}
+
+/// Build a native executable by appending AOT-compiled WASM to the wafer binary.
+fn build_native(
+    wasm_bytes: &[u8],
+    metadata: &wafer_core::export::ExportMetadata,
+    out_path: &str,
+) -> anyhow::Result<()> {
+    // AOT precompile the WASM to native code.
+    let mut config = wasmtime::Config::new();
+    config.cranelift_nan_canonicalization(false);
+    let engine = wasmtime::Engine::new(&config)?;
+    let precompiled = engine.precompile_module(wasm_bytes)?;
+
+    // Read the current wafer binary.
+    let self_exe = std::env::current_exe()?;
+    let self_bytes = std::fs::read(&self_exe)?;
+
+    // Serialize metadata.
+    let metadata_json = serialize_metadata(metadata);
+    let metadata_bytes = metadata_json.as_bytes();
+
+    // Assemble: wafer binary + precompiled payload + metadata + trailer.
+    let mut out = Vec::with_capacity(
+        self_bytes.len() + precompiled.len() + metadata_bytes.len() + TRAILER_SIZE as usize,
+    );
+    out.extend_from_slice(&self_bytes);
+    out.extend_from_slice(&precompiled);
+    out.extend_from_slice(metadata_bytes);
+    out.extend_from_slice(&(precompiled.len() as u64).to_le_bytes());
+    out.extend_from_slice(&(metadata_bytes.len() as u64).to_le_bytes());
+    out.extend_from_slice(NATIVE_MAGIC);
+
+    std::fs::write(out_path, &out)?;
+
+    // Make executable on Unix.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(out_path, std::fs::Permissions::from_mode(0o755))?;
+    }
+
+    eprintln!(
+        "Wrote {out_path} ({:.1} MB native executable, {:.0} KB precompiled WASM)",
+        out.len() as f64 / 1_048_576.0,
+        precompiled.len() as f64 / 1024.0
+    );
 
     Ok(())
 }
@@ -155,7 +276,7 @@ fn cmd_eval_or_repl(file: Option<&str>) -> anyhow::Result<()> {
             if !stdin_is_tty() {
                 // Non-interactive: read all of stdin and evaluate
                 let mut input = String::new();
-                std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
+                Read::read_to_string(&mut std::io::stdin(), &mut input)?;
                 for line in input.lines() {
                     match vm.evaluate(line) {
                         Ok(()) => {

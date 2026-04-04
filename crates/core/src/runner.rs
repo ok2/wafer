@@ -10,14 +10,21 @@ use wasmtime::{
     TableType, Val, ValType,
 };
 
-use crate::export::deserialize_metadata;
+use crate::export::{ExportMetadata, deserialize_metadata};
 use crate::memory::{CELL_SIZE, DATA_STACK_TOP, SYSVAR_BASE_VAR};
 
 /// Host state for the runner (currently unused by wasmtime `Store` but
 /// required as the generic parameter).
 struct RunnerHost {}
 
-/// Execute a pre-compiled `.wasm` module and return its output.
+/// Create a wasmtime engine with the standard WAFER configuration.
+fn make_engine() -> anyhow::Result<Engine> {
+    let mut config = wasmtime::Config::new();
+    config.cranelift_nan_canonicalization(false);
+    Engine::new(&config)
+}
+
+/// Execute a pre-compiled `.wasm` module from a file path.
 pub fn run_wasm_file(path: &str) -> anyhow::Result<String> {
     let wasm_bytes = std::fs::read(path)?;
     run_wasm_bytes(&wasm_bytes)
@@ -25,20 +32,40 @@ pub fn run_wasm_file(path: &str) -> anyhow::Result<String> {
 
 /// Execute WASM bytes directly (used by tests and the CLI).
 pub fn run_wasm_bytes(wasm_bytes: &[u8]) -> anyhow::Result<String> {
-    // Parse the "wafer" custom section for metadata.
     let metadata_json = extract_custom_section(wasm_bytes, "wafer")?;
     let metadata = deserialize_metadata(&metadata_json)?;
+    let engine = make_engine()?;
+    let module = Module::new(&engine, wasm_bytes)?;
+    run_module(&engine, module, &metadata)
+}
 
-    // Set up wasmtime runtime.
-    let mut config = wasmtime::Config::new();
-    config.cranelift_nan_canonicalization(false);
-    let engine = Engine::new(&config)?;
+/// Execute an AOT-precompiled module with separate metadata.
+///
+/// The `precompiled` bytes must have been produced by
+/// `Engine::precompile_module` with a compatible wasmtime version
+/// and platform.
+#[allow(unsafe_code)]
+pub fn run_precompiled_bytes(precompiled: &[u8], metadata_json: &str) -> anyhow::Result<String> {
+    let metadata = deserialize_metadata(metadata_json)?;
+    let engine = make_engine()?;
+    // SAFETY: precompiled bytes are produced by wafer build --native using
+    // the same wasmtime version. The caller guarantees compatibility.
+    let module = unsafe { Module::deserialize(&engine, precompiled)? };
+    run_module(&engine, module, &metadata)
+}
 
+/// Shared runner logic: given a compiled module and metadata, set up the
+/// six WASM imports, register host functions, call `_start`, return output.
+fn run_module(
+    engine: &Engine,
+    module: Module,
+    metadata: &ExportMetadata,
+) -> anyhow::Result<String> {
     let output = Arc::new(Mutex::new(String::new()));
-    let mut store = Store::new(&engine, RunnerHost {});
+    let mut store = Store::new(engine, RunnerHost {});
 
     // Create the 6 imports the module expects.
-    let memory_pages = metadata.memory_size.div_ceil(65536).max(16); // at least 16 pages like the VM
+    let memory_pages = metadata.memory_size.div_ceil(65536).max(16);
     let memory = Memory::new(&mut store, MemoryType::new(memory_pages, None))?;
 
     let dsp = Global::new(
@@ -57,24 +84,15 @@ pub fn run_wasm_bytes(wasm_bytes: &[u8]) -> anyhow::Result<String> {
         Val::I32(metadata.fsp_init as i32),
     )?;
 
-    // Determine table size from the module's import.
-    let parsed = wasmparser::Parser::new(0).parse_all(wasm_bytes);
-    let mut table_min: u64 = 256;
-    for payload in parsed {
-        if let wasmparser::Payload::ImportSection(reader) = payload? {
-            for import in reader {
-                let import = import?;
-                if import.name == "table"
-                    && let wasmparser::TypeRef::Table(t) = import.ty
-                {
-                    table_min = t.initial;
-                }
-            }
-        }
-    }
+    // Determine table size from the module's imports.
+    let table_min: u32 = module
+        .imports()
+        .find(|i| i.name() == "table")
+        .and_then(|i| i.ty().table().map(|t| t.minimum() as u32))
+        .unwrap_or(256);
     let table = Table::new(
         &mut store,
-        TableType::new(wasmtime::RefType::FUNCREF, table_min as u32, None),
+        TableType::new(wasmtime::RefType::FUNCREF, table_min, None),
         Ref::Func(None),
     )?;
 
@@ -82,7 +100,7 @@ pub fn run_wasm_bytes(wasm_bytes: &[u8]) -> anyhow::Result<String> {
     let out_ref = Arc::clone(&output);
     let emit_func = Func::new(
         &mut store,
-        FuncType::new(&engine, [ValType::I32], []),
+        FuncType::new(engine, [ValType::I32], []),
         move |_caller, params, _results| {
             let code = params[0].unwrap_i32();
             if let Some(ch) = char::from_u32(code as u32) {
@@ -93,7 +111,6 @@ pub fn run_wasm_bytes(wasm_bytes: &[u8]) -> anyhow::Result<String> {
     );
 
     // Instantiate the module.
-    let module = Module::new(&engine, wasm_bytes)?;
     let instance = wasmtime::Instance::new(
         &mut store,
         &module,
@@ -109,7 +126,7 @@ pub fn run_wasm_bytes(wasm_bytes: &[u8]) -> anyhow::Result<String> {
 
     // Register host functions in the table at the metadata-specified indices.
     for (idx, name) in &metadata.host_functions {
-        let func = create_host_func(&mut store, &engine, memory, dsp, &output, name);
+        let func = create_host_func(&mut store, engine, memory, dsp, &output, name);
         table.set(&mut store, *idx as u64, Ref::Func(Some(func)))?;
     }
 
