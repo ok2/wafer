@@ -59,3 +59,49 @@
     2DUP + 1- C@ BL <> IF EXIT THEN
     1-
   REPEAT ;
+
+\ ---------------------------------------------------------------
+\ Phase 2: Double-cell arithmetic
+\ ---------------------------------------------------------------
+
+\ D+ ( d1 d2 -- d3 )  double-cell addition with carry
+: D+  >R SWAP >R  DUP >R + DUP R> U< IF R> R> + 1+ ELSE R> R> + THEN ;
+
+\ DNEGATE ( d -- -d )  double-cell negate (two's complement)
+: DNEGATE  INVERT SWAP INVERT SWAP  1 0 D+ ;
+
+\ D- ( d1 d2 -- d3 )  double-cell subtraction
+: D-  DNEGATE D+ ;
+
+\ DABS ( d -- |d| )  double-cell absolute value
+: DABS  DUP 0< IF DNEGATE THEN ;
+
+\ D0= ( d -- flag )  true if d is zero
+: D0=  OR 0= ;
+
+\ D0< ( d -- flag )  true if d is negative
+: D0<  NIP 0< ;
+
+\ D= ( d1 d2 -- flag )  true if d1 = d2
+: D=  D- D0= ;
+
+\ D< ( d1 d2 -- flag )  true if d1 < d2 (signed)
+: D<  D- D0< ;
+
+\ D2* ( d -- d*2 )  double-cell shift left
+: D2*  2DUP D+ ;
+
+\ D2/ ( d -- d/2 )  double-cell arithmetic shift right
+: D2/  DUP 1 AND 31 LSHIFT >R  2/ SWAP 1 RSHIFT R> OR SWAP ;
+
+\ DMAX ( d1 d2 -- d-max )  double-cell maximum
+: DMAX  2OVER 2OVER D< IF 2SWAP THEN 2DROP ;
+
+\ DMIN ( d1 d2 -- d-min )  double-cell minimum
+: DMIN  2OVER 2OVER D< INVERT IF 2SWAP THEN 2DROP ;
+
+\ M+ ( d n -- d+n )  add single to double
+: M+  S>D D+ ;
+
+\ DU< ( ud1 ud2 -- flag )  unsigned double-cell less-than
+: DU<  ROT 2DUP = IF 2DROP U< ELSE U< NIP NIP THEN ;
