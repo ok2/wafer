@@ -194,9 +194,8 @@ pub struct ForthVM {
     next_table_index: u32,
     // The emit function (shared across all instantiated modules)
     emit_func: Func,
-    // Dot (print number) function -- kept for potential future use
-    #[allow(dead_code)]
-    dot_func: Func,
+    // Map from WordId to name for host-function words (for export metadata).
+    host_word_names: HashMap<WordId, String>,
     // Shared HERE value for host functions (synced with user_here)
     here_cell: Option<Arc<Mutex<u32>>>,
     // User data allocation pointer in WASM linear memory.
@@ -241,6 +240,10 @@ pub struct ForthVM {
     batch_mode: bool,
     /// IR primitives deferred during `batch_mode` for single-module compilation.
     deferred_ir: Vec<(WordId, Vec<IrOp>)>,
+    /// Recorded top-level IR from interpretation mode (for `wafer build`).
+    toplevel_ir: Vec<IrOp>,
+    /// When true, interpretation-mode execution is recorded into `toplevel_ir`.
+    recording_toplevel: bool,
 }
 
 impl ForthVM {
@@ -306,21 +309,6 @@ impl ForthVM {
             },
         );
 
-        // Create dot host function: (i32) -> ()
-        // This is used to implement `.` -- it pops TOS and prints it.
-        // We create a host function that takes i32, converts to string, appends to output.
-        let out_ref2 = Arc::clone(&output);
-        let dot_func = Func::new(
-            &mut store,
-            FuncType::new(&engine, [ValType::I32], []),
-            move |_caller, params, _results| {
-                let n = params[0].unwrap_i32();
-                let s = format!("{n} ");
-                out_ref2.lock().unwrap().push_str(&s);
-                Ok(())
-            },
-        );
-
         let dictionary = Dictionary::new();
 
         let mut vm = ForthVM {
@@ -343,7 +331,7 @@ impl ForthVM {
             output,
             next_table_index: 0,
             emit_func,
-            dot_func,
+            host_word_names: HashMap::new(),
             here_cell: None,
             // User data starts at 64K in WASM memory, well clear of all system regions
             user_here: 0x10000,
@@ -366,6 +354,8 @@ impl ForthVM {
             total_module_bytes: 0,
             batch_mode: false,
             deferred_ir: Vec::new(),
+            toplevel_ir: Vec::new(),
+            recording_toplevel: false,
         };
 
         vm.register_primitives()?;
@@ -445,6 +435,69 @@ impl ForthVM {
     /// Total WASM module bytes compiled so far.
     pub fn total_module_bytes(&self) -> u64 {
         self.total_module_bytes
+    }
+
+    // -----------------------------------------------------------------------
+    // Export support: public accessors for `wafer build`
+    // -----------------------------------------------------------------------
+
+    /// Enable or disable top-level execution recording.
+    ///
+    /// When enabled, interpretation-mode word calls and literal pushes are
+    /// captured into an IR body that becomes the `_start` entry point in
+    /// exported WASM modules.
+    pub fn set_recording(&mut self, on: bool) {
+        self.recording_toplevel = on;
+    }
+
+    /// Return the recorded top-level IR (empty if recording was not enabled).
+    pub fn toplevel_ir(&self) -> &[IrOp] {
+        &self.toplevel_ir
+    }
+
+    /// Snapshot WASM linear memory from byte 0 through `user_here`.
+    ///
+    /// The returned bytes contain system variables, stack regions, and all
+    /// user-allocated data (VARIABLEs, strings, etc.). This becomes the
+    /// WASM data section in exported modules.
+    pub fn memory_snapshot(&mut self) -> Vec<u8> {
+        self.refresh_user_here();
+        let data = self.memory.data(&self.store);
+        let end = self.user_here as usize;
+        data[..end].to_vec()
+    }
+
+    /// Return all IR-based word bodies, sorted by `WordId`.
+    pub fn ir_words(&self) -> Vec<(WordId, Vec<IrOp>)> {
+        let mut words: Vec<(WordId, Vec<IrOp>)> = self
+            .ir_bodies
+            .iter()
+            .map(|(&id, body)| (id, body.clone()))
+            .collect();
+        words.sort_by_key(|(id, _)| id.0);
+        words
+    }
+
+    /// Map of host-function `WordId`s to their Forth names.
+    pub fn host_function_names(&self) -> &HashMap<WordId, String> {
+        &self.host_word_names
+    }
+
+    /// Resolve a word name to its `WordId`. Returns `None` if not found.
+    pub fn resolve_word(&self, name: &str) -> Option<WordId> {
+        self.dictionary
+            .find(&name.to_ascii_uppercase())
+            .map(|(_, id, _)| id)
+    }
+
+    /// Current function table size.
+    pub fn current_table_size(&self) -> u32 {
+        self.table.size(&self.store) as u32
+    }
+
+    /// Initial stack pointer values: (dsp, rsp, fsp).
+    pub fn stack_pointer_inits(&self) -> (u32, u32, u32) {
+        (DATA_STACK_TOP, RETURN_STACK_TOP, FLOAT_STACK_TOP)
     }
 
     // -----------------------------------------------------------------------
@@ -674,6 +727,9 @@ impl ForthVM {
                 return self.execute_does_defining(word_id);
             }
             self.execute_word(word_id)?;
+            if self.recording_toplevel && self.state == 0 {
+                self.toplevel_ir.push(IrOp::Call(word_id));
+            }
             return Ok(());
         }
 
@@ -681,18 +737,28 @@ impl ForthVM {
         if let Some((lo, hi)) = self.parse_double_number(token) {
             self.push_data_stack(lo)?;
             self.push_data_stack(hi)?;
+            if self.recording_toplevel && self.state == 0 {
+                self.toplevel_ir.push(IrOp::PushI32(lo));
+                self.toplevel_ir.push(IrOp::PushI32(hi));
+            }
             return Ok(());
         }
 
         // Try to parse as number
         if let Some(n) = self.parse_number(token) {
             self.push_data_stack(n)?;
+            if self.recording_toplevel && self.state == 0 {
+                self.toplevel_ir.push(IrOp::PushI32(n));
+            }
             return Ok(());
         }
 
         // Try to parse as float literal (contains 'E' or 'e')
         if let Some(f) = self.parse_float_literal(token) {
             self.fpush(f)?;
+            if self.recording_toplevel && self.state == 0 {
+                self.toplevel_ir.push(IrOp::PushF64(f));
+            }
             return Ok(());
         }
 
@@ -1949,6 +2015,8 @@ impl ForthVM {
         self.dictionary.reveal();
         self.sync_word_lookup(name, word_id, immediate);
         self.next_table_index = self.next_table_index.max(word_id.0 + 1);
+        self.host_word_names
+            .insert(word_id, name.to_ascii_uppercase());
 
         Ok(word_id)
     }
@@ -2260,19 +2328,18 @@ impl ForthVM {
             &mut self.store,
             FuncType::new(&self.engine, [], []),
             move |mut caller, _params, _results| {
-                // Read top of data stack
                 let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                if sp >= DATA_STACK_TOP {
+                    return Err(wasmtime::Error::msg("stack underflow"));
+                }
                 let data = memory.data(&caller);
                 let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
                 let value = i32::from_le_bytes(b);
-                // Read BASE from WASM memory
                 let b: [u8; 4] = data[SYSVAR_BASE_VAR as usize..SYSVAR_BASE_VAR as usize + 4]
                     .try_into()
                     .unwrap();
                 let base_val = u32::from_le_bytes(b);
-                // Increment dsp (pop)
                 dsp.set(&mut caller, Val::I32((sp + CELL_SIZE) as i32))?;
-                // Format number in current base
                 let s = format_signed(value, base_val);
                 output.lock().unwrap().push_str(&s);
                 Ok(())
@@ -2294,9 +2361,13 @@ impl ForthVM {
             FuncType::new(&self.engine, [], []),
             move |mut caller, _params, _results| {
                 let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let mut out = output.lock().unwrap();
+                if sp >= DATA_STACK_TOP {
+                    out.push_str("<0> ");
+                    return Ok(());
+                }
                 let data = memory.data(&caller);
                 let depth = (DATA_STACK_TOP - sp) / CELL_SIZE;
-                let mut out = output.lock().unwrap();
                 out.push_str(&format!("<{depth}> "));
                 // Print from bottom to top
                 let mut addr = DATA_STACK_TOP - CELL_SIZE;
@@ -2449,6 +2520,7 @@ impl ForthVM {
 
         // Compile a tiny word that pushes the variable's address
         let ir_body = vec![IrOp::PushI32(var_addr as i32)];
+        self.ir_bodies.insert(word_id, ir_body.clone());
         let config = CodegenConfig {
             base_fn_index: word_id.0,
             table_size: self.table_size(),
@@ -2480,6 +2552,7 @@ impl ForthVM {
 
         // Compile a word that pushes the constant value
         let ir_body = vec![IrOp::PushI32(value)];
+        self.ir_bodies.insert(word_id, ir_body.clone());
         let config = CodegenConfig {
             base_fn_index: word_id.0,
             table_size: self.table_size(),
@@ -2516,6 +2589,7 @@ impl ForthVM {
 
         // Compile a word that pushes the pfa
         let ir_body = vec![IrOp::PushI32(pfa as i32)];
+        self.ir_bodies.insert(word_id, ir_body.clone());
         let config = CodegenConfig {
             base_fn_index: word_id.0,
             table_size: self.table_size(),
@@ -2562,6 +2636,7 @@ impl ForthVM {
 
         // Compile a word that fetches from the value's address
         let ir_body = vec![IrOp::PushI32(val_addr as i32), IrOp::Fetch];
+        self.ir_bodies.insert(word_id, ir_body.clone());
         let config = CodegenConfig {
             base_fn_index: word_id.0,
             table_size: self.table_size(),
@@ -2606,6 +2681,7 @@ impl ForthVM {
 
         // Compile a word that fetches the xt and executes it
         let ir_body = vec![IrOp::PushI32(defer_addr as i32), IrOp::Fetch, IrOp::Execute];
+        self.ir_bodies.insert(word_id, ir_body.clone());
         let config = CodegenConfig {
             base_fn_index: word_id.0,
             table_size: self.table_size(),
@@ -2644,6 +2720,7 @@ impl ForthVM {
 
         // Compile a word that pushes the buffer address
         let ir_body = vec![IrOp::PushI32(buf_addr as i32)];
+        self.ir_bodies.insert(word_id, ir_body.clone());
         let config = CodegenConfig {
             base_fn_index: word_id.0,
             table_size: self.table_size(),
@@ -2676,6 +2753,7 @@ impl ForthVM {
 
         // Stub: marker word does nothing when executed
         let ir_body = vec![];
+        self.ir_bodies.insert(word_id, ir_body.clone());
         let config = CodegenConfig {
             base_fn_index: word_id.0,
             table_size: self.table_size(),
@@ -4146,6 +4224,7 @@ impl ForthVM {
 
             // Temporarily install a "push PFA" word (will be patched later)
             let ir_body = vec![IrOp::PushI32(pfa as i32)];
+            self.ir_bodies.insert(new_word_id, ir_body.clone());
             let config = CodegenConfig {
                 base_fn_index: new_word_id.0,
                 table_size: self.table_size(),
@@ -6674,6 +6753,7 @@ impl ForthVM {
         self.dictionary.reveal();
 
         let ir = vec![IrOp::PushI32(lo), IrOp::PushI32(hi)];
+        self.ir_bodies.insert(word_id, ir.clone());
         let config = CodegenConfig {
             base_fn_index: word_id.0,
             table_size: self.table_size(),
@@ -6704,6 +6784,7 @@ impl ForthVM {
         self.dictionary.reveal();
 
         let ir = vec![IrOp::PushI32(addr as i32)];
+        self.ir_bodies.insert(word_id, ir.clone());
         let config = CodegenConfig {
             base_fn_index: word_id.0,
             table_size: self.table_size(),
@@ -6747,6 +6828,7 @@ impl ForthVM {
             IrOp::PushI32((addr + 4) as i32),
             IrOp::Fetch,
         ];
+        self.ir_bodies.insert(word_id, ir.clone());
         let config = CodegenConfig {
             base_fn_index: word_id.0,
             table_size: self.table_size(),
@@ -8074,6 +8156,7 @@ impl ForthVM {
 
         // Compile a word that pushes the address onto the DATA stack
         let ir_body = vec![IrOp::PushI32(addr as i32)];
+        self.ir_bodies.insert(word_id, ir_body.clone());
         let config = CodegenConfig {
             base_fn_index: word_id.0,
             table_size: self.table_size(),

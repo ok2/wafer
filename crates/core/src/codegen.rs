@@ -10,9 +10,10 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 
 use wasm_encoder::{
-    BlockType, CodeSection, ConstExpr, ElementSection, Elements, EntityType, ExportKind,
-    ExportSection, Function, FunctionSection, GlobalType, ImportSection, Instruction, MemArg,
-    MemoryType, Module, RefType, TableType, TypeSection, ValType,
+    BlockType, CodeSection, ConstExpr, CustomSection, DataCountSection, DataSection,
+    ElementSection, Elements, EntityType, ExportKind, ExportSection, Function, FunctionSection,
+    GlobalType, ImportSection, Instruction, MemArg, MemoryType, Module, RefType, TableType,
+    TypeSection, ValType,
 };
 
 use crate::dictionary::WordId;
@@ -2062,25 +2063,50 @@ fn emit_consolidated_do_loop(
     f.instruction(&Instruction::Drop);
 }
 
-/// Compile all given words into a single consolidated WASM module.
+/// Optional extras for exportable modules (data section, entry point, metadata).
+pub struct ExportSections<'a> {
+    /// Memory snapshot to embed as a WASM data section.
+    pub memory_snapshot: &'a [u8],
+    /// If set, export this function index as `_start`.
+    pub entry_fn_index: Option<u32>,
+    /// JSON metadata to embed as a custom "wafer" section.
+    pub metadata_json: &'a [u8],
+}
+
+/// Compile multiple IR-based words into a single WASM module with direct calls.
 ///
-/// Each word becomes a function in the module. Calls between words within the
-/// module use direct `call` instructions instead of `call_indirect` through the
-/// function table, enabling Cranelift to inline and optimize across word
-/// boundaries.
-///
-/// # Arguments
-///
-/// * `words` - Words to consolidate, sorted by `WordId`. Each entry is
-///   `(WordId, Vec<IrOp>)` containing the word's IR body.
-/// * `local_fn_map` - Maps each `WordId` in the module to its WASM function
-///   index (imported functions come first, so defined functions start at 1).
-/// * `table_size` - Current function table size, used for table import minimum.
+/// Used at runtime by `CONSOLIDATE` and during startup batch compilation.
 pub fn compile_consolidated_module(
     words: &[(WordId, Vec<IrOp>)],
     local_fn_map: &HashMap<WordId, u32>,
     table_size: u32,
 ) -> WaferResult<Vec<u8>> {
+    compile_multi_word_module(words, local_fn_map, table_size, None)
+}
+
+/// Compile an exportable WASM module with embedded memory and metadata.
+///
+/// Same as [`compile_consolidated_module`] but adds a WASM data section
+/// (memory snapshot), an optional `_start` entry point export, and a
+/// custom "wafer" section with JSON metadata.
+pub fn compile_exportable_module(
+    words: &[(WordId, Vec<IrOp>)],
+    local_fn_map: &HashMap<WordId, u32>,
+    table_size: u32,
+    export: &ExportSections<'_>,
+) -> WaferResult<Vec<u8>> {
+    compile_multi_word_module(words, local_fn_map, table_size, Some(export))
+}
+
+/// Internal: build a multi-word WASM module. When `export` is `Some`, adds
+/// data section, entry-point export, and custom metadata section.
+fn compile_multi_word_module(
+    words: &[(WordId, Vec<IrOp>)],
+    local_fn_map: &HashMap<WordId, u32>,
+    table_size: u32,
+    export: Option<&ExportSections<'_>>,
+) -> WaferResult<Vec<u8>> {
+    let has_data = export.is_some_and(|e| !e.memory_snapshot.is_empty());
     let mut module = Module::new();
 
     // -- Type section --
@@ -2157,10 +2183,15 @@ pub fn compile_consolidated_module(
         // +1 because emit is imported function index 0
         exports.export(&name, ExportKind::Func, (i as u32) + 1);
     }
+    // Optionally export an entry point as "_start"
+    if let Some(e) = export
+        && let Some(fn_idx) = e.entry_fn_index
+    {
+        exports.export("_start", ExportKind::Func, fn_idx);
+    }
     module.section(&exports);
 
     // -- Element section: place each function in the table at its WordId slot --
-    // Use a single element section with one active segment per word.
     let mut elements = ElementSection::new();
     for (i, (word_id, _)) in words.iter().enumerate() {
         let offset = ConstExpr::i32_const(word_id.0 as i32);
@@ -2173,6 +2204,11 @@ pub fn compile_consolidated_module(
         );
     }
     module.section(&elements);
+
+    // -- DataCount section (required before Code when Data section is present) --
+    if has_data {
+        module.section(&DataCountSection { count: 1 });
+    }
 
     // -- Code section: emit each function body --
     let mut code = CodeSection::new();
@@ -2206,12 +2242,34 @@ pub fn compile_consolidated_module(
     }
     module.section(&code);
 
+    // -- Data section (memory snapshot for exportable modules) --
+    if let Some(e) = export
+        && !e.memory_snapshot.is_empty()
+    {
+        let mut data = DataSection::new();
+        data.active(
+            MEMORY_INDEX,
+            &ConstExpr::i32_const(0),
+            e.memory_snapshot.iter().copied(),
+        );
+        module.section(&data);
+    }
+
+    // -- Custom "wafer" section (metadata for exportable modules) --
+    if let Some(e) = export
+        && !e.metadata_json.is_empty()
+    {
+        module.section(&CustomSection {
+            name: Cow::Borrowed("wafer"),
+            data: Cow::Borrowed(e.metadata_json),
+        });
+    }
+
     let bytes = module.finish();
 
     // Validate
-    wasmparser::validate(&bytes).map_err(|e| {
-        WaferError::ValidationError(format!("Consolidated WASM failed validation: {e}"))
-    })?;
+    wasmparser::validate(&bytes)
+        .map_err(|e| WaferError::ValidationError(format!("WASM module failed validation: {e}")))?;
 
     Ok(bytes)
 }
