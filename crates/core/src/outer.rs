@@ -2119,8 +2119,7 @@ impl ForthVM {
         self.register_primitive("CHAR+", false, vec![IrOp::PushI32(1), IrOp::Add])?;
         self.register_align()?;
         self.register_aligned()?;
-        self.register_move()?;
-        self.register_fill()?;
+        // MOVE, FILL: defined in boot.fth
 
         // -- Priority 4: Stack/arithmetic --
         self.register_primitive("2DUP", false, vec![IrOp::Over, IrOp::Over])?;
@@ -2130,12 +2129,12 @@ impl ForthVM {
             false,
             vec![IrOp::Rot, IrOp::ToR, IrOp::Rot, IrOp::FromR],
         )?;
-        self.register_2over()?;
+        // 2OVER: defined in boot.fth
         self.register_qdup()?;
         self.register_pick()?;
         self.register_min()?;
         self.register_max()?;
-        self.register_within()?;
+        // WITHIN: defined in boot.fth
 
         // -- Priority 5: Comparison --
         self.register_primitive("0<>", false, vec![IrOp::ZeroEq, IrOp::ZeroEq])?;
@@ -2162,8 +2161,7 @@ impl ForthVM {
         // -- Priority 7: New core words --
         self.register_count()?;
         self.register_s_to_d()?;
-        self.register_cmove()?;
-        self.register_cmove_up()?;
+        // CMOVE, CMOVE>: defined in boot.fth
         self.register_find()?;
         self.register_to_in()?;
         self.register_state_var()?;
@@ -2202,9 +2200,7 @@ impl ForthVM {
         self.register_evaluate_word()?;
         self.register_word_word()?;
 
-        // 2@ and 2!
-        self.register_two_fetch()?;
-        self.register_two_store()?;
+        // 2@, 2!: defined in boot.fth
 
         // Pictured numeric output
         self.register_pictured_numeric()?;
@@ -2238,8 +2234,7 @@ impl ForthVM {
             vec![IrOp::PushI32(crate::memory::PAD_BASE as i32)],
         )?;
 
-        // ERASE ( addr u -- ) fill memory with zeros
-        self.register_erase()?;
+        // ERASE: defined in boot.fth
 
         // .R and U.R
         self.register_dot_r()?;
@@ -2298,15 +2293,13 @@ impl ForthVM {
         self.register_m_star_slash()?;
         self.register_d_dot()?;
         self.register_d_dot_r()?;
-        self.register_2rot()?;
+        // 2ROT: defined in boot.fth
         self.register_du_lt()?;
 
         // -- String word set --
         self.register_compare()?;
         self.register_search()?;
-        self.register_slash_string()?;
-        self.register_blank()?;
-        self.register_minus_trailing()?;
+        // /STRING, BLANK, -TRAILING: defined in boot.fth
 
         // -- Floating-Point word set --
         self.register_float_words()?;
@@ -2314,6 +2307,13 @@ impl ForthVM {
         // Batch-compile all deferred IR primitives into a single WASM module
         self.batch_mode = false;
         self.batch_compile_deferred()?;
+
+        // Load Forth bootstrap definitions (replaces many host functions).
+        // Evaluate line-by-line so `\` comments work correctly.
+        let boot = include_str!("../boot.fth");
+        for line in boot.lines() {
+            self.evaluate(line)?;
+        }
 
         Ok(())
     }
@@ -3191,150 +3191,9 @@ impl ForthVM {
         Ok(())
     }
 
-    /// MOVE -- ( src dst n -- ) memory move.
-    fn register_move(&mut self) -> anyhow::Result<()> {
-        let memory = self.memory;
-        let dsp = self.dsp;
-
-        let func = Func::new(
-            &mut self.store,
-            FuncType::new(&self.engine, [], []),
-            move |mut caller, _params, _results| {
-                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
-                let data = memory.data(&caller);
-                let mem_len = data.len();
-                // Pop n
-                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
-                let n_raw = i32::from_le_bytes(b);
-                // Pop dst
-                let b: [u8; 4] = data[(sp + 4) as usize..(sp + 8) as usize]
-                    .try_into()
-                    .unwrap();
-                let dst_raw = i32::from_le_bytes(b);
-                // Pop src
-                let b: [u8; 4] = data[(sp + 8) as usize..(sp + 12) as usize]
-                    .try_into()
-                    .unwrap();
-                let src_raw = i32::from_le_bytes(b);
-                dsp.set(&mut caller, Val::I32((sp + 12) as i32))?;
-                // If n <= 0, nothing to do
-                if n_raw <= 0 {
-                    return Ok(());
-                }
-                let n = n_raw as usize;
-                let src = src_raw as u32 as usize;
-                let dst = dst_raw as u32 as usize;
-                // Bounds check
-                if src.saturating_add(n) > mem_len || dst.saturating_add(n) > mem_len {
-                    return Err(wasmtime::Error::msg("MOVE: address out of range"));
-                }
-                // Perform copy (handle overlapping regions)
-                let data = memory.data_mut(&mut caller);
-                if src < dst && src + n > dst {
-                    // Overlapping, copy backwards
-                    for i in (0..n).rev() {
-                        data[dst + i] = data[src + i];
-                    }
-                } else {
-                    for i in 0..n {
-                        data[dst + i] = data[src + i];
-                    }
-                }
-                Ok(())
-            },
-        );
-
-        self.register_host_primitive("MOVE", false, func)?;
-        Ok(())
-    }
-
-    /// FILL -- ( addr n char -- ) fill memory.
-    fn register_fill(&mut self) -> anyhow::Result<()> {
-        let memory = self.memory;
-        let dsp = self.dsp;
-
-        let func = Func::new(
-            &mut self.store,
-            FuncType::new(&self.engine, [], []),
-            move |mut caller, _params, _results| {
-                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
-                let data = memory.data(&caller);
-                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
-                let ch = i32::from_le_bytes(b) as u8;
-                let b: [u8; 4] = data[(sp + 4) as usize..(sp + 8) as usize]
-                    .try_into()
-                    .unwrap();
-                let n_raw = i32::from_le_bytes(b);
-                let b: [u8; 4] = data[(sp + 8) as usize..(sp + 12) as usize]
-                    .try_into()
-                    .unwrap();
-                let addr_raw = i32::from_le_bytes(b);
-                dsp.set(&mut caller, Val::I32((sp + 12) as i32))?;
-                if n_raw <= 0 {
-                    return Ok(());
-                }
-                let n = n_raw as usize;
-                let addr = addr_raw as u32 as usize;
-                let mem_len = memory.data(&caller).len();
-                if addr.saturating_add(n) > mem_len {
-                    return Err(wasmtime::Error::msg("FILL: address out of range"));
-                }
-                let data = memory.data_mut(&mut caller);
-                for i in 0..n {
-                    data[addr + i] = ch;
-                }
-                Ok(())
-            },
-        );
-
-        self.register_host_primitive("FILL", false, func)?;
-        Ok(())
-    }
-
     // -----------------------------------------------------------------------
     // Priority 4: Stack/arithmetic host functions
     // -----------------------------------------------------------------------
-
-    /// 2OVER -- ( a b c d -- a b c d a b ) copy second pair over top pair.
-    fn register_2over(&mut self) -> anyhow::Result<()> {
-        let memory = self.memory;
-        let dsp = self.dsp;
-
-        let func = Func::new(
-            &mut self.store,
-            FuncType::new(&self.engine, [], []),
-            move |mut caller, _params, _results| {
-                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
-                let data = memory.data(&caller);
-                // Stack (top first): d at sp, c at sp+4, b at sp+8, a at sp+12
-                // We want to copy a and b on top
-                let b: [u8; 4] = data[(sp + 8) as usize..(sp + 12) as usize]
-                    .try_into()
-                    .unwrap();
-                let val_b = i32::from_le_bytes(b);
-                let b: [u8; 4] = data[(sp + 12) as usize..(sp + 16) as usize]
-                    .try_into()
-                    .unwrap();
-                let val_a = i32::from_le_bytes(b);
-                // Push a then b (a goes deeper, b on top)
-                let mem_len = memory.data(&caller).len() as u32;
-                if sp < 8 || sp > mem_len {
-                    return Err(wasmtime::Error::msg("data stack overflow in 2OVER"));
-                }
-                let new_sp = sp - 8;
-                let data = memory.data_mut(&mut caller);
-                // Write a at new_sp+4 (deeper), b at new_sp (top)
-                data[(new_sp + 4) as usize..(new_sp + 8) as usize]
-                    .copy_from_slice(&val_a.to_le_bytes());
-                data[new_sp as usize..(new_sp + 4) as usize].copy_from_slice(&val_b.to_le_bytes());
-                dsp.set(&mut caller, Val::I32(new_sp as i32))?;
-                Ok(())
-            },
-        );
-
-        self.register_host_primitive("2OVER", false, func)?;
-        Ok(())
-    }
 
     /// ?DUP -- ( x -- 0 | x x ) duplicate if non-zero.
     fn register_qdup(&mut self) -> anyhow::Result<()> {
@@ -3419,44 +3278,6 @@ impl ForthVM {
                 IrOp::Drop,
             ],
         )?;
-        Ok(())
-    }
-
-    /// WITHIN -- ( n lo hi -- flag )
-    fn register_within(&mut self) -> anyhow::Result<()> {
-        let memory = self.memory;
-        let dsp = self.dsp;
-
-        let func = Func::new(
-            &mut self.store,
-            FuncType::new(&self.engine, [], []),
-            move |mut caller, _params, _results| {
-                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
-                let data = memory.data(&caller);
-                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
-                let hi = i32::from_le_bytes(b);
-                let b: [u8; 4] = data[(sp + 4) as usize..(sp + 8) as usize]
-                    .try_into()
-                    .unwrap();
-                let lo = i32::from_le_bytes(b);
-                let b: [u8; 4] = data[(sp + 8) as usize..(sp + 12) as usize]
-                    .try_into()
-                    .unwrap();
-                let n = i32::from_le_bytes(b);
-                // WITHIN: true if lo <= n < hi (unsigned subtraction trick)
-                let result = ((n.wrapping_sub(lo)) as u32) < ((hi.wrapping_sub(lo)) as u32);
-                let flag: i32 = if result { -1 } else { 0 };
-                // Pop 3, push 1: net = sp + 8
-                let new_sp = sp + 8;
-                let data = memory.data_mut(&mut caller);
-                let bytes = flag.to_le_bytes();
-                data[new_sp as usize..new_sp as usize + 4].copy_from_slice(&bytes);
-                dsp.set(&mut caller, Val::I32(new_sp as i32))?;
-                Ok(())
-            },
-        );
-
-        self.register_host_primitive("WITHIN", false, func)?;
         Ok(())
     }
 
@@ -4337,86 +4158,6 @@ impl ForthVM {
         Ok(())
     }
 
-    /// CMOVE ( src dst u -- ) copy u bytes from src to dst, low-to-high.
-    fn register_cmove(&mut self) -> anyhow::Result<()> {
-        let memory = self.memory;
-        let dsp = self.dsp;
-
-        let func = Func::new(
-            &mut self.store,
-            FuncType::new(&self.engine, [], []),
-            move |mut caller, _params, _results| {
-                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
-                let data = memory.data(&caller);
-                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
-                let u = i32::from_le_bytes(b) as usize;
-                let b: [u8; 4] = data[(sp + 4) as usize..(sp + 8) as usize]
-                    .try_into()
-                    .unwrap();
-                let dst = i32::from_le_bytes(b) as usize;
-                let b: [u8; 4] = data[(sp + 8) as usize..(sp + 12) as usize]
-                    .try_into()
-                    .unwrap();
-                let src = i32::from_le_bytes(b) as u32 as usize;
-                dsp.set(&mut caller, Val::I32((sp + 12) as i32))?;
-                if u > 0 {
-                    let mem_len = memory.data(&caller).len();
-                    if src.saturating_add(u) > mem_len || dst.saturating_add(u) > mem_len {
-                        return Err(wasmtime::Error::msg("CMOVE: address out of range"));
-                    }
-                    let data = memory.data_mut(&mut caller);
-                    for i in 0..u {
-                        data[dst + i] = data[src + i];
-                    }
-                }
-                Ok(())
-            },
-        );
-
-        self.register_host_primitive("CMOVE", false, func)?;
-        Ok(())
-    }
-
-    /// CMOVE> ( src dst u -- ) copy u bytes from src to dst, high-to-low.
-    fn register_cmove_up(&mut self) -> anyhow::Result<()> {
-        let memory = self.memory;
-        let dsp = self.dsp;
-
-        let func = Func::new(
-            &mut self.store,
-            FuncType::new(&self.engine, [], []),
-            move |mut caller, _params, _results| {
-                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
-                let data = memory.data(&caller);
-                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
-                let u = i32::from_le_bytes(b) as usize;
-                let b: [u8; 4] = data[(sp + 4) as usize..(sp + 8) as usize]
-                    .try_into()
-                    .unwrap();
-                let dst = i32::from_le_bytes(b) as usize;
-                let b: [u8; 4] = data[(sp + 8) as usize..(sp + 12) as usize]
-                    .try_into()
-                    .unwrap();
-                let src = i32::from_le_bytes(b) as u32 as usize;
-                dsp.set(&mut caller, Val::I32((sp + 12) as i32))?;
-                if u > 0 {
-                    let mem_len = memory.data(&caller).len();
-                    if src.saturating_add(u) > mem_len || dst.saturating_add(u) > mem_len {
-                        return Err(wasmtime::Error::msg("CMOVE>: address out of range"));
-                    }
-                    let data = memory.data_mut(&mut caller);
-                    for i in (0..u).rev() {
-                        data[dst + i] = data[src + i];
-                    }
-                }
-                Ok(())
-            },
-        );
-
-        self.register_host_primitive("CMOVE>", false, func)?;
-        Ok(())
-    }
-
     /// FIND ( c-addr -- c-addr 0 | xt 1 | xt -1 ) look up counted string.
     fn register_find(&mut self) -> anyhow::Result<()> {
         let memory = self.memory;
@@ -5259,92 +5000,6 @@ impl ForthVM {
     }
 
     // -----------------------------------------------------------------------
-    // 2@ and 2!
-    // -----------------------------------------------------------------------
-
-    /// 2@ ( addr -- x1 x2 ) Fetch two cells. x2 from addr, x1 from addr+CELL.
-    fn register_two_fetch(&mut self) -> anyhow::Result<()> {
-        let memory = self.memory;
-        let dsp = self.dsp;
-
-        let func = Func::new(
-            &mut self.store,
-            FuncType::new(&self.engine, [], []),
-            move |mut caller, _params, _results| {
-                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
-                let data = memory.data(&caller);
-                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
-                let addr = u32::from_le_bytes(b);
-                // x2 is at addr, x1 is at addr+4
-                let mem_len = data.len() as u32;
-                if addr.wrapping_add(8) > mem_len || addr > mem_len {
-                    return Err(wasmtime::Error::msg("2@: address out of range"));
-                }
-                let b: [u8; 4] = data[addr as usize..addr as usize + 4].try_into().unwrap();
-                let x2 = i32::from_le_bytes(b);
-                let b: [u8; 4] = data[(addr + 4) as usize..(addr + 8) as usize]
-                    .try_into()
-                    .unwrap();
-                let x1 = i32::from_le_bytes(b);
-                // Replace addr with x1, push x2
-                if sp < 4 || sp > mem_len {
-                    return Err(wasmtime::Error::msg("data stack overflow in 2@"));
-                }
-                let new_sp = sp - 4;
-                let data = memory.data_mut(&mut caller);
-                data[(new_sp + 4) as usize..(new_sp + 8) as usize]
-                    .copy_from_slice(&x1.to_le_bytes());
-                data[new_sp as usize..new_sp as usize + 4].copy_from_slice(&x2.to_le_bytes());
-                dsp.set(&mut caller, Val::I32(new_sp as i32))?;
-                Ok(())
-            },
-        );
-
-        self.register_host_primitive("2@", false, func)?;
-        Ok(())
-    }
-
-    /// 2! ( x1 x2 addr -- ) Store x2 at addr, x1 at addr+CELL.
-    fn register_two_store(&mut self) -> anyhow::Result<()> {
-        let memory = self.memory;
-        let dsp = self.dsp;
-
-        let func = Func::new(
-            &mut self.store,
-            FuncType::new(&self.engine, [], []),
-            move |mut caller, _params, _results| {
-                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
-                let data = memory.data(&caller);
-                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
-                let addr = u32::from_le_bytes(b);
-                let b: [u8; 4] = data[(sp + 4) as usize..(sp + 8) as usize]
-                    .try_into()
-                    .unwrap();
-                let x2 = i32::from_le_bytes(b);
-                let b: [u8; 4] = data[(sp + 8) as usize..(sp + 12) as usize]
-                    .try_into()
-                    .unwrap();
-                let x1 = i32::from_le_bytes(b);
-                // Store x2 at addr, x1 at addr+4
-                let mem_len = memory.data(&caller).len() as u32;
-                if addr.wrapping_add(8) > mem_len || addr > mem_len {
-                    dsp.set(&mut caller, Val::I32((sp + 12) as i32))?;
-                    return Err(wasmtime::Error::msg("2!: address out of range"));
-                }
-                let data = memory.data_mut(&mut caller);
-                data[addr as usize..addr as usize + 4].copy_from_slice(&x2.to_le_bytes());
-                data[(addr + 4) as usize..(addr + 8) as usize].copy_from_slice(&x1.to_le_bytes());
-                // Pop 3 cells
-                dsp.set(&mut caller, Val::I32((sp + 12) as i32))?;
-                Ok(())
-            },
-        );
-
-        self.register_host_primitive("2!", false, func)?;
-        Ok(())
-    }
-
-    // -----------------------------------------------------------------------
     // Pictured numeric output: <# # #S #> HOLD SIGN
     // -----------------------------------------------------------------------
 
@@ -5704,42 +5359,6 @@ impl ForthVM {
         );
 
         self.register_host_primitive("2R@", false, func)?;
-        Ok(())
-    }
-
-    /// ERASE ( addr u -- ) fill memory with zeros.
-    fn register_erase(&mut self) -> anyhow::Result<()> {
-        let memory = self.memory;
-        let dsp = self.dsp;
-
-        let func = Func::new(
-            &mut self.store,
-            FuncType::new(&self.engine, [], []),
-            move |mut caller, _params, _results| {
-                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
-                let data = memory.data(&caller);
-                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
-                let u = i32::from_le_bytes(b) as usize;
-                let b: [u8; 4] = data[(sp + 4) as usize..(sp + 8) as usize]
-                    .try_into()
-                    .unwrap();
-                let addr = i32::from_le_bytes(b) as u32 as usize;
-                dsp.set(&mut caller, Val::I32((sp + 8) as i32))?;
-                if u > 0 {
-                    let mem_len = memory.data(&caller).len();
-                    if addr.saturating_add(u) > mem_len {
-                        return Err(wasmtime::Error::msg("ERASE: address out of range"));
-                    }
-                    let data = memory.data_mut(&mut caller);
-                    for i in 0..u {
-                        data[addr + i] = 0;
-                    }
-                }
-                Ok(())
-            },
-        );
-
-        self.register_host_primitive("ERASE", false, func)?;
         Ok(())
     }
 
@@ -6665,42 +6284,6 @@ impl ForthVM {
         Ok(())
     }
 
-    /// 2ROT ( x1 x2 x3 x4 x5 x6 -- x3 x4 x5 x6 x1 x2 ) rotate three pairs.
-    fn register_2rot(&mut self) -> anyhow::Result<()> {
-        let memory = self.memory;
-        let dsp = self.dsp;
-
-        let func = Func::new(
-            &mut self.store,
-            FuncType::new(&self.engine, [], []),
-            move |mut caller, _params, _results| {
-                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
-                let data = memory.data(&caller);
-                // Stack: x6(sp), x5(sp+4), x4(sp+8), x3(sp+12), x2(sp+16), x1(sp+20)
-                let mut vals = [0i32; 6];
-                for (i, val) in vals.iter_mut().enumerate() {
-                    let off = (sp + i as u32 * 4) as usize;
-                    let b: [u8; 4] = data[off..off + 4].try_into().unwrap();
-                    *val = i32::from_le_bytes(b);
-                }
-                // Want: x6(sp), x5(sp+4), x4(sp+8), x3(sp+12) stay as x4,x3,x2,x1
-                // Actually: ( x1 x2 x3 x4 x5 x6 -- x3 x4 x5 x6 x1 x2 )
-                // Stack top-first: [x6, x5, x4, x3, x2, x1]
-                // Result top-first: [x2, x1, x6, x5, x4, x3]
-                let new_vals = [vals[4], vals[5], vals[0], vals[1], vals[2], vals[3]];
-                let data = memory.data_mut(&mut caller);
-                for (i, new_val) in new_vals.iter().enumerate() {
-                    let off = (sp + i as u32 * 4) as usize;
-                    data[off..off + 4].copy_from_slice(&new_val.to_le_bytes());
-                }
-                Ok(())
-            },
-        );
-
-        self.register_host_primitive("2ROT", false, func)?;
-        Ok(())
-    }
-
     /// DU< ( ud1 ud2 -- flag ) unsigned double-cell comparison.
     fn register_du_lt(&mut self) -> anyhow::Result<()> {
         let memory = self.memory;
@@ -7035,121 +6618,6 @@ impl ForthVM {
         );
 
         self.register_host_primitive("SEARCH", false, func)?;
-        Ok(())
-    }
-
-    /// /STRING ( c-addr u n -- c-addr+n u-n ) adjust string.
-    fn register_slash_string(&mut self) -> anyhow::Result<()> {
-        // ( c-addr u n -- c-addr+n u-n )
-        // ROT ROT + SWAP ROT - -- hmm, simpler with host fn
-        let memory = self.memory;
-        let dsp = self.dsp;
-
-        let func = Func::new(
-            &mut self.store,
-            FuncType::new(&self.engine, [], []),
-            move |mut caller, _params, _results| {
-                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
-                let data = memory.data(&caller);
-                // Stack: n(sp), u(sp+4), c-addr(sp+8)
-                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
-                let n = i32::from_le_bytes(b);
-                let b: [u8; 4] = data[(sp + 4) as usize..(sp + 8) as usize]
-                    .try_into()
-                    .unwrap();
-                let u = i32::from_le_bytes(b);
-                let b: [u8; 4] = data[(sp + 8) as usize..(sp + 12) as usize]
-                    .try_into()
-                    .unwrap();
-                let addr = i32::from_le_bytes(b);
-                let new_addr = addr.wrapping_add(n);
-                let new_u = u.wrapping_sub(n);
-                // Pop 3, push 2: net sp + 4
-                let new_sp = sp + 4;
-                let data = memory.data_mut(&mut caller);
-                data[(new_sp + 4) as usize..(new_sp + 8) as usize]
-                    .copy_from_slice(&new_addr.to_le_bytes());
-                data[new_sp as usize..new_sp as usize + 4].copy_from_slice(&new_u.to_le_bytes());
-                dsp.set(&mut caller, Val::I32(new_sp as i32))?;
-                Ok(())
-            },
-        );
-
-        self.register_host_primitive("/STRING", false, func)?;
-        Ok(())
-    }
-
-    /// BLANK ( c-addr u -- ) fill with spaces.
-    fn register_blank(&mut self) -> anyhow::Result<()> {
-        let memory = self.memory;
-        let dsp = self.dsp;
-
-        let func = Func::new(
-            &mut self.store,
-            FuncType::new(&self.engine, [], []),
-            move |mut caller, _params, _results| {
-                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
-                let data = memory.data(&caller);
-                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
-                let u = i32::from_le_bytes(b);
-                let b: [u8; 4] = data[(sp + 4) as usize..(sp + 8) as usize]
-                    .try_into()
-                    .unwrap();
-                let addr = i32::from_le_bytes(b) as u32 as usize;
-                dsp.set(&mut caller, Val::I32((sp + 8) as i32))?;
-                if u > 0 {
-                    let n = u as usize;
-                    let mem_len = memory.data(&caller).len();
-                    if addr.saturating_add(n) <= mem_len {
-                        let data = memory.data_mut(&mut caller);
-                        for i in 0..n {
-                            data[addr + i] = b' ';
-                        }
-                    }
-                }
-                Ok(())
-            },
-        );
-
-        self.register_host_primitive("BLANK", false, func)?;
-        Ok(())
-    }
-
-    /// -TRAILING ( c-addr u -- c-addr u' ) remove trailing spaces.
-    fn register_minus_trailing(&mut self) -> anyhow::Result<()> {
-        let memory = self.memory;
-        let dsp = self.dsp;
-
-        let func = Func::new(
-            &mut self.store,
-            FuncType::new(&self.engine, [], []),
-            move |mut caller, _params, _results| {
-                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
-                let data = memory.data(&caller);
-                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
-                let mut u = i32::from_le_bytes(b) as usize;
-                let b: [u8; 4] = data[(sp + 4) as usize..(sp + 8) as usize]
-                    .try_into()
-                    .unwrap();
-                let addr = u32::from_le_bytes(b) as usize;
-
-                let mem_len = data.len();
-                while u > 0 {
-                    let idx = addr + u - 1;
-                    if idx < mem_len && data[idx] == b' ' {
-                        u -= 1;
-                    } else {
-                        break;
-                    }
-                }
-
-                let data = memory.data_mut(&mut caller);
-                data[sp as usize..sp as usize + 4].copy_from_slice(&(u as i32).to_le_bytes());
-                Ok(())
-            },
-        );
-
-        self.register_host_primitive("-TRAILING", false, func)?;
         Ok(())
     }
 
