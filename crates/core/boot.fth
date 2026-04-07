@@ -160,6 +160,18 @@
 
 \ ALIGNED is already an IR primitive in the compiler.
 
+\ ALLOT ( n -- )  advance HERE by n bytes
+: ALLOT  HERE + 12 ! ;
+
+\ , ( x -- )  store cell at HERE, advance by cell
+: ,  HERE ! 1 CELLS ALLOT ;
+
+\ C, ( char -- )  store byte at HERE, advance by 1
+: C,  HERE C! 1 ALLOT ;
+
+\ ALIGN ( -- )  align HERE to cell boundary
+: ALIGN  HERE ALIGNED 12 ! ;
+
 \ ---------------------------------------------------------------
 \ Phase 5: I/O, pictured numeric output, formatted output
 \ ---------------------------------------------------------------
@@ -274,5 +286,14 @@
 
 \ DFALIGNED ( addr -- addr )  align to 8-byte double-float boundary
 : DFALIGNED  7 + -8 AND ;
+
+\ FALIGN ( -- )  align HERE to 8-byte float boundary
+: FALIGN  HERE FALIGNED 12 ! ;
+
+\ SFALIGN ( -- )  align HERE to 4-byte single-float boundary
+: SFALIGN  ALIGN ;
+
+\ DFALIGN ( -- )  align HERE to 8-byte double-float boundary
+: DFALIGN  FALIGN ;
 
 \ .S keeps its Rust host function (complex stack introspection).

@@ -2067,15 +2067,13 @@ impl ForthVM {
         // HERE: defined in boot.fth (reads SYSVAR_HERE from WASM memory).
         // Initialize the here_cell for host functions that still need it.
         self.here_cell = Some(Arc::new(Mutex::new(self.user_here)));
-        self.register_allot()?;
-        self.register_comma()?;
-        self.register_c_comma()?;
+        // ALLOT, comma, C-comma: defined in boot.fth
         self.register_primitive("CELLS", false, vec![IrOp::PushI32(4), IrOp::Mul])?;
         self.register_primitive("CELL+", false, vec![IrOp::PushI32(4), IrOp::Add])?;
         // CHARS is a no-op (byte addressed)
         self.register_primitive("CHARS", false, vec![])?;
         self.register_primitive("CHAR+", false, vec![IrOp::PushI32(1), IrOp::Add])?;
-        self.register_align()?;
+        // ALIGN: defined in boot.fth
         self.register_aligned()?;
         // MOVE, FILL: defined in boot.fth
 
@@ -2899,10 +2897,26 @@ impl ForthVM {
         }
     }
 
-    /// Update `user_here` from the shared cell and then write back.
+    /// Update `user_here` from the shared cell and WASM memory.
+    ///
+    /// Reads both `here_cell` (modified by Rust host functions) and
+    /// `memory[SYSVAR_HERE]` (modified by Forth ALLOT/`,`/`C,`/ALIGN).
+    /// Takes the maximum to ensure no allocation is lost.
     fn refresh_user_here(&mut self) {
         if let Some(ref cell) = self.here_cell {
             self.user_here = *cell.lock().unwrap();
+        }
+        let data = self.memory.data(&self.store);
+        let mem_here = u32::from_le_bytes(
+            data[SYSVAR_HERE as usize..SYSVAR_HERE as usize + 4]
+                .try_into()
+                .unwrap(),
+        );
+        if mem_here > self.user_here {
+            self.user_here = mem_here;
+            if let Some(ref cell) = self.here_cell {
+                *cell.lock().unwrap() = mem_here;
+            }
         }
     }
 
@@ -2913,132 +2927,6 @@ impl ForthVM {
         let data = self.memory.data_mut(&mut self.store);
         data[SYSVAR_HERE as usize..SYSVAR_HERE as usize + 4]
             .copy_from_slice(&self.user_here.to_le_bytes());
-    }
-
-    /// ALLOT -- ( n -- ) advance HERE by n bytes.
-    fn register_allot(&mut self) -> anyhow::Result<()> {
-        let memory = self.memory;
-        let dsp = self.dsp;
-        let here_cell = self.here_cell.clone();
-
-        let func = Func::new(
-            &mut self.store,
-            FuncType::new(&self.engine, [], []),
-            move |mut caller, _params, _results| {
-                // Pop n from data stack
-                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
-                let data = memory.data(&caller);
-                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
-                let n = i32::from_le_bytes(b);
-                dsp.set(&mut caller, Val::I32((sp + CELL_SIZE) as i32))?;
-                // Advance HERE
-                if let Some(ref cell) = here_cell {
-                    let mut h = cell.lock().unwrap();
-                    *h = (*h as i32 + n) as u32;
-                    let new_here = *h;
-                    let data = memory.data_mut(&mut caller);
-                    data[SYSVAR_HERE as usize..SYSVAR_HERE as usize + 4]
-                        .copy_from_slice(&new_here.to_le_bytes());
-                }
-                Ok(())
-            },
-        );
-
-        self.register_host_primitive("ALLOT", false, func)?;
-        Ok(())
-    }
-
-    /// , (comma) -- ( x -- ) store x at HERE, advance HERE by cell.
-    fn register_comma(&mut self) -> anyhow::Result<()> {
-        let memory = self.memory;
-        let dsp = self.dsp;
-        let here_cell = self.here_cell.clone();
-
-        let func = Func::new(
-            &mut self.store,
-            FuncType::new(&self.engine, [], []),
-            move |mut caller, _params, _results| {
-                // Pop value from data stack
-                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
-                let data = memory.data(&caller);
-                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
-                let value = i32::from_le_bytes(b);
-                dsp.set(&mut caller, Val::I32((sp + CELL_SIZE) as i32))?;
-                // Store at HERE and advance
-                if let Some(ref cell) = here_cell {
-                    let mut h = cell.lock().unwrap();
-                    let addr = *h as usize;
-                    *h += CELL_SIZE;
-                    let new_here = *h;
-                    let data = memory.data_mut(&mut caller);
-                    data[addr..addr + 4].copy_from_slice(&value.to_le_bytes());
-                    data[SYSVAR_HERE as usize..SYSVAR_HERE as usize + 4]
-                        .copy_from_slice(&new_here.to_le_bytes());
-                }
-                Ok(())
-            },
-        );
-
-        self.register_host_primitive(",", false, func)?;
-        Ok(())
-    }
-
-    /// C, -- ( char -- ) store byte at HERE, advance HERE by 1.
-    fn register_c_comma(&mut self) -> anyhow::Result<()> {
-        let memory = self.memory;
-        let dsp = self.dsp;
-        let here_cell = self.here_cell.clone();
-
-        let func = Func::new(
-            &mut self.store,
-            FuncType::new(&self.engine, [], []),
-            move |mut caller, _params, _results| {
-                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
-                let data = memory.data(&caller);
-                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
-                let value = i32::from_le_bytes(b) as u8;
-                dsp.set(&mut caller, Val::I32((sp + CELL_SIZE) as i32))?;
-                if let Some(ref cell) = here_cell {
-                    let mut h = cell.lock().unwrap();
-                    let addr = *h as usize;
-                    *h += 1;
-                    let new_here = *h;
-                    let data = memory.data_mut(&mut caller);
-                    data[addr] = value;
-                    data[SYSVAR_HERE as usize..SYSVAR_HERE as usize + 4]
-                        .copy_from_slice(&new_here.to_le_bytes());
-                }
-                Ok(())
-            },
-        );
-
-        self.register_host_primitive("C,", false, func)?;
-        Ok(())
-    }
-
-    /// ALIGN -- align HERE to cell boundary.
-    fn register_align(&mut self) -> anyhow::Result<()> {
-        let memory = self.memory;
-        let here_cell = self.here_cell.clone();
-
-        let func = Func::new(
-            &mut self.store,
-            FuncType::new(&self.engine, [], []),
-            move |mut caller, _params, _results| {
-                if let Some(ref cell) = here_cell {
-                    let mut h = cell.lock().unwrap();
-                    *h = (*h + 3) & !3;
-                    let new_here = *h;
-                    let data = memory.data_mut(&mut caller);
-                    data[SYSVAR_HERE as usize..SYSVAR_HERE as usize + 4]
-                        .copy_from_slice(&new_here.to_le_bytes());
-                }
-                Ok(())
-            },
-        );
-
-        self.register_host_primitive("ALIGN", false, func)?;
-        Ok(())
     }
 
     /// ALIGNED -- ( addr -- aligned-addr ) align address to cell boundary.
@@ -5270,36 +5158,6 @@ impl ForthVM {
             self.register_host_primitive("FALIGNED", false, func)?;
         }
 
-        // FALIGN ( -- ) align HERE to float boundary
-        {
-            let memory = self.memory;
-            let here_cell = self.here_cell.clone();
-            let func = Func::new(
-                &mut self.store,
-                FuncType::new(&self.engine, [], []),
-                move |mut caller, _, _| {
-                    let here_val = if let Some(ref cell) = here_cell {
-                        *cell.lock().unwrap()
-                    } else {
-                        let mem = memory.data(&caller);
-                        let b: [u8; 4] = mem[SYSVAR_HERE as usize..SYSVAR_HERE as usize + 4]
-                            .try_into()
-                            .unwrap();
-                        u32::from_le_bytes(b)
-                    };
-                    let aligned = (here_val + 7) & !7;
-                    if let Some(ref cell) = here_cell {
-                        *cell.lock().unwrap() = aligned;
-                    }
-                    let mem = memory.data_mut(&mut caller);
-                    mem[SYSVAR_HERE as usize..SYSVAR_HERE as usize + 4]
-                        .copy_from_slice(&aligned.to_le_bytes());
-                    Ok(())
-                },
-            );
-            self.register_host_primitive("FALIGN", false, func)?;
-        }
-
         // SFLOATS ( n -- n*sfloat_size ) single-float size (same as FLOATS for us)
         self.register_primitive(
             "SFLOATS",
@@ -5883,67 +5741,6 @@ impl ForthVM {
                 },
             );
             self.register_host_primitive("DFALIGNED", false, func)?;
-        }
-
-        // SFALIGN, DFALIGN (align HERE)
-        // Not commonly needed but let's register stubs
-        // SFALIGN aligns to 4, DFALIGN aligns to 8
-        {
-            let memory = self.memory;
-            let here_cell = self.here_cell.clone();
-            let func = Func::new(
-                &mut self.store,
-                FuncType::new(&self.engine, [], []),
-                move |mut caller, _, _| {
-                    let here_val = if let Some(ref cell) = here_cell {
-                        *cell.lock().unwrap()
-                    } else {
-                        let mem = memory.data(&caller);
-                        let b: [u8; 4] = mem[SYSVAR_HERE as usize..SYSVAR_HERE as usize + 4]
-                            .try_into()
-                            .unwrap();
-                        u32::from_le_bytes(b)
-                    };
-                    let aligned = (here_val + 3) & !3;
-                    if let Some(ref cell) = here_cell {
-                        *cell.lock().unwrap() = aligned;
-                    }
-                    let mem = memory.data_mut(&mut caller);
-                    mem[SYSVAR_HERE as usize..SYSVAR_HERE as usize + 4]
-                        .copy_from_slice(&aligned.to_le_bytes());
-                    Ok(())
-                },
-            );
-            self.register_host_primitive("SFALIGN", false, func)?;
-        }
-
-        {
-            let memory = self.memory;
-            let here_cell = self.here_cell.clone();
-            let func = Func::new(
-                &mut self.store,
-                FuncType::new(&self.engine, [], []),
-                move |mut caller, _, _| {
-                    let here_val = if let Some(ref cell) = here_cell {
-                        *cell.lock().unwrap()
-                    } else {
-                        let mem = memory.data(&caller);
-                        let b: [u8; 4] = mem[SYSVAR_HERE as usize..SYSVAR_HERE as usize + 4]
-                            .try_into()
-                            .unwrap();
-                        u32::from_le_bytes(b)
-                    };
-                    let aligned = (here_val + 7) & !7;
-                    if let Some(ref cell) = here_cell {
-                        *cell.lock().unwrap() = aligned;
-                    }
-                    let mem = memory.data_mut(&mut caller);
-                    mem[SYSVAR_HERE as usize..SYSVAR_HERE as usize + 4]
-                        .copy_from_slice(&aligned.to_le_bytes());
-                    Ok(())
-                },
-            );
-            self.register_host_primitive("DFALIGN", false, func)?;
         }
 
         Ok(())
