@@ -22,8 +22,8 @@ use crate::dictionary::{Dictionary, WordId};
 use crate::ir::IrOp;
 use crate::memory::{
     CELL_SIZE, DATA_STACK_TOP, FLOAT_SIZE, FLOAT_STACK_BASE, FLOAT_STACK_TOP, INPUT_BUFFER_BASE,
-    INPUT_BUFFER_SIZE, RETURN_STACK_TOP, SYSVAR_BASE_VAR, SYSVAR_NUM_TIB, SYSVAR_STATE,
-    SYSVAR_TO_IN,
+    INPUT_BUFFER_SIZE, RETURN_STACK_TOP, SYSVAR_BASE_VAR, SYSVAR_HERE, SYSVAR_NUM_TIB,
+    SYSVAR_STATE, SYSVAR_TO_IN,
 };
 use crate::optimizer::optimize;
 
@@ -368,6 +368,7 @@ impl ForthVM {
         self.input_buffer = input.to_string();
         self.input_pos = 0;
         self.sync_input_to_wasm();
+        self.sync_here_to_wasm();
 
         while let Some(token) = self.next_token() {
             self.sync_input_to_wasm();
@@ -2108,7 +2109,9 @@ impl ForthVM {
         // (VARIABLE, CONSTANT, CREATE are special tokens)
 
         // -- Priority 3: Memory/system words --
-        self.register_here()?;
+        // HERE: defined in boot.fth (reads SYSVAR_HERE from WASM memory).
+        // Initialize the here_cell for host functions that still need it.
+        self.here_cell = Some(Arc::new(Mutex::new(self.user_here)));
         self.register_allot()?;
         self.register_comma()?;
         self.register_c_comma()?;
@@ -2996,43 +2999,12 @@ impl ForthVM {
     // Priority 3: Memory/system host functions
     // -----------------------------------------------------------------------
 
-    /// HERE -- push the current user data pointer.
-    fn register_here(&mut self) -> anyhow::Result<()> {
-        let memory = self.memory;
-        let dsp = self.dsp;
-
-        // Use a shared cell that tracks user_here.
-        let here_cell = Arc::new(Mutex::new(self.user_here));
-        self.here_cell = Some(Arc::clone(&here_cell));
-
-        let func = Func::new(
-            &mut self.store,
-            FuncType::new(&self.engine, [], []),
-            move |mut caller, _params, _results| {
-                let here_val = *here_cell.lock().unwrap();
-                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
-                let mem_len = memory.data(&caller).len() as u32;
-                if sp < CELL_SIZE || sp > mem_len {
-                    return Err(wasmtime::Error::msg("data stack overflow in HERE"));
-                }
-                let new_sp = sp - CELL_SIZE;
-                let data = memory.data_mut(&mut caller);
-                let bytes = (here_val as i32).to_le_bytes();
-                data[new_sp as usize..new_sp as usize + 4].copy_from_slice(&bytes);
-                dsp.set(&mut caller, Val::I32(new_sp as i32))?;
-                Ok(())
-            },
-        );
-
-        self.register_host_primitive("HERE", false, func)?;
-        Ok(())
-    }
-
-    /// Keep the `here_cell` in sync with `user_here`.
-    fn sync_here_cell(&self) {
+    /// Keep the `here_cell` and WASM `memory[SYSVAR_HERE]` in sync with `user_here`.
+    fn sync_here_cell(&mut self) {
         if let Some(ref cell) = self.here_cell {
             *cell.lock().unwrap() = self.user_here;
         }
+        self.sync_here_to_wasm();
     }
 
     /// Sync a new `word_pfa_map` entry to the shared copy (for >BODY host function).
@@ -3047,6 +3019,15 @@ impl ForthVM {
         if let Some(ref cell) = self.here_cell {
             self.user_here = *cell.lock().unwrap();
         }
+    }
+
+    /// Write `user_here` to WASM `memory[SYSVAR_HERE]` so Forth code can read it.
+    /// Refreshes from `here_cell` first in case a host function updated it.
+    fn sync_here_to_wasm(&mut self) {
+        self.refresh_user_here();
+        let data = self.memory.data_mut(&mut self.store);
+        data[SYSVAR_HERE as usize..SYSVAR_HERE as usize + 4]
+            .copy_from_slice(&self.user_here.to_le_bytes());
     }
 
     /// ALLOT -- ( n -- ) advance HERE by n bytes.
@@ -3069,6 +3050,10 @@ impl ForthVM {
                 if let Some(ref cell) = here_cell {
                     let mut h = cell.lock().unwrap();
                     *h = (*h as i32 + n) as u32;
+                    let new_here = *h;
+                    let data = memory.data_mut(&mut caller);
+                    data[SYSVAR_HERE as usize..SYSVAR_HERE as usize + 4]
+                        .copy_from_slice(&new_here.to_le_bytes());
                 }
                 Ok(())
             },
@@ -3098,10 +3083,12 @@ impl ForthVM {
                 if let Some(ref cell) = here_cell {
                     let mut h = cell.lock().unwrap();
                     let addr = *h as usize;
-                    let data = memory.data_mut(&mut caller);
-                    let bytes = value.to_le_bytes();
-                    data[addr..addr + 4].copy_from_slice(&bytes);
                     *h += CELL_SIZE;
+                    let new_here = *h;
+                    let data = memory.data_mut(&mut caller);
+                    data[addr..addr + 4].copy_from_slice(&value.to_le_bytes());
+                    data[SYSVAR_HERE as usize..SYSVAR_HERE as usize + 4]
+                        .copy_from_slice(&new_here.to_le_bytes());
                 }
                 Ok(())
             },
@@ -3129,9 +3116,12 @@ impl ForthVM {
                 if let Some(ref cell) = here_cell {
                     let mut h = cell.lock().unwrap();
                     let addr = *h as usize;
+                    *h += 1;
+                    let new_here = *h;
                     let data = memory.data_mut(&mut caller);
                     data[addr] = value;
-                    *h += 1;
+                    data[SYSVAR_HERE as usize..SYSVAR_HERE as usize + 4]
+                        .copy_from_slice(&new_here.to_le_bytes());
                 }
                 Ok(())
             },
@@ -3143,15 +3133,20 @@ impl ForthVM {
 
     /// ALIGN -- align HERE to cell boundary.
     fn register_align(&mut self) -> anyhow::Result<()> {
+        let memory = self.memory;
         let here_cell = self.here_cell.clone();
 
         let func = Func::new(
             &mut self.store,
             FuncType::new(&self.engine, [], []),
-            move |_caller, _params, _results| {
+            move |mut caller, _params, _results| {
                 if let Some(ref cell) = here_cell {
                     let mut h = cell.lock().unwrap();
                     *h = (*h + 3) & !3;
+                    let new_here = *h;
+                    let data = memory.data_mut(&mut caller);
+                    data[SYSVAR_HERE as usize..SYSVAR_HERE as usize + 4]
+                        .copy_from_slice(&new_here.to_le_bytes());
                 }
                 Ok(())
             },
@@ -6153,8 +6148,7 @@ impl ForthVM {
                         *cell.lock().unwrap()
                     } else {
                         let mem = memory.data(&caller);
-                        let b: [u8; 4] = mem[crate::memory::SYSVAR_HERE as usize
-                            ..crate::memory::SYSVAR_HERE as usize + 4]
+                        let b: [u8; 4] = mem[SYSVAR_HERE as usize..SYSVAR_HERE as usize + 4]
                             .try_into()
                             .unwrap();
                         u32::from_le_bytes(b)
@@ -6164,8 +6158,7 @@ impl ForthVM {
                         *cell.lock().unwrap() = aligned;
                     }
                     let mem = memory.data_mut(&mut caller);
-                    mem[crate::memory::SYSVAR_HERE as usize
-                        ..crate::memory::SYSVAR_HERE as usize + 4]
+                    mem[SYSVAR_HERE as usize..SYSVAR_HERE as usize + 4]
                         .copy_from_slice(&aligned.to_le_bytes());
                     Ok(())
                 },
@@ -6772,8 +6765,7 @@ impl ForthVM {
                         *cell.lock().unwrap()
                     } else {
                         let mem = memory.data(&caller);
-                        let b: [u8; 4] = mem[crate::memory::SYSVAR_HERE as usize
-                            ..crate::memory::SYSVAR_HERE as usize + 4]
+                        let b: [u8; 4] = mem[SYSVAR_HERE as usize..SYSVAR_HERE as usize + 4]
                             .try_into()
                             .unwrap();
                         u32::from_le_bytes(b)
@@ -6783,8 +6775,7 @@ impl ForthVM {
                         *cell.lock().unwrap() = aligned;
                     }
                     let mem = memory.data_mut(&mut caller);
-                    mem[crate::memory::SYSVAR_HERE as usize
-                        ..crate::memory::SYSVAR_HERE as usize + 4]
+                    mem[SYSVAR_HERE as usize..SYSVAR_HERE as usize + 4]
                         .copy_from_slice(&aligned.to_le_bytes());
                     Ok(())
                 },
@@ -6803,8 +6794,7 @@ impl ForthVM {
                         *cell.lock().unwrap()
                     } else {
                         let mem = memory.data(&caller);
-                        let b: [u8; 4] = mem[crate::memory::SYSVAR_HERE as usize
-                            ..crate::memory::SYSVAR_HERE as usize + 4]
+                        let b: [u8; 4] = mem[SYSVAR_HERE as usize..SYSVAR_HERE as usize + 4]
                             .try_into()
                             .unwrap();
                         u32::from_le_bytes(b)
@@ -6814,8 +6804,7 @@ impl ForthVM {
                         *cell.lock().unwrap() = aligned;
                     }
                     let mem = memory.data_mut(&mut caller);
-                    mem[crate::memory::SYSVAR_HERE as usize
-                        ..crate::memory::SYSVAR_HERE as usize + 4]
+                    mem[SYSVAR_HERE as usize..SYSVAR_HERE as usize + 4]
                         .copy_from_slice(&aligned.to_le_bytes());
                     Ok(())
                 },

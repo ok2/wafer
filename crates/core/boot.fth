@@ -137,3 +137,14 @@
 
 \ */MOD ( n1 n2 n3 -- rem quot )
 : */MOD  >R M* R> FM/MOD ;
+
+\ ---------------------------------------------------------------
+\ Phase 4: HERE and ALIGNED
+\ ---------------------------------------------------------------
+
+\ HERE reads from SYSVAR_HERE (offset 12 in WASM memory).
+\ The Rust side syncs user_here to memory[12] before each evaluate call
+\ and whenever host ALLOT/comma modifies it.
+: HERE  12 @ ;
+
+\ ALIGNED is already an IR primitive in the compiler.
