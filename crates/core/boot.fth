@@ -110,6 +110,30 @@
 \ Phase 3: Mixed arithmetic (built on M* and UM/MOD host primitives)
 \ ---------------------------------------------------------------
 
-\ Phase 3 words (SM/REM, FM/MOD, */, */MOD) kept as Rust host functions
-\ for now due to return-stack depth interactions with DABS/DNEGATE.
-\ TODO: replace once return-stack nesting issue is resolved.
+\ SM/REM ( d n -- rem quot )  symmetric (truncated) division
+\ Quotient sign: negative if dividend and divisor signs differ.
+\ Remainder sign: same as dividend.
+: SM/REM
+  OVER >R
+  2DUP XOR >R
+  ABS >R DABS R>
+  UM/MOD
+  R> 0< IF NEGATE THEN
+  SWAP R> 0< IF NEGATE THEN
+  SWAP ;
+
+\ FM/MOD ( d n -- rem quot )  floored division
+: FM/MOD
+  DUP >R
+  SM/REM
+  OVER 0<> OVER 0< AND IF
+    1- SWAP R> + SWAP
+  ELSE
+    R> DROP
+  THEN ;
+
+\ */ ( n1 n2 n3 -- n4 )  n1*n2/n3 with double intermediate
+: */  >R M* R> FM/MOD SWAP DROP ;
+
+\ */MOD ( n1 n2 n3 -- rem quot )
+: */MOD  >R M* R> FM/MOD ;
