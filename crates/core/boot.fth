@@ -213,3 +213,36 @@
 
 \ D.R ( d width -- )  print right-justified signed double
 : D.R  >R SWAP OVER DABS <# #S ROT SIGN #> R> OVER - SPACES TYPE ;
+
+\ ---------------------------------------------------------------
+\ Phase 6: DEFER support
+\ ---------------------------------------------------------------
+
+\ DEFER! ( xt xt-deferred -- )  store xt into a deferred word
+: DEFER!  >BODY ! ;
+
+\ DEFER@ ( xt-deferred -- xt )  retrieve xt from a deferred word
+: DEFER@  >BODY @ ;
+
+\ ---------------------------------------------------------------
+\ String operations
+\ ---------------------------------------------------------------
+
+\ COMPARE ( addr1 u1 addr2 u2 -- n )  compare two strings lexicographically
+: COMPARE
+  ROT 2DUP - >R
+  MIN 0 ?DO
+    OVER I + C@
+    OVER I + C@
+    2DUP <> IF
+      < IF 2DROP R> DROP -1 UNLOOP EXIT
+      ELSE  2DROP R> DROP  1 UNLOOP EXIT
+      THEN
+    THEN 2DROP
+  LOOP
+  2DROP R>
+  DUP 0< IF DROP -1 EXIT THEN
+  0> IF 1 EXIT THEN
+  0 ;
+
+\ SEARCH stays as a host function (complex multi-line control flow).

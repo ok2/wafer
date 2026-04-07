@@ -2215,8 +2215,7 @@ impl ForthVM {
         // Handled as a special token in interpret_token_immediate
 
         // DEFER!, DEFER@ (standard aliases)
-        self.register_defer_store()?;
-        self.register_defer_fetch()?;
+        // DEFER!, DEFER@: defined in boot.fth
 
         // FALSE and TRUE are already registered in core
         // NIP, TUCK already registered
@@ -2233,7 +2232,7 @@ impl ForthVM {
         // D., D.R: defined in boot.fth
 
         // -- String word set --
-        self.register_compare()?;
+        // COMPARE: defined in boot.fth
         self.register_search()?;
         // /STRING, BLANK, -TRAILING: defined in boot.fth
 
@@ -4831,76 +4830,6 @@ impl ForthVM {
         Ok(())
     }
 
-    /// DEFER! ( xt2 xt1 -- ) set deferred word xt1 to execute xt2.
-    fn register_defer_store(&mut self) -> anyhow::Result<()> {
-        let memory = self.memory;
-        let dsp = self.dsp;
-        let pfa_map = self.word_pfa_map_shared.clone();
-
-        let func = Func::new(
-            &mut self.store,
-            FuncType::new(&self.engine, [], []),
-            move |mut caller, _params, _results| {
-                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
-                let data = memory.data(&caller);
-                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
-                let xt1 = u32::from_le_bytes(b); // deferred word's xt
-                let b: [u8; 4] = data[(sp + 4) as usize..(sp + 8) as usize]
-                    .try_into()
-                    .unwrap();
-                let xt2 = i32::from_le_bytes(b); // xt to store
-                dsp.set(&mut caller, Val::I32((sp + 8) as i32))?;
-
-                if let Some(ref map) = pfa_map {
-                    let map = map.lock().unwrap();
-                    if let Some(&pfa) = map.get(&xt1) {
-                        let data = memory.data_mut(&mut caller);
-                        data[pfa as usize..pfa as usize + 4].copy_from_slice(&xt2.to_le_bytes());
-                    }
-                }
-                Ok(())
-            },
-        );
-
-        self.register_host_primitive("DEFER!", false, func)?;
-        Ok(())
-    }
-
-    /// DEFER@ ( xt1 -- xt2 ) retrieve the xt from a deferred word.
-    fn register_defer_fetch(&mut self) -> anyhow::Result<()> {
-        let memory = self.memory;
-        let dsp = self.dsp;
-        let pfa_map = self.word_pfa_map_shared.clone();
-
-        let func = Func::new(
-            &mut self.store,
-            FuncType::new(&self.engine, [], []),
-            move |mut caller, _params, _results| {
-                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
-                let data = memory.data(&caller);
-                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
-                let xt1 = u32::from_le_bytes(b);
-
-                let mut result = 0i32;
-                if let Some(ref map) = pfa_map {
-                    let map = map.lock().unwrap();
-                    if let Some(&pfa) = map.get(&xt1) {
-                        let data = memory.data(&caller);
-                        let b: [u8; 4] = data[pfa as usize..pfa as usize + 4].try_into().unwrap();
-                        result = i32::from_le_bytes(b);
-                    }
-                }
-
-                let data = memory.data_mut(&mut caller);
-                data[sp as usize..sp as usize + 4].copy_from_slice(&result.to_le_bytes());
-                Ok(())
-            },
-        );
-
-        self.register_host_primitive("DEFER@", false, func)?;
-        Ok(())
-    }
-
     // -----------------------------------------------------------------------
     // Double-Number word set
     // -----------------------------------------------------------------------
@@ -5078,81 +5007,6 @@ impl ForthVM {
     // -----------------------------------------------------------------------
     // String word set
     // -----------------------------------------------------------------------
-
-    /// COMPARE ( c-addr1 u1 c-addr2 u2 -- n ) compare two strings.
-    fn register_compare(&mut self) -> anyhow::Result<()> {
-        let memory = self.memory;
-        let dsp = self.dsp;
-
-        let func = Func::new(
-            &mut self.store,
-            FuncType::new(&self.engine, [], []),
-            move |mut caller, _params, _results| {
-                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
-                let data = memory.data(&caller);
-                // Stack: u2(sp), c-addr2(sp+4), u1(sp+8), c-addr1(sp+12)
-                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
-                let u2 = i32::from_le_bytes(b) as u32;
-                let b: [u8; 4] = data[(sp + 4) as usize..(sp + 8) as usize]
-                    .try_into()
-                    .unwrap();
-                let addr2 = u32::from_le_bytes(b) as usize;
-                let b: [u8; 4] = data[(sp + 8) as usize..(sp + 12) as usize]
-                    .try_into()
-                    .unwrap();
-                let u1 = i32::from_le_bytes(b) as u32;
-                let b: [u8; 4] = data[(sp + 12) as usize..(sp + 16) as usize]
-                    .try_into()
-                    .unwrap();
-                let addr1 = u32::from_le_bytes(b) as usize;
-
-                let mem_len = data.len();
-                let len1 = u1 as usize;
-                let len2 = u2 as usize;
-
-                let min_len = len1.min(len2);
-                let mut result: i32 = 0;
-
-                for i in 0..min_len {
-                    let a1 = if addr1 + i < mem_len {
-                        data[addr1 + i]
-                    } else {
-                        0
-                    };
-                    let a2 = if addr2 + i < mem_len {
-                        data[addr2 + i]
-                    } else {
-                        0
-                    };
-                    if a1 < a2 {
-                        result = -1;
-                        break;
-                    } else if a1 > a2 {
-                        result = 1;
-                        break;
-                    }
-                }
-
-                if result == 0 {
-                    if len1 < len2 {
-                        result = -1;
-                    } else if len1 > len2 {
-                        result = 1;
-                    }
-                }
-
-                // Pop 4, push 1: net sp + 12
-                let new_sp = sp + 12;
-                let data = memory.data_mut(&mut caller);
-                data[new_sp as usize..new_sp as usize + 4].copy_from_slice(&result.to_le_bytes());
-                dsp.set(&mut caller, Val::I32(new_sp as i32))?;
-                Ok(())
-            },
-        );
-
-        self.register_host_primitive("COMPARE", false, func)?;
-        Ok(())
-    }
 
     /// SEARCH ( c-addr1 u1 c-addr2 u2 -- c-addr3 u3 flag ) search for substring.
     fn register_search(&mut self) -> anyhow::Result<()> {
