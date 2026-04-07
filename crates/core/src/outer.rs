@@ -2089,7 +2089,7 @@ impl ForthVM {
         )?;
         // 2OVER: defined in boot.fth
         self.register_qdup()?;
-        self.register_pick()?;
+        // PICK: defined in boot.fth (uses SP@ IR op)
         self.register_min()?;
         self.register_max()?;
         // WITHIN: defined in boot.fth
@@ -2100,6 +2100,7 @@ impl ForthVM {
 
         // -- Priority 6: System/compiler --
         self.register_primitive("EXECUTE", false, vec![IrOp::Execute])?;
+        self.register_primitive("SP@", false, vec![IrOp::SpFetch])?;
         self.register_immediate_word()?;
         self.register_decimal()?;
         self.register_hex()?;
@@ -2107,12 +2108,12 @@ impl ForthVM {
         self.register_tick()?;
         self.register_to_body()?;
         self.register_environment_q()?;
-        self.register_source()?;
+        // SOURCE: defined in boot.fth
         self.register_abort()?;
 
         // . (dot): defined in boot.fth
         self.register_dot_s()?;
-        self.register_depth()?;
+        // DEPTH: defined in boot.fth (uses SP@ IR op)
 
         // -- Priority 7: New core words --
         self.register_count()?;
@@ -2288,40 +2289,6 @@ impl ForthVM {
         );
 
         self.register_host_primitive(".S", false, func)?;
-        Ok(())
-    }
-
-    /// Register DEPTH word.
-    fn register_depth(&mut self) -> anyhow::Result<()> {
-        let memory = self.memory;
-        let dsp_global = self.dsp;
-
-        let func = Func::new(
-            &mut self.store,
-            FuncType::new(&self.engine, [], []),
-            move |mut caller, _params, _results| {
-                let sp = dsp_global.get(&mut caller).unwrap_i32() as u32;
-                let depth = if sp <= DATA_STACK_TOP {
-                    ((DATA_STACK_TOP - sp) / CELL_SIZE) as i32
-                } else {
-                    // Stack pointer has gone below the base -- treat as empty
-                    0
-                };
-                // Push depth onto stack
-                let mem_len = memory.data(&caller).len() as u32;
-                let new_sp = sp.wrapping_sub(CELL_SIZE);
-                if new_sp < crate::memory::DATA_STACK_BASE || new_sp >= mem_len {
-                    return Err(wasmtime::Error::msg("data stack overflow"));
-                }
-                let data = memory.data_mut(&mut caller);
-                let bytes = depth.to_le_bytes();
-                data[new_sp as usize..new_sp as usize + 4].copy_from_slice(&bytes);
-                dsp_global.set(&mut caller, Val::I32(new_sp as i32))?;
-                Ok(())
-            },
-        );
-
-        self.register_host_primitive("DEPTH", false, func)?;
         Ok(())
     }
 
@@ -3107,35 +3074,6 @@ impl ForthVM {
     }
 
     /// PICK -- ( xn ... x0 n -- xn ... x0 xn ) pick nth item.
-    fn register_pick(&mut self) -> anyhow::Result<()> {
-        let memory = self.memory;
-        let dsp = self.dsp;
-
-        let func = Func::new(
-            &mut self.store,
-            FuncType::new(&self.engine, [], []),
-            move |mut caller, _params, _results| {
-                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
-                let data = memory.data(&caller);
-                // Read n from TOS
-                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
-                let n = i32::from_le_bytes(b) as u32;
-                // Read the nth item below TOS: at sp + (n+1)*CELL_SIZE
-                let pick_addr = (sp + (n + 1) * CELL_SIZE) as usize;
-                let b: [u8; 4] = data[pick_addr..pick_addr + 4].try_into().unwrap();
-                let value = i32::from_le_bytes(b);
-                // Replace TOS with picked value
-                let data = memory.data_mut(&mut caller);
-                let bytes = value.to_le_bytes();
-                data[sp as usize..sp as usize + 4].copy_from_slice(&bytes);
-                Ok(())
-            },
-        );
-
-        self.register_host_primitive("PICK", false, func)?;
-        Ok(())
-    }
-
     /// MIN -- ( a b -- min )
     fn register_min(&mut self) -> anyhow::Result<()> {
         // 2DUP > IF SWAP THEN DROP
@@ -3323,48 +3261,6 @@ impl ForthVM {
         );
 
         self.register_host_primitive("ENVIRONMENT?", false, func)?;
-        Ok(())
-    }
-
-    /// SOURCE -- ( -- c-addr u ) push address and length of input buffer.
-    fn register_source(&mut self) -> anyhow::Result<()> {
-        let memory = self.memory;
-        let dsp = self.dsp;
-
-        let func = Func::new(
-            &mut self.store,
-            FuncType::new(&self.engine, [], []),
-            move |mut caller, _params, _results| {
-                // The input buffer is synced to WASM memory at INPUT_BUFFER_BASE.
-                // The length is stored at a known location. We read it from the
-                // first 4 bytes before the buffer, or we use a different approach:
-                // read the actual length from a sysvar.
-                // For simplicity, read the buffer length from SYSVAR_NUM_TIB.
-                let data = memory.data(&caller);
-                let b: [u8; 4] = data[SYSVAR_NUM_TIB as usize..SYSVAR_NUM_TIB as usize + 4]
-                    .try_into()
-                    .unwrap();
-                let len = i32::from_le_bytes(b);
-
-                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
-                let mem_len = memory.data(&caller).len() as u32;
-                // Bounds check for stack underflow/corruption
-                if sp < 8 || sp > mem_len {
-                    return Err(wasmtime::Error::msg("data stack overflow in SOURCE"));
-                }
-                let new_sp = sp - 8;
-                let data = memory.data_mut(&mut caller);
-                // c-addr (deeper)
-                data[(new_sp + 4) as usize..(new_sp + 8) as usize]
-                    .copy_from_slice(&(INPUT_BUFFER_BASE as i32).to_le_bytes());
-                // u (on top)
-                data[new_sp as usize..new_sp as usize + 4].copy_from_slice(&len.to_le_bytes());
-                dsp.set(&mut caller, Val::I32(new_sp as i32))?;
-                Ok(())
-            },
-        );
-
-        self.register_host_primitive("SOURCE", false, func)?;
         Ok(())
     }
 

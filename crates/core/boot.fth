@@ -3,6 +3,17 @@
 \ Compiled WASM with direct calls outperforms host function dispatch.
 
 \ ---------------------------------------------------------------
+\ Foundation: stack introspection (needed by 2OVER et al.)
+\ ---------------------------------------------------------------
+
+\ DEPTH ( -- n )  number of items on the data stack
+\ DATA_STACK_TOP = 5440, uses arithmetic right shift for / 4
+: DEPTH  5440 SP@ - 2 RSHIFT ;
+
+\ PICK ( xn..x0 n -- xn..x0 xn )  copy nth stack item
+: PICK  1+ CELLS SP@ + @ ;
+
+\ ---------------------------------------------------------------
 \ Phase 1: Pure stack and memory operations
 \ ---------------------------------------------------------------
 
@@ -246,3 +257,22 @@
   0 ;
 
 \ SEARCH stays as a host function (complex multi-line control flow).
+
+\ ---------------------------------------------------------------
+\ Phase 7: More easy replacements
+\ ---------------------------------------------------------------
+
+\ SOURCE ( -- c-addr u )  input buffer address and length
+\ INPUT_BUFFER_BASE = 64, SYSVAR_NUM_TIB = 24
+: SOURCE  64 24 @ ;
+
+\ FALIGNED ( addr -- addr )  align to 8-byte float boundary
+: FALIGNED  7 + -8 AND ;
+
+\ SFALIGNED ( addr -- addr )  align to 4-byte single-float boundary
+: SFALIGNED  3 + -4 AND ;
+
+\ DFALIGNED ( addr -- addr )  align to 8-byte double-float boundary
+: DFALIGNED  7 + -8 AND ;
+
+\ .S keeps its Rust host function (complex stack introspection).

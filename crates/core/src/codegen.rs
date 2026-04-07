@@ -715,6 +715,17 @@ fn emit_op(f: &mut Function, op: &IrOp, ctx: &EmitCtx) {
             dsp_reload(f);
         }
 
+        IrOp::SpFetch => {
+            // Push the current cached DSP value onto the data stack.
+            // Save DSP, decrement, then store the saved value at new TOS.
+            f.instruction(&Instruction::LocalGet(CACHED_DSP_LOCAL))
+                .instruction(&Instruction::LocalSet(SCRATCH_BASE));
+            dsp_dec(f);
+            f.instruction(&Instruction::LocalGet(CACHED_DSP_LOCAL))
+                .instruction(&Instruction::LocalGet(SCRATCH_BASE))
+                .instruction(&Instruction::I32Store(MEM4));
+        }
+
         // -- Compound operations -----------------------------------------------
         IrOp::TwoDup => {
             // ( a b -- a b a b )
@@ -982,7 +993,7 @@ fn is_promotable(ops: &[IrOp]) -> bool {
     }
     for op in ops {
         match op {
-            IrOp::Call(_) | IrOp::TailCall(_) | IrOp::Execute => return false,
+            IrOp::Call(_) | IrOp::TailCall(_) | IrOp::Execute | IrOp::SpFetch => return false,
             IrOp::If { .. }
             | IrOp::DoLoop { .. }
             | IrOp::BeginUntil { .. }

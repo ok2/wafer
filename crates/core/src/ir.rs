@@ -133,6 +133,8 @@ pub enum IrOp {
     // -- System --
     /// Execute word by function table index: ( xt -- )
     Execute,
+    /// Push the current data-stack pointer: ( -- addr )
+    SpFetch,
 
     // -- Float stack manipulation --
     /// Float duplicate: ( F: r -- r r )
