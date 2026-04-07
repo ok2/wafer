@@ -19,7 +19,7 @@ use wasm_encoder::{
 use crate::dictionary::WordId;
 use crate::error::{WaferError, WaferResult};
 use crate::ir::IrOp;
-use crate::memory::CELL_SIZE;
+use crate::memory::{CELL_SIZE, SYSVAR_LEAVE_FLAG};
 
 // ---------------------------------------------------------------------------
 // Import indices (order matters: imports numbered sequentially by kind)
@@ -908,11 +908,21 @@ fn emit_do_loop(f: &mut Function, body: &[IrOp], is_plus_loop: bool, ctx: &EmitC
 
     if is_plus_loop {
         // +LOOP: Forth 2012 termination check.
-        // Exit when (old_index - limit) XOR (new_index - limit) is negative.
-        // SCRATCH_BASE = old_index (from rpop)
-        // SCRATCH_BASE+2 = step (from data stack)
+        // Exit when (old_index - limit) XOR (new_index - limit) is negative,
+        // or when the LEAVE flag is set (LEAVE sets index=limit, but +LOOP with
+        // step=0 would loop forever without this flag check).
         f.instruction(&Instruction::LocalSet(SCRATCH_BASE));
         pop_to(f, SCRATCH_BASE + 2); // step from data stack
+
+        // Check leave flag first — if set, clear it and exit immediately
+        f.instruction(&Instruction::I32Const(SYSVAR_LEAVE_FLAG as i32))
+            .instruction(&Instruction::I32Load(MEM4))
+            .instruction(&Instruction::If(BlockType::Empty))
+            .instruction(&Instruction::I32Const(SYSVAR_LEAVE_FLAG as i32))
+            .instruction(&Instruction::I32Const(0))
+            .instruction(&Instruction::I32Store(MEM4))
+            .instruction(&Instruction::Br(2)) // exit: If(0) → Loop(1) → Block(2)
+            .instruction(&Instruction::End);
 
         // Peek limit from return stack
         rpeek(f);
@@ -973,11 +983,14 @@ fn emit_do_loop(f: &mut Function, body: &[IrOp], is_plus_loop: bool, ctx: &EmitC
             .instruction(&Instruction::End); // end block
     }
 
-    // Clean up: pop index and limit from return stack
+    // Clean up: pop index and limit from return stack, clear leave flag
     rpop(f);
     f.instruction(&Instruction::Drop);
     rpop(f);
     f.instruction(&Instruction::Drop);
+    f.instruction(&Instruction::I32Const(SYSVAR_LEAVE_FLAG as i32))
+        .instruction(&Instruction::I32Const(0))
+        .instruction(&Instruction::I32Store(MEM4));
 }
 
 // ---------------------------------------------------------------------------
@@ -2020,6 +2033,16 @@ fn emit_consolidated_do_loop(
         f.instruction(&Instruction::LocalSet(SCRATCH_BASE));
         pop_to(f, SCRATCH_BASE + 2); // step from data stack
 
+        // Check leave flag — if set, clear it and exit immediately
+        f.instruction(&Instruction::I32Const(SYSVAR_LEAVE_FLAG as i32))
+            .instruction(&Instruction::I32Load(MEM4))
+            .instruction(&Instruction::If(BlockType::Empty))
+            .instruction(&Instruction::I32Const(SYSVAR_LEAVE_FLAG as i32))
+            .instruction(&Instruction::I32Const(0))
+            .instruction(&Instruction::I32Store(MEM4))
+            .instruction(&Instruction::Br(2)) // exit: If(0) → Loop(1) → Block(2)
+            .instruction(&Instruction::End);
+
         rpeek(f);
         f.instruction(&Instruction::LocalSet(SCRATCH_BASE + 1));
 
@@ -2067,11 +2090,14 @@ fn emit_consolidated_do_loop(
             .instruction(&Instruction::End);
     }
 
-    // Clean up: pop index and limit from return stack
+    // Clean up: pop index and limit from return stack, clear leave flag
     rpop(f);
     f.instruction(&Instruction::Drop);
     rpop(f);
     f.instruction(&Instruction::Drop);
+    f.instruction(&Instruction::I32Const(SYSVAR_LEAVE_FLAG as i32))
+        .instruction(&Instruction::I32Const(0))
+        .instruction(&Instruction::I32Store(MEM4));
 }
 
 /// Optional extras for exportable modules (data section, entry point, metadata).

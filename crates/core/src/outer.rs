@@ -22,8 +22,8 @@ use crate::dictionary::{Dictionary, WordId};
 use crate::ir::IrOp;
 use crate::memory::{
     CELL_SIZE, DATA_STACK_TOP, FLOAT_SIZE, FLOAT_STACK_BASE, FLOAT_STACK_TOP, INPUT_BUFFER_BASE,
-    INPUT_BUFFER_SIZE, RETURN_STACK_TOP, SYSVAR_BASE_VAR, SYSVAR_HERE, SYSVAR_NUM_TIB,
-    SYSVAR_STATE, SYSVAR_TO_IN,
+    INPUT_BUFFER_SIZE, RETURN_STACK_TOP, SYSVAR_BASE_VAR, SYSVAR_HERE, SYSVAR_LEAVE_FLAG,
+    SYSVAR_NUM_TIB, SYSVAR_STATE, SYSVAR_TO_IN,
 };
 use crate::optimizer::optimize;
 
@@ -2333,7 +2333,8 @@ impl ForthVM {
     }
 
     /// Register LEAVE as a host function.
-    /// Sets the loop index equal to the limit so the loop exits on next iteration.
+    /// Sets the loop index equal to the limit and sets the leave flag
+    /// so the loop exits on the next +LOOP/LOOP check.
     fn register_leave(&mut self) -> anyhow::Result<()> {
         let memory = self.memory;
         let rsp = self.rsp;
@@ -2353,6 +2354,9 @@ impl ForthVM {
                 let data = memory.data_mut(&mut caller);
                 let bytes = limit.to_le_bytes();
                 data[index_addr..index_addr + 4].copy_from_slice(&bytes);
+                // Set leave flag so +LOOP exits even with step=0
+                data[SYSVAR_LEAVE_FLAG as usize..SYSVAR_LEAVE_FLAG as usize + 4]
+                    .copy_from_slice(&1i32.to_le_bytes());
                 Ok(())
             },
         );
@@ -2907,12 +2911,16 @@ impl ForthVM {
             self.user_here = *cell.lock().unwrap();
         }
         let data = self.memory.data(&self.store);
+        let mem_len = data.len() as u32;
         let mem_here = u32::from_le_bytes(
             data[SYSVAR_HERE as usize..SYSVAR_HERE as usize + 4]
                 .try_into()
                 .unwrap(),
         );
-        if mem_here > self.user_here {
+        // Only accept mem_here if it's within valid memory bounds.
+        // A corrupted SYSVAR_HERE (e.g., from stack overflow into the sysvar area)
+        // would otherwise propagate as a garbage user_here.
+        if mem_here > self.user_here && mem_here < mem_len {
             self.user_here = mem_here;
             if let Some(ref cell) = self.here_cell {
                 *cell.lock().unwrap() = mem_here;
@@ -3323,14 +3331,55 @@ impl ForthVM {
         self.input_buffer = s;
         self.input_pos = 0;
 
-        // Interpret
-        while let Some(token) = self.next_token() {
-            self.interpret_token(&token)?;
+        // Sync input buffer, >IN, and #TIB to WASM (for SOURCE and WORD)
+        {
+            let bytes = self.input_buffer.as_bytes();
+            let len = bytes.len().min(INPUT_BUFFER_SIZE as usize);
+            let data = self.memory.data_mut(&mut self.store);
+            data[INPUT_BUFFER_BASE as usize..INPUT_BUFFER_BASE as usize + len]
+                .copy_from_slice(&bytes[..len]);
+            data[SYSVAR_TO_IN as usize..SYSVAR_TO_IN as usize + 4]
+                .copy_from_slice(&0u32.to_le_bytes());
+            data[SYSVAR_NUM_TIB as usize..SYSVAR_NUM_TIB as usize + 4]
+                .copy_from_slice(&(len as u32).to_le_bytes());
         }
 
-        // Restore input state
+        // Interpret with >IN sync (supports >IN manipulation)
+        while let Some(token) = self.next_token() {
+            {
+                let data = self.memory.data_mut(&mut self.store);
+                data[SYSVAR_TO_IN as usize..SYSVAR_TO_IN as usize + 4]
+                    .copy_from_slice(&(self.input_pos as u32).to_le_bytes());
+            }
+            let wasm_to_in_before = self.input_pos;
+            self.interpret_token(&token)?;
+            let data = self.memory.data(&self.store);
+            let b: [u8; 4] = data[SYSVAR_TO_IN as usize..SYSVAR_TO_IN as usize + 4]
+                .try_into()
+                .unwrap();
+            let wasm_to_in = u32::from_le_bytes(b) as usize;
+            if wasm_to_in != wasm_to_in_before {
+                self.input_pos = wasm_to_in;
+            }
+            if self.input_pos >= self.input_buffer.len() {
+                break;
+            }
+        }
+
+        // Restore input state and sync back to WASM
         self.input_buffer = saved_buffer;
         self.input_pos = saved_pos;
+        {
+            let bytes = self.input_buffer.as_bytes();
+            let len = bytes.len().min(INPUT_BUFFER_SIZE as usize);
+            let data = self.memory.data_mut(&mut self.store);
+            data[INPUT_BUFFER_BASE as usize..INPUT_BUFFER_BASE as usize + len]
+                .copy_from_slice(&bytes[..len]);
+            data[SYSVAR_TO_IN as usize..SYSVAR_TO_IN as usize + 4]
+                .copy_from_slice(&(self.input_pos as u32).to_le_bytes());
+            data[SYSVAR_NUM_TIB as usize..SYSVAR_NUM_TIB as usize + 4]
+                .copy_from_slice(&(len as u32).to_le_bytes());
+        }
 
         Ok(())
     }
@@ -4204,13 +4253,15 @@ impl ForthVM {
                     .unwrap();
                 let num_tib = u32::from_le_bytes(b);
 
-                // Skip leading delimiters
+                // Skip leading delimiters (also skip spaces when delimiter != space)
                 while to_in < num_tib {
                     let data = memory.data(&caller);
-                    if data[(INPUT_BUFFER_BASE + to_in) as usize] != delim {
+                    let ch = data[(INPUT_BUFFER_BASE + to_in) as usize];
+                    if ch == delim || (delim != b' ' && ch == b' ') {
+                        to_in += 1;
+                    } else {
                         break;
                     }
-                    to_in += 1;
                 }
 
                 // Collect word
@@ -4611,6 +4662,30 @@ impl ForthVM {
         );
 
         self.register_host_primitive("REFILL", false, func)?;
+
+        // ACCEPT ( c-addr +n1 -- +n2 )  receive up to +n1 characters.
+        // In non-interactive mode, return 0 (no input).
+        let memory = self.memory;
+        let dsp = self.dsp;
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                // Pop +n1 (max count) and c-addr from stack
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let new_sp = sp + CELL_SIZE; // pop +n1
+                let new_sp = new_sp + CELL_SIZE; // pop c-addr
+                // Push 0 (no characters received)
+                let result_sp = new_sp - CELL_SIZE;
+                let data = memory.data_mut(&mut caller);
+                data[result_sp as usize..result_sp as usize + 4]
+                    .copy_from_slice(&0i32.to_le_bytes());
+                dsp.set(&mut caller, Val::I32(result_sp as i32))?;
+                Ok(())
+            },
+        );
+        self.register_host_primitive("ACCEPT", false, func)?;
+
         Ok(())
     }
 
@@ -6655,6 +6730,22 @@ mod tests {
             eval_output(": TEST 10 0 DO I . 2 +LOOP ; TEST"),
             "0 2 4 6 8 "
         );
+    }
+
+    #[test]
+    fn test_plus_loop_leave_with_zero_step() {
+        // Regression: LEAVE inside +LOOP with step=0 caused infinite loop.
+        // LEAVE sets index=limit, but the XOR termination check yields 0 XOR 0 = 0
+        // (not negative), so the loop never exited without the leave flag.
+        let mut vm = ForthVM::new().unwrap();
+        vm.evaluate("VARIABLE INCRMNT  VARIABLE ITERS").unwrap();
+        vm.evaluate(
+            ": QD6 INCRMNT ! 0 ITERS ! ?DO 1 ITERS +! I ITERS @ 6 = IF LEAVE THEN INCRMNT @ +LOOP ITERS @ ;"
+        ).unwrap();
+        vm.evaluate("-1 2 0 QD6").unwrap();
+        let stack = vm.data_stack();
+        // Expected: 2 2 2 2 2 2 6 (6 iterations of I=2, then ITERS@=6)
+        assert_eq!(stack, vec![6, 2, 2, 2, 2, 2, 2]);
     }
 
     // ===================================================================

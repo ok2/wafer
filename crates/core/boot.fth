@@ -7,8 +7,9 @@
 \ ---------------------------------------------------------------
 
 \ DEPTH ( -- n )  number of items on the data stack
+\ SP@ must come first so it reads the dsp before DEPTH's own literal push.
 \ DATA_STACK_TOP = 5440, uses arithmetic right shift for / 4
-: DEPTH  5440 SP@ - 2 RSHIFT ;
+: DEPTH  SP@ 5440 SWAP - 2 RSHIFT ;
 
 \ PICK ( xn..x0 n -- xn..x0 xn )  copy nth stack item
 : PICK  1+ CELLS SP@ + @ ;
@@ -144,10 +145,11 @@
   THEN ;
 
 \ */ ( n1 n2 n3 -- n4 )  n1*n2/n3 with double intermediate
-: */  >R M* R> FM/MOD SWAP DROP ;
+\ Must use SM/REM (symmetric) to match WAFER's WASM i32.div_s semantics.
+: */  >R M* R> SM/REM SWAP DROP ;
 
 \ */MOD ( n1 n2 n3 -- rem quot )
-: */MOD  >R M* R> FM/MOD ;
+: */MOD  >R M* R> SM/REM ;
 
 \ ---------------------------------------------------------------
 \ Phase 4: HERE and ALIGNED

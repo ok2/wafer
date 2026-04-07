@@ -86,6 +86,8 @@ pub const SYSVAR_SOURCE_ID: u32 = SYSVAR_BASE + 20;
 pub const SYSVAR_NUM_TIB: u32 = SYSVAR_BASE + 24;
 /// HLD: pointer for pictured numeric output.
 pub const SYSVAR_HLD: u32 = SYSVAR_BASE + 28;
+/// LEAVE flag: nonzero when LEAVE has been called inside a DO loop.
+pub const SYSVAR_LEAVE_FLAG: u32 = SYSVAR_BASE + 32;
 
 #[cfg(test)]
 mod tests {
@@ -125,6 +127,7 @@ mod tests {
             SYSVAR_SOURCE_ID,
             SYSVAR_NUM_TIB,
             SYSVAR_HLD,
+            SYSVAR_LEAVE_FLAG,
         ];
         for offset in all_offsets {
             assert!(offset >= SYSVAR_BASE);
