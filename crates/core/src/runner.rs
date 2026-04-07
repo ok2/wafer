@@ -270,6 +270,87 @@ fn create_host_func(
             })
         }
 
+        "M*" => {
+            // ( n1 n2 -- d )  signed multiply producing double-cell result
+            Func::new(store, void_type, move |mut caller, _params, _results| {
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let (n1, n2) = {
+                    let data = memory.data(&caller);
+                    let n2 =
+                        i32::from_le_bytes(data[sp as usize..sp as usize + 4].try_into().unwrap())
+                            as i64;
+                    let n1 = i32::from_le_bytes(
+                        data[sp as usize + 4..sp as usize + 8].try_into().unwrap(),
+                    ) as i64;
+                    (n1, n2)
+                };
+                let result = n1 * n2;
+                let lo = result as i32;
+                let hi = (result >> 32) as i32;
+                let data = memory.data_mut(&mut caller);
+                data[sp as usize + 4..sp as usize + 8].copy_from_slice(&lo.to_le_bytes());
+                data[sp as usize..sp as usize + 4].copy_from_slice(&hi.to_le_bytes());
+                Ok(())
+            })
+        }
+
+        "UM*" => {
+            // ( u1 u2 -- ud )  unsigned multiply producing double-cell result
+            Func::new(store, void_type, move |mut caller, _params, _results| {
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let (u1, u2) = {
+                    let data = memory.data(&caller);
+                    let u2 =
+                        u32::from_le_bytes(data[sp as usize..sp as usize + 4].try_into().unwrap())
+                            as u64;
+                    let u1 = u32::from_le_bytes(
+                        data[sp as usize + 4..sp as usize + 8].try_into().unwrap(),
+                    ) as u64;
+                    (u1, u2)
+                };
+                let result = u1 * u2;
+                let lo = result as u32;
+                let hi = (result >> 32) as u32;
+                let data = memory.data_mut(&mut caller);
+                data[sp as usize + 4..sp as usize + 8].copy_from_slice(&lo.to_le_bytes());
+                data[sp as usize..sp as usize + 4].copy_from_slice(&hi.to_le_bytes());
+                Ok(())
+            })
+        }
+
+        "UM/MOD" => {
+            // ( ud u -- rem quot )  unsigned double-cell divide
+            Func::new(store, void_type, move |mut caller, _params, _results| {
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let (dividend, divisor) = {
+                    let data = memory.data(&caller);
+                    let divisor =
+                        u32::from_le_bytes(data[sp as usize..sp as usize + 4].try_into().unwrap())
+                            as u64;
+                    let hi = u32::from_le_bytes(
+                        data[sp as usize + 4..sp as usize + 8].try_into().unwrap(),
+                    ) as u64;
+                    let lo = u32::from_le_bytes(
+                        data[sp as usize + 8..sp as usize + 12].try_into().unwrap(),
+                    ) as u64;
+                    ((hi << 32) | lo, divisor)
+                };
+                if divisor == 0 {
+                    anyhow::bail!("division by zero");
+                }
+                let quot = (dividend / divisor) as u32;
+                let rem = (dividend % divisor) as u32;
+                let new_sp = sp + CELL_SIZE;
+                let data = memory.data_mut(&mut caller);
+                data[new_sp as usize + 4..new_sp as usize + 8]
+                    .copy_from_slice(&(rem as i32).to_le_bytes());
+                data[new_sp as usize..new_sp as usize + 4]
+                    .copy_from_slice(&(quot as i32).to_le_bytes());
+                dsp.set(&mut caller, Val::I32(new_sp as i32))?;
+                Ok(())
+            })
+        }
+
         "DEPTH" => {
             // ( -- n ) push current stack depth
             Func::new(store, void_type, move |mut caller, _params, _results| {

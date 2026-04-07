@@ -148,3 +148,68 @@
 : HERE  12 @ ;
 
 \ ALIGNED is already an IR primitive in the compiler.
+
+\ ---------------------------------------------------------------
+\ Phase 5: I/O, pictured numeric output, formatted output
+\ ---------------------------------------------------------------
+
+\ TYPE ( c-addr u -- )  output u characters
+: TYPE  0 ?DO DUP C@ EMIT 1+ LOOP DROP ;
+
+\ SPACES ( n -- )  output n spaces
+: SPACES  0 ?DO SPACE LOOP ;
+
+\ Pictured numeric output constants
+\ PAD_BASE = 0x0440, PAD_SIZE = 256, SYSVAR_HLD = 28
+
+\ <# ( -- )  begin pictured numeric output
+: <#  1344 28 ! ;
+
+\ HOLD ( char -- )  add character to pictured output
+: HOLD  28 @ 1- DUP 28 ! C! ;
+
+\ HOLDS ( addr u -- )  add string to pictured output
+: HOLDS
+  BEGIN DUP 0> WHILE
+    1- 2DUP + C@ HOLD
+  REPEAT 2DROP ;
+
+\ SIGN ( n -- )  if negative, add '-'
+: SIGN  0< IF 45 HOLD THEN ;
+
+\ # ( ud -- ud2 )  extract one digit from ud, convert to char, HOLD it.
+\ Double-cell division by BASE using two UM/MODs:
+\   First UM/MOD divides (0 ud-hi) by BASE -> rem1, quot-hi
+\   Second UM/MOD divides (rem1 ud-lo) by BASE -> digit, quot-lo
+: #
+  BASE @
+  >R 0 R@ UM/MOD R> SWAP >R
+  UM/MOD
+  SWAP DUP 9 > IF 7 + THEN 48 + HOLD
+  R> ;
+
+\ #S ( ud -- 0 0 )  convert all digits
+: #S  BEGIN # 2DUP OR 0= UNTIL ;
+
+\ #> ( ud -- c-addr u )  end pictured output, return string
+: #>  2DROP 28 @ 1344 OVER - ;
+
+\ Formatted output built on pictured numeric output
+
+\ . ( n -- )  print signed number and space
+: .  DUP ABS 0 <# #S ROT SIGN #> TYPE SPACE ;
+
+\ U. ( u -- )  print unsigned number and space
+: U.  0 <# #S #> TYPE SPACE ;
+
+\ .R ( n width -- )  print right-justified signed number
+: .R  >R DUP ABS 0 <# #S ROT SIGN #> R> OVER - SPACES TYPE ;
+
+\ U.R ( u width -- )  print right-justified unsigned number
+: U.R  >R 0 <# #S #> R> OVER - SPACES TYPE ;
+
+\ D. ( d -- )  print signed double number and space
+: D.  SWAP OVER DABS <# #S ROT SIGN #> TYPE SPACE ;
+
+\ D.R ( d width -- )  print right-justified signed double
+: D.R  >R SWAP OVER DABS <# #S ROT SIGN #> R> OVER - SPACES TYPE ;

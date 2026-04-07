@@ -118,51 +118,6 @@ struct DoesDefinition {
 }
 
 // ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
-// Number formatting helpers
-// ---------------------------------------------------------------------------
-
-/// Format a signed integer in the given base, followed by a space.
-fn format_signed(value: i32, base: u32) -> String {
-    if base == 10 {
-        format!("{value} ")
-    } else if value < 0 {
-        let abs = -(value as i64);
-        format!("-{} ", format_unsigned_digits(abs as u32, base))
-    } else {
-        format!("{} ", format_unsigned_digits(value as u32, base))
-    }
-}
-
-/// Format an unsigned integer in the given base, followed by a space.
-fn format_unsigned(value: u32, base: u32) -> String {
-    if base == 10 {
-        format!("{value} ")
-    } else {
-        format!("{} ", format_unsigned_digits(value, base))
-    }
-}
-
-/// Convert an unsigned value to a digit string in the given base.
-fn format_unsigned_digits(mut value: u32, base: u32) -> String {
-    if value == 0 {
-        return "0".to_string();
-    }
-    let mut digits = Vec::new();
-    while value > 0 {
-        let rem = (value % base) as u8;
-        let ch = if rem < 10 {
-            b'0' + rem
-        } else {
-            b'A' + rem - 10
-        };
-        digits.push(ch as char);
-        value /= base;
-    }
-    digits.iter().rev().collect()
-}
-
-// ---------------------------------------------------------------------------
 // ForthVM
 // ---------------------------------------------------------------------------
 
@@ -2148,16 +2103,14 @@ impl ForthVM {
         self.register_immediate_word()?;
         self.register_decimal()?;
         self.register_hex()?;
-        self.register_type_word()?;
-        self.register_spaces()?;
+        // TYPE, SPACES: defined in boot.fth
         self.register_tick()?;
         self.register_to_body()?;
         self.register_environment_q()?;
         self.register_source()?;
         self.register_abort()?;
 
-        // -- I/O: . (dot) needs host function because it does number-to-string --
-        self.register_dot()?;
+        // . (dot): defined in boot.fth
         self.register_dot_s()?;
         self.register_depth()?;
 
@@ -2177,7 +2130,7 @@ impl ForthVM {
         // FM/MOD, SM/REM, */, */MOD: defined in boot.fth
 
         // U. (unsigned dot)
-        self.register_u_dot()?;
+        // U.: defined in boot.fth
 
         // >NUMBER
         self.register_to_number()?;
@@ -2201,7 +2154,7 @@ impl ForthVM {
         // 2@, 2!: defined in boot.fth
 
         // Pictured numeric output
-        self.register_pictured_numeric()?;
+        // Pictured numeric output (<# # #S #> HOLD SIGN): defined in boot.fth
 
         // Exception word set: CATCH and THROW
         self.register_catch_throw()?;
@@ -2235,14 +2188,13 @@ impl ForthVM {
         // ERASE: defined in boot.fth
 
         // .R and U.R
-        self.register_dot_r()?;
-        self.register_u_dot_r()?;
+        // .R, U.R: defined in boot.fth
 
         // UNUSED
         self.register_unused()?;
 
         // HOLDS
-        self.register_holds()?;
+        // HOLDS: defined in boot.fth
 
         // PARSE as a host function (for compiled code)
         self.register_parse_host()?;
@@ -2278,8 +2230,7 @@ impl ForthVM {
         // DMAX, DMIN, M+, DU<, 2ROT: defined in boot.fth
         self.register_d_to_s()?;
         self.register_m_star_slash()?;
-        self.register_d_dot()?;
-        self.register_d_dot_r()?;
+        // D., D.R: defined in boot.fth
 
         // -- String word set --
         self.register_compare()?;
@@ -2300,38 +2251,6 @@ impl ForthVM {
             self.evaluate(line)?;
         }
 
-        Ok(())
-    }
-
-    /// Register the `.` (dot) word as a host function.
-    fn register_dot(&mut self) -> anyhow::Result<()> {
-        let memory = self.memory;
-        let dsp = self.dsp;
-        let output = Arc::clone(&self.output);
-
-        let func = Func::new(
-            &mut self.store,
-            FuncType::new(&self.engine, [], []),
-            move |mut caller, _params, _results| {
-                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
-                if sp >= DATA_STACK_TOP {
-                    return Err(wasmtime::Error::msg("stack underflow"));
-                }
-                let data = memory.data(&caller);
-                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
-                let value = i32::from_le_bytes(b);
-                let b: [u8; 4] = data[SYSVAR_BASE_VAR as usize..SYSVAR_BASE_VAR as usize + 4]
-                    .try_into()
-                    .unwrap();
-                let base_val = u32::from_le_bytes(b);
-                dsp.set(&mut caller, Val::I32((sp + CELL_SIZE) as i32))?;
-                let s = format_signed(value, base_val);
-                output.lock().unwrap().push_str(&s);
-                Ok(())
-            },
-        );
-
-        self.register_host_primitive(".", false, func)?;
         Ok(())
     }
 
@@ -3311,71 +3230,6 @@ impl ForthVM {
         Ok(())
     }
 
-    /// TYPE -- ( c-addr u -- ) output a string from memory.
-    fn register_type_word(&mut self) -> anyhow::Result<()> {
-        let memory = self.memory;
-        let dsp = self.dsp;
-        let output = Arc::clone(&self.output);
-
-        let func = Func::new(
-            &mut self.store,
-            FuncType::new(&self.engine, [], []),
-            move |mut caller, _params, _results| {
-                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
-                let data = memory.data(&caller);
-                // Pop u (length)
-                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
-                let len = i32::from_le_bytes(b) as usize;
-                // Pop c-addr
-                let b: [u8; 4] = data[(sp + 4) as usize..(sp + 8) as usize]
-                    .try_into()
-                    .unwrap();
-                let addr = i32::from_le_bytes(b) as u32 as usize;
-                dsp.set(&mut caller, Val::I32((sp + 8) as i32))?;
-                // Read string from memory and output
-                if len > 0 {
-                    let data = memory.data(&caller);
-                    if addr.saturating_add(len) > data.len() {
-                        return Err(wasmtime::Error::msg("TYPE: address out of range"));
-                    }
-                    let s = String::from_utf8_lossy(&data[addr..addr + len]).to_string();
-                    output.lock().unwrap().push_str(&s);
-                }
-                Ok(())
-            },
-        );
-
-        self.register_host_primitive("TYPE", false, func)?;
-        Ok(())
-    }
-
-    /// SPACES -- ( n -- ) output n spaces.
-    fn register_spaces(&mut self) -> anyhow::Result<()> {
-        let memory = self.memory;
-        let dsp = self.dsp;
-        let output = Arc::clone(&self.output);
-
-        let func = Func::new(
-            &mut self.store,
-            FuncType::new(&self.engine, [], []),
-            move |mut caller, _params, _results| {
-                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
-                let data = memory.data(&caller);
-                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
-                let n = i32::from_le_bytes(b);
-                dsp.set(&mut caller, Val::I32((sp + CELL_SIZE) as i32))?;
-                if n > 0 {
-                    let spaces = " ".repeat(n as usize);
-                    output.lock().unwrap().push_str(&spaces);
-                }
-                Ok(())
-            },
-        );
-
-        self.register_host_primitive("SPACES", false, func)?;
-        Ok(())
-    }
-
     /// ' (tick) in interpret mode -- push the xt (function table index) of the next word.
     fn register_tick(&mut self) -> anyhow::Result<()> {
         // Tick is handled as a special token in interpret_token_immediate.
@@ -4345,36 +4199,6 @@ impl ForthVM {
         Ok(())
     }
 
-    /// U. ( u -- ) unsigned dot.
-    fn register_u_dot(&mut self) -> anyhow::Result<()> {
-        let memory = self.memory;
-        let dsp = self.dsp;
-        let output = Arc::clone(&self.output);
-
-        let func = Func::new(
-            &mut self.store,
-            FuncType::new(&self.engine, [], []),
-            move |mut caller, _params, _results| {
-                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
-                let data = memory.data(&caller);
-                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
-                let value = u32::from_le_bytes(b);
-                // Read BASE from WASM memory
-                let b: [u8; 4] = data[SYSVAR_BASE_VAR as usize..SYSVAR_BASE_VAR as usize + 4]
-                    .try_into()
-                    .unwrap();
-                let base_val = u32::from_le_bytes(b);
-                dsp.set(&mut caller, Val::I32((sp + CELL_SIZE) as i32))?;
-                let s = format_unsigned(value, base_val);
-                output.lock().unwrap().push_str(&s);
-                Ok(())
-            },
-        );
-
-        self.register_host_primitive("U.", false, func)?;
-        Ok(())
-    }
-
     /// >NUMBER ( ud1 c-addr1 u1 -- ud2 c-addr2 u2 ) convert string to number.
     fn register_to_number(&mut self) -> anyhow::Result<()> {
         let memory = self.memory;
@@ -4791,240 +4615,6 @@ impl ForthVM {
     }
 
     // -----------------------------------------------------------------------
-    // Pictured numeric output: <# # #S #> HOLD SIGN
-    // -----------------------------------------------------------------------
-
-    /// Register pictured numeric output words.
-    fn register_pictured_numeric(&mut self) -> anyhow::Result<()> {
-        use crate::memory::{PAD_BASE, PAD_SIZE, SYSVAR_HLD};
-
-        // <# ( -- ) Initialize pictured numeric output
-        {
-            let memory = self.memory;
-            let func = Func::new(
-                &mut self.store,
-                FuncType::new(&self.engine, [], []),
-                move |mut caller, _params, _results| {
-                    let data = memory.data_mut(&mut caller);
-                    // HLD points to end of PAD area (we build string backwards)
-                    let hld = PAD_BASE + PAD_SIZE;
-                    data[SYSVAR_HLD as usize..SYSVAR_HLD as usize + 4]
-                        .copy_from_slice(&hld.to_le_bytes());
-                    Ok(())
-                },
-            );
-            self.register_host_primitive("<#", false, func)?;
-        }
-
-        // HOLD ( char -- ) Add character to pictured output
-        {
-            let memory = self.memory;
-            let dsp = self.dsp;
-            let func = Func::new(
-                &mut self.store,
-                FuncType::new(&self.engine, [], []),
-                move |mut caller, _params, _results| {
-                    let sp = dsp.get(&mut caller).unwrap_i32() as u32;
-                    let data = memory.data(&caller);
-                    let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
-                    let ch = i32::from_le_bytes(b) as u8;
-                    // Read HLD
-                    let b: [u8; 4] = data[SYSVAR_HLD as usize..SYSVAR_HLD as usize + 4]
-                        .try_into()
-                        .unwrap();
-                    let mut hld = u32::from_le_bytes(b);
-                    hld -= 1;
-                    let data = memory.data_mut(&mut caller);
-                    data[hld as usize] = ch;
-                    data[SYSVAR_HLD as usize..SYSVAR_HLD as usize + 4]
-                        .copy_from_slice(&hld.to_le_bytes());
-                    dsp.set(&mut caller, Val::I32((sp + 4) as i32))?;
-                    Ok(())
-                },
-            );
-            self.register_host_primitive("HOLD", false, func)?;
-        }
-
-        // SIGN ( n -- ) If n is negative, add '-' to pictured output
-        {
-            let memory = self.memory;
-            let dsp = self.dsp;
-            let func = Func::new(
-                &mut self.store,
-                FuncType::new(&self.engine, [], []),
-                move |mut caller, _params, _results| {
-                    let sp = dsp.get(&mut caller).unwrap_i32() as u32;
-                    let data = memory.data(&caller);
-                    let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
-                    let n = i32::from_le_bytes(b);
-                    // Pop n
-                    dsp.set(&mut caller, Val::I32((sp + 4) as i32))?;
-                    if n < 0 {
-                        // Add '-' like HOLD would
-                        let data = memory.data(&caller);
-                        let b: [u8; 4] = data[SYSVAR_HLD as usize..SYSVAR_HLD as usize + 4]
-                            .try_into()
-                            .unwrap();
-                        let mut hld = u32::from_le_bytes(b);
-                        hld -= 1;
-                        let data = memory.data_mut(&mut caller);
-                        data[hld as usize] = b'-';
-                        data[SYSVAR_HLD as usize..SYSVAR_HLD as usize + 4]
-                            .copy_from_slice(&hld.to_le_bytes());
-                    }
-                    Ok(())
-                },
-            );
-            self.register_host_primitive("SIGN", false, func)?;
-        }
-
-        // # ( ud1 -- ud2 ) Divide ud by BASE, convert remainder to char, HOLD it
-        {
-            let memory = self.memory;
-            let dsp = self.dsp;
-            let func = Func::new(
-                &mut self.store,
-                FuncType::new(&self.engine, [], []),
-                move |mut caller, _params, _results| {
-                    let sp = dsp.get(&mut caller).unwrap_i32() as u32;
-                    let data = memory.data(&caller);
-                    // ud is on the stack as two cells: hi at sp, lo at sp+4
-                    // Stack: ud-hi at sp (TOS), ud-lo at sp+4
-                    let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
-                    let ud_hi = u32::from_le_bytes(b) as u64;
-                    let b: [u8; 4] = data[(sp + 4) as usize..(sp + 8) as usize]
-                        .try_into()
-                        .unwrap();
-                    let ud_lo = u32::from_le_bytes(b) as u64;
-                    let ud = (ud_hi << 32) | ud_lo;
-
-                    // Read BASE from WASM memory (not base_cell)
-                    let b: [u8; 4] = data[SYSVAR_BASE_VAR as usize..SYSVAR_BASE_VAR as usize + 4]
-                        .try_into()
-                        .unwrap();
-                    let base = u32::from_le_bytes(b) as u64;
-                    let rem = (ud % base) as u32;
-                    let quot = ud / base;
-
-                    // Convert remainder to digit character
-                    let ch = if rem < 10 {
-                        b'0' + rem as u8
-                    } else {
-                        b'A' + (rem as u8 - 10)
-                    };
-
-                    // HOLD the character
-                    let data = memory.data(&caller);
-                    let b: [u8; 4] = data[SYSVAR_HLD as usize..SYSVAR_HLD as usize + 4]
-                        .try_into()
-                        .unwrap();
-                    let mut hld = u32::from_le_bytes(b);
-                    hld -= 1;
-                    let data = memory.data_mut(&mut caller);
-                    data[hld as usize] = ch;
-                    data[SYSVAR_HLD as usize..SYSVAR_HLD as usize + 4]
-                        .copy_from_slice(&hld.to_le_bytes());
-
-                    // Write quotient back
-                    let new_hi = (quot >> 32) as u32;
-                    let new_lo = quot as u32;
-                    data[sp as usize..sp as usize + 4].copy_from_slice(&new_hi.to_le_bytes());
-                    data[(sp + 4) as usize..(sp + 8) as usize]
-                        .copy_from_slice(&new_lo.to_le_bytes());
-                    Ok(())
-                },
-            );
-            self.register_host_primitive("#", false, func)?;
-        }
-
-        // #S ( ud1 -- 0 0 ) Convert all remaining digits
-        {
-            let memory = self.memory;
-            let dsp = self.dsp;
-            let func = Func::new(
-                &mut self.store,
-                FuncType::new(&self.engine, [], []),
-                move |mut caller, _params, _results| {
-                    let sp = dsp.get(&mut caller).unwrap_i32() as u32;
-                    let data = memory.data(&caller);
-                    let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
-                    let ud_hi = u32::from_le_bytes(b) as u64;
-                    let b: [u8; 4] = data[(sp + 4) as usize..(sp + 8) as usize]
-                        .try_into()
-                        .unwrap();
-                    let ud_lo = u32::from_le_bytes(b) as u64;
-                    let mut ud = (ud_hi << 32) | ud_lo;
-
-                    // Read BASE from WASM memory (not base_cell)
-                    let b: [u8; 4] = data[SYSVAR_BASE_VAR as usize..SYSVAR_BASE_VAR as usize + 4]
-                        .try_into()
-                        .unwrap();
-                    let base = u32::from_le_bytes(b) as u64;
-
-                    loop {
-                        let rem = (ud % base) as u32;
-                        ud /= base;
-                        let ch = if rem < 10 {
-                            b'0' + rem as u8
-                        } else {
-                            b'A' + (rem as u8 - 10)
-                        };
-                        let data = memory.data(&caller);
-                        let b: [u8; 4] = data[SYSVAR_HLD as usize..SYSVAR_HLD as usize + 4]
-                            .try_into()
-                            .unwrap();
-                        let mut hld = u32::from_le_bytes(b);
-                        hld -= 1;
-                        let data = memory.data_mut(&mut caller);
-                        data[hld as usize] = ch;
-                        data[SYSVAR_HLD as usize..SYSVAR_HLD as usize + 4]
-                            .copy_from_slice(&hld.to_le_bytes());
-                        if ud == 0 {
-                            break;
-                        }
-                    }
-
-                    let data = memory.data_mut(&mut caller);
-                    data[sp as usize..sp as usize + 4].copy_from_slice(&0u32.to_le_bytes());
-                    data[(sp + 4) as usize..(sp + 8) as usize].copy_from_slice(&0u32.to_le_bytes());
-                    Ok(())
-                },
-            );
-            self.register_host_primitive("#S", false, func)?;
-        }
-
-        // #> ( xd -- c-addr u ) Finish pictured output, return string
-        {
-            let memory = self.memory;
-            let dsp = self.dsp;
-            let func = Func::new(
-                &mut self.store,
-                FuncType::new(&self.engine, [], []),
-                move |mut caller, _params, _results| {
-                    let sp = dsp.get(&mut caller).unwrap_i32() as u32;
-                    let data = memory.data(&caller);
-                    // Drop the double-cell, read HLD
-                    let b: [u8; 4] = data[SYSVAR_HLD as usize..SYSVAR_HLD as usize + 4]
-                        .try_into()
-                        .unwrap();
-                    let hld = u32::from_le_bytes(b);
-                    let end = PAD_BASE + PAD_SIZE;
-                    let len = end - hld;
-                    // Replace the double on stack with (c-addr u)
-                    let data = memory.data_mut(&mut caller);
-                    data[(sp + 4) as usize..(sp + 8) as usize]
-                        .copy_from_slice(&(hld as i32).to_le_bytes());
-                    data[sp as usize..sp as usize + 4].copy_from_slice(&(len as i32).to_le_bytes());
-                    Ok(())
-                },
-            );
-            self.register_host_primitive("#>", false, func)?;
-        }
-
-        Ok(())
-    }
-
-    // -----------------------------------------------------------------------
     // Improved SOURCE
     // -----------------------------------------------------------------------
 
@@ -5153,89 +4743,6 @@ impl ForthVM {
         Ok(())
     }
 
-    /// .R ( n width -- ) right-justified signed number output.
-    fn register_dot_r(&mut self) -> anyhow::Result<()> {
-        let memory = self.memory;
-        let dsp = self.dsp;
-        let output = Arc::clone(&self.output);
-
-        let func = Func::new(
-            &mut self.store,
-            FuncType::new(&self.engine, [], []),
-            move |mut caller, _params, _results| {
-                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
-                let data = memory.data(&caller);
-                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
-                let width = i32::from_le_bytes(b) as usize;
-                let b: [u8; 4] = data[(sp + 4) as usize..(sp + 8) as usize]
-                    .try_into()
-                    .unwrap();
-                let n = i32::from_le_bytes(b);
-                // Read BASE
-                let b: [u8; 4] = data[SYSVAR_BASE_VAR as usize..SYSVAR_BASE_VAR as usize + 4]
-                    .try_into()
-                    .unwrap();
-                let base_val = u32::from_le_bytes(b);
-                dsp.set(&mut caller, Val::I32((sp + 8) as i32))?;
-                // Format number without trailing space
-                let s = format_signed(n, base_val);
-                let s = s.trim_end(); // remove trailing space
-                let mut out = output.lock().unwrap();
-                if s.len() < width {
-                    for _ in 0..width - s.len() {
-                        out.push(' ');
-                    }
-                }
-                out.push_str(s);
-                Ok(())
-            },
-        );
-
-        self.register_host_primitive(".R", false, func)?;
-        Ok(())
-    }
-
-    /// U.R ( u width -- ) right-justified unsigned number output.
-    fn register_u_dot_r(&mut self) -> anyhow::Result<()> {
-        let memory = self.memory;
-        let dsp = self.dsp;
-        let output = Arc::clone(&self.output);
-
-        let func = Func::new(
-            &mut self.store,
-            FuncType::new(&self.engine, [], []),
-            move |mut caller, _params, _results| {
-                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
-                let data = memory.data(&caller);
-                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
-                let width = i32::from_le_bytes(b) as usize;
-                let b: [u8; 4] = data[(sp + 4) as usize..(sp + 8) as usize]
-                    .try_into()
-                    .unwrap();
-                let u = u32::from_le_bytes(b);
-                // Read BASE
-                let b: [u8; 4] = data[SYSVAR_BASE_VAR as usize..SYSVAR_BASE_VAR as usize + 4]
-                    .try_into()
-                    .unwrap();
-                let base_val = u32::from_le_bytes(b);
-                dsp.set(&mut caller, Val::I32((sp + 8) as i32))?;
-                let s = format_unsigned(u, base_val);
-                let s = s.trim_end();
-                let mut out = output.lock().unwrap();
-                if s.len() < width {
-                    for _ in 0..width - s.len() {
-                        out.push(' ');
-                    }
-                }
-                out.push_str(s);
-                Ok(())
-            },
-        );
-
-        self.register_host_primitive("U.R", false, func)?;
-        Ok(())
-    }
-
     /// UNUSED ( -- u ) return available dictionary space.
     fn register_unused(&mut self) -> anyhow::Result<()> {
         let memory = self.memory;
@@ -5263,47 +4770,6 @@ impl ForthVM {
         );
 
         self.register_host_primitive("UNUSED", false, func)?;
-        Ok(())
-    }
-
-    /// HOLDS ( c-addr u -- ) add string to pictured output.
-    fn register_holds(&mut self) -> anyhow::Result<()> {
-        use crate::memory::SYSVAR_HLD;
-
-        let memory = self.memory;
-        let dsp = self.dsp;
-
-        let func = Func::new(
-            &mut self.store,
-            FuncType::new(&self.engine, [], []),
-            move |mut caller, _params, _results| {
-                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
-                let data = memory.data(&caller);
-                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
-                let u = i32::from_le_bytes(b) as usize;
-                let b: [u8; 4] = data[(sp + 4) as usize..(sp + 8) as usize]
-                    .try_into()
-                    .unwrap();
-                let c_addr = i32::from_le_bytes(b) as usize;
-                // Read HLD
-                let b: [u8; 4] = data[SYSVAR_HLD as usize..SYSVAR_HLD as usize + 4]
-                    .try_into()
-                    .unwrap();
-                let mut hld = u32::from_le_bytes(b);
-                dsp.set(&mut caller, Val::I32((sp + 8) as i32))?;
-                // Add string to pictured output (backwards)
-                let data = memory.data_mut(&mut caller);
-                for i in (0..u).rev() {
-                    hld -= 1;
-                    data[hld as usize] = data[c_addr + i];
-                }
-                data[SYSVAR_HLD as usize..SYSVAR_HLD as usize + 4]
-                    .copy_from_slice(&hld.to_le_bytes());
-                Ok(())
-            },
-        );
-
-        self.register_host_primitive("HOLDS", false, func)?;
         Ok(())
     }
 
@@ -5501,88 +4967,6 @@ impl ForthVM {
         );
 
         self.register_host_primitive("M*/", false, func)?;
-        Ok(())
-    }
-
-    /// D. ( d -- ) print double-cell number.
-    fn register_d_dot(&mut self) -> anyhow::Result<()> {
-        let memory = self.memory;
-        let dsp = self.dsp;
-        let output = Arc::clone(&self.output);
-
-        let func = Func::new(
-            &mut self.store,
-            FuncType::new(&self.engine, [], []),
-            move |mut caller, _params, _results| {
-                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
-                let data = memory.data(&caller);
-                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
-                let hi = i32::from_le_bytes(b) as i64;
-                let b: [u8; 4] = data[(sp + 4) as usize..(sp + 8) as usize]
-                    .try_into()
-                    .unwrap();
-                let lo = u32::from_le_bytes(b) as i64;
-                let d = (hi << 32) | (lo & 0xFFFF_FFFF);
-                // Read BASE
-                let b: [u8; 4] = data[SYSVAR_BASE_VAR as usize..SYSVAR_BASE_VAR as usize + 4]
-                    .try_into()
-                    .unwrap();
-                let base_val = u32::from_le_bytes(b);
-                dsp.set(&mut caller, Val::I32((sp + 8) as i32))?;
-                let s = format_signed_64(d, base_val);
-                output.lock().unwrap().push_str(&s);
-                Ok(())
-            },
-        );
-
-        self.register_host_primitive("D.", false, func)?;
-        Ok(())
-    }
-
-    /// D.R ( d width -- ) right-justified double-cell number output.
-    fn register_d_dot_r(&mut self) -> anyhow::Result<()> {
-        let memory = self.memory;
-        let dsp = self.dsp;
-        let output = Arc::clone(&self.output);
-
-        let func = Func::new(
-            &mut self.store,
-            FuncType::new(&self.engine, [], []),
-            move |mut caller, _params, _results| {
-                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
-                let data = memory.data(&caller);
-                // Stack: width(sp), d-hi(sp+4), d-lo(sp+8)
-                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
-                let width = i32::from_le_bytes(b) as usize;
-                let b: [u8; 4] = data[(sp + 4) as usize..(sp + 8) as usize]
-                    .try_into()
-                    .unwrap();
-                let hi = i32::from_le_bytes(b) as i64;
-                let b: [u8; 4] = data[(sp + 8) as usize..(sp + 12) as usize]
-                    .try_into()
-                    .unwrap();
-                let lo = u32::from_le_bytes(b) as i64;
-                let d = (hi << 32) | (lo & 0xFFFF_FFFF);
-                // Read BASE
-                let b: [u8; 4] = data[SYSVAR_BASE_VAR as usize..SYSVAR_BASE_VAR as usize + 4]
-                    .try_into()
-                    .unwrap();
-                let base_val = u32::from_le_bytes(b);
-                dsp.set(&mut caller, Val::I32((sp + 12) as i32))?;
-                let s = format_signed_64(d, base_val);
-                let s = s.trim_end();
-                let mut out = output.lock().unwrap();
-                if s.len() < width {
-                    for _ in 0..width - s.len() {
-                        out.push(' ');
-                    }
-                }
-                out.push_str(s);
-                Ok(())
-            },
-        );
-
-        self.register_host_primitive("D.R", false, func)?;
         Ok(())
     }
 
@@ -7103,43 +6487,6 @@ fn represent_float(val: f64, buf_len: usize) -> (String, i32, bool, bool) {
     }
     let padded = format!("{digits:0>buf_len$}");
     (padded, exp, is_negative, true)
-}
-
-/// Format a signed 64-bit integer in the given base, followed by a space.
-fn format_signed_64(value: i64, base: u32) -> String {
-    if base == 10 {
-        format!("{value} ")
-    } else if value < 0 {
-        let abs = if value == i64::MIN {
-            // Handle overflow: i64::MIN cannot be negated
-            (value as u64).to_string()
-        } else {
-            format_unsigned_digits_64((-value) as u64, base)
-        };
-        format!("-{abs} ")
-    } else {
-        format!("{} ", format_unsigned_digits_64(value as u64, base))
-    }
-}
-
-/// Convert an unsigned 64-bit value to a digit string in the given base.
-fn format_unsigned_digits_64(mut value: u64, base: u32) -> String {
-    if value == 0 {
-        return "0".to_string();
-    }
-    let mut digits = Vec::new();
-    let base = base as u64;
-    while value > 0 {
-        let rem = (value % base) as u8;
-        let ch = if rem < 10 {
-            b'0' + rem
-        } else {
-            b'A' + rem - 10
-        };
-        digits.push(ch as char);
-        value /= base;
-    }
-    digits.iter().rev().collect()
 }
 
 // ---------------------------------------------------------------------------
