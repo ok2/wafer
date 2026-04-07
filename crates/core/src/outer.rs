@@ -7945,6 +7945,18 @@ mod tests {
     }
 
     #[test]
+    fn test_inline_tailcall_rstack_interaction() {
+        // Regression: inlining a word that had a TailCall inside an If branch
+        // caused the TailCall's Return to exit the *caller*, corrupting the
+        // return stack. The fix: detailcall() recursively converts TailCall
+        // back to Call inside all nested control-flow bodies when inlining.
+        assert_eq!(
+            eval_stack(": T 42 >R 99 >R -7 -1 DABS R> R> ; T"),
+            vec![42, 99, 0, 7]
+        );
+    }
+
+    #[test]
     fn test_do_loop_with_i_and_step() {
         // +LOOP with step of 2
         assert_eq!(

@@ -505,13 +505,10 @@ fn inline(ops: Vec<IrOp>, bodies: &HashMap<WordId, Vec<IrOp>>, max_size: usize) 
                     && body.len() <= max_size
                     && !contains_call_to(body, *id)
                 {
-                    // Inline the body, converting TailCall back to Call
-                    // (tail position in the callee is not tail position in the caller)
+                    // Inline the body, recursively converting TailCall back to Call
+                    // (tail position in the callee is not tail position in the caller).
                     for inlined_op in body {
-                        match inlined_op {
-                            IrOp::TailCall(tid) => out.push(IrOp::Call(*tid)),
-                            other => out.push(other.clone()),
-                        }
+                        out.push(detailcall(inlined_op.clone()));
                     }
                     continue;
                 }
@@ -525,6 +522,54 @@ fn inline(ops: Vec<IrOp>, bodies: &HashMap<WordId, Vec<IrOp>>, max_size: usize) 
         }
     }
     out
+}
+
+/// Recursively convert all `TailCall` ops to `Call` in an IR tree.
+///
+/// When inlining a callee, its tail-call positions are no longer tail positions
+/// in the caller. The `TailCall` codegen emits `Return` after the call, which
+/// would prematurely exit the caller's function. This must recurse into
+/// control-flow bodies (If, loops) where `convert_tail_call` may have placed
+/// `TailCall` ops.
+fn detailcall(op: IrOp) -> IrOp {
+    match op {
+        IrOp::TailCall(id) => IrOp::Call(id),
+        IrOp::If {
+            then_body,
+            else_body,
+        } => IrOp::If {
+            then_body: then_body.into_iter().map(detailcall).collect(),
+            else_body: else_body.map(|eb| eb.into_iter().map(detailcall).collect()),
+        },
+        IrOp::DoLoop { body, is_plus_loop } => IrOp::DoLoop {
+            body: body.into_iter().map(detailcall).collect(),
+            is_plus_loop,
+        },
+        IrOp::BeginUntil { body } => IrOp::BeginUntil {
+            body: body.into_iter().map(detailcall).collect(),
+        },
+        IrOp::BeginAgain { body } => IrOp::BeginAgain {
+            body: body.into_iter().map(detailcall).collect(),
+        },
+        IrOp::BeginWhileRepeat { test, body } => IrOp::BeginWhileRepeat {
+            test: test.into_iter().map(detailcall).collect(),
+            body: body.into_iter().map(detailcall).collect(),
+        },
+        IrOp::BeginDoubleWhileRepeat {
+            outer_test,
+            inner_test,
+            body,
+            after_repeat,
+            else_body,
+        } => IrOp::BeginDoubleWhileRepeat {
+            outer_test: outer_test.into_iter().map(detailcall).collect(),
+            inner_test: inner_test.into_iter().map(detailcall).collect(),
+            body: body.into_iter().map(detailcall).collect(),
+            after_repeat: after_repeat.into_iter().map(detailcall).collect(),
+            else_body: else_body.map(|eb| eb.into_iter().map(detailcall).collect()),
+        },
+        other => other,
+    }
 }
 
 /// Check if an IR body contains a direct call to the given word (recursion guard).
