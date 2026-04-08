@@ -1,2 +1,0 @@
-: SQUARE DUP * ;
-7 SQUARE . CR
