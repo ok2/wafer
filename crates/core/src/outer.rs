@@ -1075,6 +1075,27 @@ impl ForthVM {
                 });
                 // compiling_ir is now empty and will collect the else_body
             }
+            Some(ControlEntry::IfElse {
+                then_body,
+                else_body: mut prefix,
+            }) => {
+                // Multiple ELSE: save the condition flag on the return stack
+                // so subsequent IFs can re-test it with R@.
+                let first_else = std::mem::take(&mut self.compiling_ir);
+                prefix.push(IrOp::ToR); // save flag to return stack
+                prefix.push(IrOp::RFetch); // copy for first If test
+                prefix.push(IrOp::If {
+                    then_body,
+                    else_body: Some(first_else),
+                });
+                // R-stack still holds the flag; push R@ for next If test
+                prefix.push(IrOp::RFetch);
+                // Push an If entry — the next code will be the "then" body
+                // of the next branch pair (e.g., code "3" in IF 1 ELSE 2 ELSE 3 ELSE 4)
+                self.control_stack
+                    .push(ControlEntry::If { then_body: prefix });
+                // compiling_ir is empty, collects the next then-code
+            }
             Some(ControlEntry::PostDoubleWhileRepeat {
                 outer_test,
                 inner_test,
@@ -1103,12 +1124,18 @@ impl ForthVM {
             Some(ControlEntry::If { then_body: prefix }) => {
                 // compiling_ir has the then_body ops
                 let then_body = std::mem::take(&mut self.compiling_ir);
-                // Restore prefix and append the If node
+                // Check if this was created by a multi-ELSE desugaring
+                // (prefix ends with RFetch which pushed the flag for this If)
+                let multi_else = matches!(prefix.last(), Some(IrOp::RFetch));
                 self.compiling_ir = prefix;
                 self.compiling_ir.push(IrOp::If {
                     then_body,
                     else_body: None,
                 });
+                if multi_else {
+                    self.compiling_ir.push(IrOp::FromR);
+                    self.compiling_ir.push(IrOp::Drop);
+                }
             }
             Some(ControlEntry::IfElse {
                 then_body,
@@ -1116,11 +1143,17 @@ impl ForthVM {
             }) => {
                 // compiling_ir has the else_body ops
                 let else_body = std::mem::take(&mut self.compiling_ir);
+                // Check if this was created by a multi-ELSE desugaring
+                let multi_else = matches!(prefix.last(), Some(IrOp::RFetch));
                 self.compiling_ir = prefix;
                 self.compiling_ir.push(IrOp::If {
                     then_body,
                     else_body: Some(else_body),
                 });
+                if multi_else {
+                    self.compiling_ir.push(IrOp::FromR);
+                    self.compiling_ir.push(IrOp::Drop);
+                }
             }
             Some(ControlEntry::PostDoubleWhileRepeat {
                 outer_test,
