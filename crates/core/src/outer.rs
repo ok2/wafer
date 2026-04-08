@@ -4264,6 +4264,34 @@ impl ForthVM {
             self.register_host_primitive("CREATE", false, func)?;
         }
 
+        // 2CONSTANT: sets pending_define to 9
+        {
+            let pending = Arc::clone(&self.pending_define);
+            let func = Func::new(
+                &mut self.store,
+                FuncType::new(&self.engine, [], []),
+                move |_caller, _params, _results| {
+                    *pending.lock().unwrap() = 9;
+                    Ok(())
+                },
+            );
+            self.register_host_primitive("2CONSTANT", false, func)?;
+        }
+
+        // 2VARIABLE: sets pending_define to 10
+        {
+            let pending = Arc::clone(&self.pending_define);
+            let func = Func::new(
+                &mut self.store,
+                FuncType::new(&self.engine, [], []),
+                move |_caller, _params, _results| {
+                    *pending.lock().unwrap() = 10;
+                    Ok(())
+                },
+            );
+            self.register_host_primitive("2VARIABLE", false, func)?;
+        }
+
         Ok(())
     }
 
@@ -4422,6 +4450,8 @@ impl ForthVM {
             6 => self.interpret_find(),
             7 => self.interpret_parse(),
             8 => self.interpret_parse_name(),
+            9 => self.define_2constant(),
+            10 => self.define_2variable(),
             _ => Ok(()),
         }
     }

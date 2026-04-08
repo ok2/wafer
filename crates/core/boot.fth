@@ -118,7 +118,8 @@
 : M+  S>D D+ ;
 
 \ DU< ( ud1 ud2 -- flag )  unsigned double-cell less-than
-: DU<  ROT 2DUP = IF 2DROP U< ELSE U< NIP NIP THEN ;
+\ Compare high cells (unsigned); if equal, compare low cells unsigned.
+: DU<  ROT 2DUP = IF 2DROP U< ELSE SWAP U< NIP NIP THEN ;
 
 \ ---------------------------------------------------------------
 \ Phase 3: Mixed arithmetic (built on M* and UM/MOD host primitives)
