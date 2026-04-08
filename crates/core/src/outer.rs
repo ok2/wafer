@@ -2624,8 +2624,9 @@ impl ForthVM {
             .create(&name, false)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        // Allocate the buffer in WASM memory
+        // Allocate the buffer in WASM memory (aligned to cell boundary)
         self.refresh_user_here();
+        self.user_here = (self.user_here + 3) & !3; // ALIGN
         let buf_addr = self.user_here;
         self.user_here += size;
 
@@ -3417,13 +3418,24 @@ impl ForthVM {
         let s =
             String::from_utf8_lossy(&data[addr as usize..addr as usize + len as usize]).to_string();
 
-        // Save current input state
+        // Save current input state and SOURCE-ID
         let saved_buffer = std::mem::take(&mut self.input_buffer);
         let saved_pos = self.input_pos;
+        let data = self.memory.data(&self.store);
+        let saved_source_id = i32::from_le_bytes(
+            data[crate::memory::SYSVAR_SOURCE_ID as usize
+                ..crate::memory::SYSVAR_SOURCE_ID as usize + 4]
+                .try_into()
+                .unwrap(),
+        );
 
-        // Set new input
+        // Set new input and SOURCE-ID = -1 (string source)
         self.input_buffer = s;
         self.input_pos = 0;
+        let data = self.memory.data_mut(&mut self.store);
+        data[crate::memory::SYSVAR_SOURCE_ID as usize
+            ..crate::memory::SYSVAR_SOURCE_ID as usize + 4]
+            .copy_from_slice(&(-1i32).to_le_bytes());
 
         // Sync input buffer, >IN, and #TIB to WASM (for SOURCE and WORD)
         {
@@ -3460,7 +3472,7 @@ impl ForthVM {
             }
         }
 
-        // Restore input state and sync back to WASM
+        // Restore input state, SOURCE-ID, and sync back to WASM
         self.input_buffer = saved_buffer;
         self.input_pos = saved_pos;
         {
@@ -3473,6 +3485,9 @@ impl ForthVM {
                 .copy_from_slice(&(self.input_pos as u32).to_le_bytes());
             data[SYSVAR_NUM_TIB as usize..SYSVAR_NUM_TIB as usize + 4]
                 .copy_from_slice(&(len as u32).to_le_bytes());
+            data[crate::memory::SYSVAR_SOURCE_ID as usize
+                ..crate::memory::SYSVAR_SOURCE_ID as usize + 4]
+                .copy_from_slice(&saved_source_id.to_le_bytes());
         }
 
         Ok(())
