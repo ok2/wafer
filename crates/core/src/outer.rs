@@ -1384,9 +1384,9 @@ impl ForthVM {
     /// Build the nested IR for a CASE statement.
     fn compile_case_ir(&mut self, branches: &[(Vec<IrOp>, Vec<IrOp>)], default_code: &[IrOp]) {
         if branches.is_empty() {
-            // Default case: just emit DROP and default code
-            self.compiling_ir.push(IrOp::Drop);
+            // Default case: emit default code first, then DROP the selector
             self.compiling_ir.extend(default_code.iter().cloned());
+            self.compiling_ir.push(IrOp::Drop);
             return;
         }
 
@@ -2086,6 +2086,8 @@ impl ForthVM {
             vec![IrOp::Rot, IrOp::ToR, IrOp::Rot, IrOp::FromR],
         )?;
         // 2OVER: defined in boot.fth
+        // PICK: defined in boot.fth
+        self.register_roll()?;
         self.register_qdup()?;
         // PICK: defined in boot.fth (uses SP@ IR op)
         self.register_min()?;
@@ -2778,6 +2780,10 @@ impl ForthVM {
         let delim = self.pop_data_stack()? as u8 as char;
 
         let bytes = self.input_buffer.as_bytes();
+        // Skip one leading space (the delimiter between the parsed word and its argument)
+        if self.input_pos < bytes.len() && bytes[self.input_pos] == b' ' {
+            self.input_pos += 1;
+        }
         let start = self.input_pos;
         while self.input_pos < bytes.len() && bytes[self.input_pos] != delim as u8 {
             self.input_pos += 1;
@@ -2952,6 +2958,57 @@ impl ForthVM {
     // -----------------------------------------------------------------------
     // Priority 4: Stack/arithmetic host functions
     // -----------------------------------------------------------------------
+
+    /// ROLL -- ( xu xu-1 ... x0 u -- xu-1 ... x0 xu ) rotate u+1 items.
+    fn register_roll(&mut self) -> anyhow::Result<()> {
+        let memory = self.memory;
+        let dsp = self.dsp;
+
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                // Pop u from stack
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let data = memory.data(&caller);
+                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
+                let u = i32::from_le_bytes(b) as u32;
+                let sp = sp + CELL_SIZE; // pop u
+
+                if u == 0 {
+                    // 0 ROLL is a no-op
+                    dsp.set(&mut caller, Val::I32(sp as i32))?;
+                    return Ok(());
+                }
+
+                // Save xu (the deep item to bring to top)
+                let xu_addr = sp + u * CELL_SIZE;
+                let data = memory.data(&caller);
+                let saved: [u8; 4] = data[xu_addr as usize..xu_addr as usize + 4]
+                    .try_into()
+                    .unwrap();
+
+                // Shift items from sp to sp+(u-1)*4 toward higher addresses by one cell
+                // (i.e., move each item one position deeper)
+                let data = memory.data_mut(&mut caller);
+                let src_start = sp as usize;
+                let count = (u * CELL_SIZE) as usize;
+                // Copy backward to handle overlap correctly
+                for i in (0..count).rev() {
+                    data[src_start + CELL_SIZE as usize + i] = data[src_start + i];
+                }
+
+                // Write saved xu at new TOS
+                data[sp as usize..sp as usize + 4].copy_from_slice(&saved);
+
+                dsp.set(&mut caller, Val::I32(sp as i32))?;
+                Ok(())
+            },
+        );
+
+        self.register_host_primitive("ROLL", false, func)?;
+        Ok(())
+    }
 
     /// ?DUP -- ( x -- 0 | x x ) duplicate if non-zero.
     fn register_qdup(&mut self) -> anyhow::Result<()> {
@@ -4445,6 +4502,17 @@ impl ForthVM {
         );
 
         self.register_host_primitive("\\", true, func)?;
+
+        // .( is an immediate word that prints until closing paren.
+        // Register as no-op in dictionary so FIND can discover it as immediate.
+        // The actual parsing is handled by interpret_token_immediate/compile_token.
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            |_caller, _params, _results| Ok(()),
+        );
+        self.register_host_primitive(".(", true, func)?;
+
         Ok(())
     }
 
@@ -4587,8 +4655,18 @@ impl ForthVM {
             &mut self.store,
             FuncType::new(&self.engine, [], []),
             move |mut caller, _params, _results| {
-                let here_val = here_cell.as_ref().map_or(0, |c| *c.lock().unwrap());
-                let mem_size = memory.data(&caller).len() as u32;
+                let mut here_val = here_cell.as_ref().map_or(0, |c| *c.lock().unwrap());
+                let data = memory.data(&caller);
+                let mem_size = data.len() as u32;
+                // Also read SYSVAR_HERE from WASM (Forth ALLOT/,/C, update it directly)
+                let mem_here = u32::from_le_bytes(
+                    data[SYSVAR_HERE as usize..SYSVAR_HERE as usize + 4]
+                        .try_into()
+                        .unwrap(),
+                );
+                if mem_here > here_val && mem_here < mem_size {
+                    here_val = mem_here;
+                }
                 let unused = mem_size.saturating_sub(here_val);
                 let sp = dsp.get(&mut caller).unwrap_i32() as u32;
                 if sp < CELL_SIZE || sp > mem_size {
@@ -7384,13 +7462,12 @@ mod tests {
     #[test]
     fn test_parse() {
         // PARSE ( char -- c-addr u ) in interpret mode
-        // PARSE does NOT skip leading delimiter, so includes leading space
+        // Skips one leading space (outer interpreter's trailing delimiter)
         let mut vm = ForthVM::new().unwrap();
         vm.evaluate("CHAR ) PARSE hello)").unwrap();
         let stack = vm.data_stack();
         assert_eq!(stack.len(), 2);
-        // The parsed text is " hello" (with leading space) -- length 6
-        assert_eq!(stack[0], 6); // length
+        assert_eq!(stack[0], 5); // length of "hello"
     }
 
     #[test]
