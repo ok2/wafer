@@ -597,13 +597,12 @@ impl ForthVM {
         }
         if token_upper == "S\\\"" {
             // S\" with escape sequences in interpret mode
-            if let Some(s) = self.parse_s_escape() {
+            if let Some(raw) = self.parse_s_escape() {
                 self.refresh_user_here();
                 let addr = self.user_here;
-                let bytes = s.as_bytes();
-                let len = bytes.len() as u32;
+                let len = raw.len() as u32;
                 let data = self.memory.data_mut(&mut self.store);
-                data[addr as usize..addr as usize + len as usize].copy_from_slice(bytes);
+                data[addr as usize..addr as usize + len as usize].copy_from_slice(&raw);
                 self.user_here += len;
                 self.sync_here_cell();
                 self.push_data_stack(addr as i32)?;
@@ -978,13 +977,12 @@ impl ForthVM {
             }
             "S\\\"" => {
                 // S\" with escape sequences
-                if let Some(s) = self.parse_s_escape() {
+                if let Some(raw) = self.parse_s_escape() {
                     self.refresh_user_here();
                     let addr = self.user_here;
-                    let bytes = s.as_bytes();
-                    let len = bytes.len() as u32;
+                    let len = raw.len() as u32;
                     let data = self.memory.data_mut(&mut self.store);
-                    data[addr as usize..addr as usize + len as usize].copy_from_slice(bytes);
+                    data[addr as usize..addr as usize + len as usize].copy_from_slice(&raw);
                     self.user_here += len;
                     self.sync_here_cell();
                     self.push_ir(IrOp::PushI32(addr as i32));
@@ -2865,7 +2863,7 @@ impl ForthVM {
     }
 
     /// Parse a string with escape sequences for S\".
-    fn parse_s_escape(&mut self) -> Option<String> {
+    fn parse_s_escape(&mut self) -> Option<Vec<u8>> {
         let bytes = self.input_buffer.as_bytes();
         // Skip one leading space if present
         if self.input_pos < bytes.len() && bytes[self.input_pos] == b' ' {
@@ -2924,7 +2922,7 @@ impl ForthVM {
         if self.input_pos < bytes.len() {
             self.input_pos += 1;
         }
-        Some(String::from_utf8_lossy(&result).to_string())
+        Some(result)
     }
 
     // -----------------------------------------------------------------------
