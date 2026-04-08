@@ -4961,6 +4961,18 @@ impl ForthVM {
                 let size = u32::from_le_bytes(b);
 
                 let mem_len = data.len() as u32;
+
+                // Reject obviously impossible sizes (> available memory)
+                if size > mem_len / 2 {
+                    let data = memory.data_mut(&mut caller);
+                    data[sp as usize..sp as usize + 4].copy_from_slice(&0i32.to_le_bytes());
+                    let new_sp = sp - CELL_SIZE;
+                    data[new_sp as usize..new_sp as usize + 4]
+                        .copy_from_slice(&(-1i32).to_le_bytes());
+                    dsp.set(&mut caller, Val::I32(new_sp as i32))?;
+                    return Ok(());
+                }
+
                 // Allocate from top of memory, growing downward
                 // Use last 4 bytes of memory as the allocation pointer
                 let alloc_ptr_addr = mem_len - 4;
@@ -4973,8 +4985,8 @@ impl ForthVM {
                 }
 
                 // Block: [size(4)] [data(size)] — aligned to 4 bytes
-                let aligned_size = size.wrapping_add(3) & !3;
-                let block_size = 4u32.wrapping_add(aligned_size);
+                let aligned_size = (size + 3) & !3;
+                let block_size = 4 + aligned_size;
 
                 if alloc_top < block_size + 0x20000 {
                     // Not enough memory (leave some space for dictionary growth)
@@ -5047,7 +5059,19 @@ impl ForthVM {
                     .unwrap();
                 let old_addr = u32::from_le_bytes(b);
 
+                let mem_len = data.len() as u32;
+
+                // Reject obviously impossible sizes
+                if new_size > mem_len / 2 {
+                    let data = memory.data_mut(&mut caller);
+                    data[(sp + 4) as usize..(sp + 8) as usize]
+                        .copy_from_slice(&(old_addr as i32).to_le_bytes());
+                    data[sp as usize..sp as usize + 4].copy_from_slice(&(-1i32).to_le_bytes());
+                    return Ok(());
+                }
+
                 // Read old size from header (4 bytes before old_addr)
+                let data = memory.data(&caller);
                 let old_size = if old_addr >= 4 {
                     let b: [u8; 4] = data[(old_addr - 4) as usize..old_addr as usize]
                         .try_into()
@@ -5057,7 +5081,6 @@ impl ForthVM {
                     0
                 };
 
-                let mem_len = data.len() as u32;
                 let alloc_ptr_addr = mem_len - 4;
                 let b: [u8; 4] = data[alloc_ptr_addr as usize..mem_len as usize]
                     .try_into()
@@ -5067,8 +5090,8 @@ impl ForthVM {
                     alloc_top = mem_len - 8;
                 }
 
-                let aligned_size = new_size.wrapping_add(3) & !3;
-                let block_size = 4u32.wrapping_add(aligned_size);
+                let aligned_size = (new_size + 3) & !3;
+                let block_size = 4 + aligned_size;
 
                 if alloc_top < block_size + 0x20000 {
                     // Allocation failure
