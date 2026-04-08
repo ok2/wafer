@@ -2206,6 +2206,9 @@ impl ForthVM {
         // REFILL as a host function (always returns FALSE in piped mode)
         self.register_refill()?;
 
+        // Memory-Allocation word set
+        self.register_memory_alloc()?;
+
         // S\" (string with escape sequences)
         // Handled as a special token in compile_token/interpret_token
 
@@ -4905,6 +4908,180 @@ impl ForthVM {
     // -----------------------------------------------------------------------
     // Double-Number word set
     // -----------------------------------------------------------------------
+
+    /// Memory-Allocation word set: ALLOCATE, FREE, RESIZE.
+    ///
+    /// Uses a simple arena allocator at the top of WASM linear memory.
+    /// Each allocated block has a 4-byte header storing its size.
+    fn register_memory_alloc(&mut self) -> anyhow::Result<()> {
+        let memory = self.memory;
+        let dsp = self.dsp;
+
+        // ALLOCATE ( u -- a-addr ior )
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let data = memory.data(&caller);
+                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
+                let size = u32::from_le_bytes(b);
+
+                let mem_len = data.len() as u32;
+                // Allocate from top of memory, growing downward
+                // Use last 4 bytes of memory as the allocation pointer
+                let alloc_ptr_addr = mem_len - 4;
+                let b: [u8; 4] = data[alloc_ptr_addr as usize..mem_len as usize]
+                    .try_into()
+                    .unwrap();
+                let mut alloc_top = u32::from_le_bytes(b);
+                if alloc_top == 0 {
+                    alloc_top = mem_len - 8; // Initialize: leave room for pointer
+                }
+
+                // Block: [size(4)] [data(size)] — aligned to 4 bytes
+                let aligned_size = size.wrapping_add(3) & !3;
+                let block_size = 4u32.wrapping_add(aligned_size);
+
+                if alloc_top < block_size + 0x20000 {
+                    // Not enough memory (leave some space for dictionary growth)
+                    let data = memory.data_mut(&mut caller);
+                    // Replace u with a-addr=0, push ior=-1
+                    data[sp as usize..sp as usize + 4].copy_from_slice(&0i32.to_le_bytes());
+                    let new_sp = sp - CELL_SIZE;
+                    data[new_sp as usize..new_sp as usize + 4]
+                        .copy_from_slice(&(-1i32).to_le_bytes());
+                    dsp.set(&mut caller, Val::I32(new_sp as i32))?;
+                    return Ok(());
+                }
+
+                let block_start = alloc_top - block_size;
+                let data_addr = block_start + 4; // skip size header
+
+                let data = memory.data_mut(&mut caller);
+                // Write size header
+                data[block_start as usize..block_start as usize + 4]
+                    .copy_from_slice(&size.to_le_bytes());
+                // Zero the allocated area
+                for i in 0..aligned_size as usize {
+                    data[data_addr as usize + i] = 0;
+                }
+                // Update allocation pointer
+                data[alloc_ptr_addr as usize..mem_len as usize]
+                    .copy_from_slice(&block_start.to_le_bytes());
+
+                // Replace u with a-addr, push ior=0
+                data[sp as usize..sp as usize + 4]
+                    .copy_from_slice(&(data_addr as i32).to_le_bytes());
+                let new_sp = sp - CELL_SIZE;
+                data[new_sp as usize..new_sp as usize + 4].copy_from_slice(&0i32.to_le_bytes());
+                dsp.set(&mut caller, Val::I32(new_sp as i32))?;
+                Ok(())
+            },
+        );
+        self.register_host_primitive("ALLOCATE", false, func)?;
+
+        // FREE ( a-addr -- ior )
+        let memory = self.memory;
+        let dsp = self.dsp;
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                // Simple allocator: FREE is a no-op (arena style), return ior=0
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let data = memory.data_mut(&mut caller);
+                // Replace a-addr with ior=0
+                data[sp as usize..sp as usize + 4].copy_from_slice(&0i32.to_le_bytes());
+                Ok(())
+            },
+        );
+        self.register_host_primitive("FREE", false, func)?;
+
+        // RESIZE ( a-addr u -- a-addr2 ior )
+        let memory = self.memory;
+        let dsp = self.dsp;
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let data = memory.data(&caller);
+                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
+                let new_size = u32::from_le_bytes(b);
+                let b: [u8; 4] = data[(sp + 4) as usize..(sp + 8) as usize]
+                    .try_into()
+                    .unwrap();
+                let old_addr = u32::from_le_bytes(b);
+
+                // Read old size from header (4 bytes before old_addr)
+                let old_size = if old_addr >= 4 {
+                    let b: [u8; 4] = data[(old_addr - 4) as usize..old_addr as usize]
+                        .try_into()
+                        .unwrap();
+                    u32::from_le_bytes(b)
+                } else {
+                    0
+                };
+
+                let mem_len = data.len() as u32;
+                let alloc_ptr_addr = mem_len - 4;
+                let b: [u8; 4] = data[alloc_ptr_addr as usize..mem_len as usize]
+                    .try_into()
+                    .unwrap();
+                let mut alloc_top = u32::from_le_bytes(b);
+                if alloc_top == 0 {
+                    alloc_top = mem_len - 8;
+                }
+
+                let aligned_size = new_size.wrapping_add(3) & !3;
+                let block_size = 4u32.wrapping_add(aligned_size);
+
+                if alloc_top < block_size + 0x20000 {
+                    // Allocation failure
+                    let data = memory.data_mut(&mut caller);
+                    // Keep old a-addr, push ior=-1
+                    let new_sp = sp + CELL_SIZE; // pop new_size
+                    data[(new_sp) as usize..(new_sp + 4) as usize]
+                        .copy_from_slice(&(old_addr as i32).to_le_bytes());
+                    let new_sp = new_sp - CELL_SIZE;
+                    data[new_sp as usize..new_sp as usize + 4]
+                        .copy_from_slice(&(-1i32).to_le_bytes());
+                    dsp.set(&mut caller, Val::I32(new_sp as i32))?;
+                    return Ok(());
+                }
+
+                let block_start = alloc_top - block_size;
+                let new_addr = block_start + 4;
+
+                // Copy old data to new location
+                let copy_len = old_size.min(new_size) as usize;
+                let data = memory.data_mut(&mut caller);
+                for i in 0..copy_len {
+                    data[new_addr as usize + i] = data[old_addr as usize + i];
+                }
+                // Zero any extra space
+                for i in copy_len..aligned_size as usize {
+                    data[new_addr as usize + i] = 0;
+                }
+                // Write size header
+                data[block_start as usize..block_start as usize + 4]
+                    .copy_from_slice(&new_size.to_le_bytes());
+                // Update allocation pointer
+                data[alloc_ptr_addr as usize..mem_len as usize]
+                    .copy_from_slice(&block_start.to_le_bytes());
+
+                // Replace (a-addr u) with (a-addr2 ior)
+                data[(sp + 4) as usize..(sp + 8) as usize]
+                    .copy_from_slice(&(new_addr as i32).to_le_bytes());
+                data[sp as usize..sp as usize + 4].copy_from_slice(&0i32.to_le_bytes());
+                Ok(())
+            },
+        );
+        self.register_host_primitive("RESIZE", false, func)?;
+
+        Ok(())
+    }
 
     /// D>S ( d -- n ) convert double to single (just drop high cell).
     fn register_d_to_s(&mut self) -> anyhow::Result<()> {
