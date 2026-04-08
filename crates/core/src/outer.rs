@@ -4685,14 +4685,71 @@ impl ForthVM {
         Ok(())
     }
 
-    /// PARSE as a host function for compiled code.
+    /// PARSE ( char "ccc<char>" -- c-addr u ) as inline host function.
     fn register_parse_host(&mut self) -> anyhow::Result<()> {
-        let pending = Arc::clone(&self.pending_define);
+        let memory = self.memory;
+        let dsp = self.dsp;
+
         let func = Func::new(
             &mut self.store,
             FuncType::new(&self.engine, [], []),
-            move |_caller, _params, _results| {
-                *pending.lock().unwrap() = 7;
+            move |mut caller, _params, _results| {
+                // Pop delimiter from data stack
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let data = memory.data(&caller);
+                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
+                let delim = i32::from_le_bytes(b) as u8;
+                let sp = sp + CELL_SIZE; // pop delimiter
+
+                // Read >IN and #TIB from WASM memory
+                let data = memory.data(&caller);
+                let b: [u8; 4] = data[SYSVAR_TO_IN as usize..SYSVAR_TO_IN as usize + 4]
+                    .try_into()
+                    .unwrap();
+                let mut to_in = u32::from_le_bytes(b);
+                let b: [u8; 4] = data[SYSVAR_NUM_TIB as usize..SYSVAR_NUM_TIB as usize + 4]
+                    .try_into()
+                    .unwrap();
+                let num_tib = u32::from_le_bytes(b);
+
+                // Skip one leading space (outer interpreter's trailing delimiter)
+                if to_in < num_tib {
+                    let data = memory.data(&caller);
+                    if data[(INPUT_BUFFER_BASE + to_in) as usize] == b' ' {
+                        to_in += 1;
+                    }
+                }
+
+                // Parse until delimiter
+                let start = to_in;
+                while to_in < num_tib {
+                    let data = memory.data(&caller);
+                    if data[(INPUT_BUFFER_BASE + to_in) as usize] == delim {
+                        break;
+                    }
+                    to_in += 1;
+                }
+                let parsed_len = to_in - start;
+
+                // Skip past delimiter
+                if to_in < num_tib {
+                    to_in += 1;
+                }
+
+                // Update >IN in WASM memory
+                let data = memory.data_mut(&mut caller);
+                data[SYSVAR_TO_IN as usize..SYSVAR_TO_IN as usize + 4]
+                    .copy_from_slice(&to_in.to_le_bytes());
+
+                // Push (c-addr u) to data stack
+                let c_addr = INPUT_BUFFER_BASE + start;
+                let new_sp = sp - 2 * CELL_SIZE;
+                data[new_sp as usize..new_sp as usize + 4]
+                    .copy_from_slice(&(parsed_len as i32).to_le_bytes());
+                data[(new_sp + CELL_SIZE) as usize..(new_sp + 2 * CELL_SIZE) as usize]
+                    .copy_from_slice(&(c_addr as i32).to_le_bytes());
+                dsp.set(&mut caller, Val::I32(new_sp as i32))?;
+
                 Ok(())
             },
         );
@@ -4701,14 +4758,62 @@ impl ForthVM {
         Ok(())
     }
 
-    /// PARSE-NAME as a host function for compiled code.
+    /// PARSE-NAME ( "<spaces>name<space>" -- c-addr u ) as inline host function.
     fn register_parse_name_host(&mut self) -> anyhow::Result<()> {
-        let pending = Arc::clone(&self.pending_define);
+        let memory = self.memory;
+        let dsp = self.dsp;
+
         let func = Func::new(
             &mut self.store,
             FuncType::new(&self.engine, [], []),
-            move |_caller, _params, _results| {
-                *pending.lock().unwrap() = 8;
+            move |mut caller, _params, _results| {
+                // Read >IN and #TIB from WASM memory
+                let data = memory.data(&caller);
+                let b: [u8; 4] = data[SYSVAR_TO_IN as usize..SYSVAR_TO_IN as usize + 4]
+                    .try_into()
+                    .unwrap();
+                let mut to_in = u32::from_le_bytes(b);
+                let b: [u8; 4] = data[SYSVAR_NUM_TIB as usize..SYSVAR_NUM_TIB as usize + 4]
+                    .try_into()
+                    .unwrap();
+                let num_tib = u32::from_le_bytes(b);
+
+                // Skip leading whitespace
+                while to_in < num_tib {
+                    let data = memory.data(&caller);
+                    if !data[(INPUT_BUFFER_BASE + to_in) as usize].is_ascii_whitespace() {
+                        break;
+                    }
+                    to_in += 1;
+                }
+                let start = to_in;
+
+                // Parse until whitespace
+                while to_in < num_tib {
+                    let data = memory.data(&caller);
+                    if data[(INPUT_BUFFER_BASE + to_in) as usize].is_ascii_whitespace() {
+                        break;
+                    }
+                    to_in += 1;
+                }
+                let parsed_len = to_in - start;
+
+                // Update >IN
+                let data = memory.data_mut(&mut caller);
+                data[SYSVAR_TO_IN as usize..SYSVAR_TO_IN as usize + 4]
+                    .copy_from_slice(&to_in.to_le_bytes());
+
+                // Push (c-addr u) to data stack
+                let c_addr = INPUT_BUFFER_BASE + start;
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let new_sp = sp - 2 * CELL_SIZE;
+                let data = memory.data_mut(&mut caller);
+                data[new_sp as usize..new_sp as usize + 4]
+                    .copy_from_slice(&(parsed_len as i32).to_le_bytes());
+                data[(new_sp + CELL_SIZE) as usize..(new_sp + 2 * CELL_SIZE) as usize]
+                    .copy_from_slice(&(c_addr as i32).to_le_bytes());
+                dsp.set(&mut caller, Val::I32(new_sp as i32))?;
+
                 Ok(())
             },
         );
