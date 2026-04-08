@@ -1856,6 +1856,9 @@ impl ForthVM {
             dec.parse::<i64>().ok()
         } else if let Some(bin) = rest.strip_prefix('%') {
             i64::from_str_radix(bin, 2).ok()
+        } else if rest.len() == 3 && rest.as_bytes()[0] == b'\'' && rest.as_bytes()[2] == b'\'' {
+            // Character literal: 'x' → ASCII value of x
+            Some(rest.as_bytes()[1] as i64)
         } else {
             i64::from_str_radix(rest, self.base).ok()
         };
@@ -4578,6 +4581,14 @@ impl ForthVM {
             |_caller, _params, _results| Ok(()),
         );
         self.register_host_primitive(".(", true, func)?;
+
+        // ( is an immediate word (comment). Register in dictionary for FIND.
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            |_caller, _params, _results| Ok(()),
+        );
+        self.register_host_primitive("(", true, func)?;
 
         Ok(())
     }
