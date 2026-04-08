@@ -98,7 +98,9 @@
 : D=  D- D0= ;
 
 \ D< ( d1 d2 -- flag )  true if d1 < d2 (signed)
-: D<  D- D0< ;
+\ Cannot use D- D0< because subtraction overflows for extreme values.
+\ Compare high cells first (signed); if equal, compare low cells unsigned.
+: D<  ROT 2DUP = IF 2DROP U< ELSE 2SWAP 2DROP > THEN ;
 
 \ D2* ( d -- d*2 )  double-cell shift left
 : D2*  2DUP D+ ;
@@ -255,7 +257,7 @@
 
 \ COMPARE ( addr1 u1 addr2 u2 -- n )  compare two strings lexicographically
 : COMPARE
-  ROT 2DUP - >R
+  ROT 2DUP SWAP - >R
   MIN 0 ?DO
     OVER I + C@
     OVER I + C@
@@ -269,6 +271,9 @@
   DUP 0< IF DROP -1 EXIT THEN
   0> IF 1 EXIT THEN
   0 ;
+
+\ -TRAILING ( c-addr u1 -- c-addr u2 )  remove trailing spaces
+: -TRAILING  BEGIN DUP WHILE 2DUP + 1- C@ BL = WHILE 1- REPEAT THEN ;
 
 \ SEARCH stays as a host function (complex multi-line control flow).
 
