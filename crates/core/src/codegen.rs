@@ -225,13 +225,22 @@ fn bool_to_forth_flag(f: &mut Function, tmp: u32) {
 // Float stack helpers
 // ---------------------------------------------------------------------------
 
-/// Carries f64 scratch local indices for float codegen.
+/// Carries context for WASM code emission.
 struct EmitCtx {
     f64_local_0: u32,
     f64_local_1: u32,
     /// Base WASM local index for Forth locals ({: ... :}).
     /// Forth local N maps to WASM local `forth_local_base + N`.
     forth_local_base: u32,
+    /// Base WASM local index for DO/LOOP index/limit local pairs.
+    /// Each nested loop uses 2 locals: (index, limit).
+    loop_local_base: u32,
+    /// Stack of (index_local, limit_local) for active DO/LOOP nesting.
+    /// Innermost loop is last. Used to compile `J` as local.get.
+    loop_locals: Vec<(u32, u32)>,
+    /// Nesting depth of DO/LOOPs that use the fast path (no RS sync).
+    /// When > 0, `RFetch` (I) reads from the loop local instead of rpeek.
+    fast_loop_depth: u32,
 }
 
 /// Decrement the FSP global by 8 (allocate space for one f64).
@@ -318,7 +327,7 @@ fn emit_float_cmp(f: &mut Function, ctx: &EmitCtx, wasm_cmp: &Instruction<'_>) {
 // ---------------------------------------------------------------------------
 
 /// Emit all IR operations in `ops` into the WASM function body `f`.
-fn emit_body(f: &mut Function, ops: &[IrOp], ctx: &EmitCtx) {
+fn emit_body(f: &mut Function, ops: &[IrOp], ctx: &mut EmitCtx) {
     for op in ops {
         emit_op(f, op, ctx);
     }
@@ -326,7 +335,7 @@ fn emit_body(f: &mut Function, ops: &[IrOp], ctx: &EmitCtx) {
 
 /// Emit a single IR operation.
 #[allow(clippy::too_many_lines)]
-fn emit_op(f: &mut Function, op: &IrOp, ctx: &EmitCtx) {
+fn emit_op(f: &mut Function, op: &IrOp, ctx: &mut EmitCtx) {
     match op {
         // -- Literals -------------------------------------------------------
         IrOp::PushI32(n) => push_const(f, *n),
@@ -685,8 +694,33 @@ fn emit_op(f: &mut Function, op: &IrOp, ctx: &EmitCtx) {
         }
 
         IrOp::RFetch => {
-            rpeek(f);
-            push_via_local(f, SCRATCH_BASE);
+            // In a fast-path DO/LOOP (no >R/R>/calls), R@ == loop index local.
+            // In slow-path or outside loops, read from the return stack.
+            if ctx.fast_loop_depth > 0 {
+                let (index_local, _) = *ctx.loop_locals.last().expect("fast loop without locals");
+                f.instruction(&Instruction::LocalGet(index_local));
+                push_via_local(f, SCRATCH_BASE);
+            } else {
+                rpeek(f);
+                push_via_local(f, SCRATCH_BASE);
+            }
+        }
+
+        IrOp::LoopJ => {
+            // Read outer loop index: use loop locals if available,
+            // otherwise fall back to reading rsp+8.
+            if ctx.loop_locals.len() >= 2 {
+                let (outer_index, _) = ctx.loop_locals[ctx.loop_locals.len() - 2];
+                f.instruction(&Instruction::LocalGet(outer_index));
+                push_via_local(f, SCRATCH_BASE);
+            } else {
+                // Fallback: read from return stack (rsp + 2*CELL_SIZE)
+                f.instruction(&Instruction::GlobalGet(RSP))
+                    .instruction(&Instruction::I32Const(2 * CELL_SIZE as i32))
+                    .instruction(&Instruction::I32Add)
+                    .instruction(&Instruction::I32Load(MEM4));
+                push_via_local(f, SCRATCH_BASE);
+            }
         }
 
         // -- I/O ------------------------------------------------------------
@@ -892,41 +926,59 @@ fn emit_cmp(f: &mut Function, cmp: &Instruction<'_>) {
     push_via_local(f, SCRATCH_BASE + 3);
 }
 
-/// Emit a DO...LOOP / DO...+LOOP construct.
-fn emit_do_loop(f: &mut Function, body: &[IrOp], is_plus_loop: bool, ctx: &EmitCtx) {
+/// Emit a DO...LOOP / DO...+LOOP construct using WASM locals for index/limit.
+///
+/// Two paths:
+/// - **Fast path**: Body has no calls, no return stack ops. Index/limit live
+///   purely in WASM locals — zero return stack traffic per iteration.
+/// - **Slow path**: Body uses calls or return stack. Index/limit still in locals
+///   but synced to return stack for LEAVE/UNLOOP/J/I compatibility.
+fn emit_do_loop(f: &mut Function, body: &[IrOp], is_plus_loop: bool, ctx: &mut EmitCtx) {
+    let loop_depth = ctx.loop_locals.len() as u32;
+    let index_local = ctx.loop_local_base + loop_depth * 2;
+    let limit_local = ctx.loop_local_base + loop_depth * 2 + 1;
+    let needs_rs = body_needs_return_stack(body);
+
     // DO ( limit index -- )
-    pop_to(f, SCRATCH_BASE); // index
-    pop_to(f, SCRATCH_BASE + 1); // limit
+    pop_to(f, index_local);
+    pop_to(f, limit_local);
 
-    // Push limit then index to return stack
-    f.instruction(&Instruction::LocalGet(SCRATCH_BASE + 1));
-    rpush_via_local(f, SCRATCH_BASE + 2);
-    f.instruction(&Instruction::LocalGet(SCRATCH_BASE));
-    rpush_via_local(f, SCRATCH_BASE + 2);
+    if needs_rs {
+        // Push to return stack for I/J/LEAVE/UNLOOP
+        f.instruction(&Instruction::LocalGet(limit_local));
+        rpush_via_local(f, SCRATCH_BASE);
+        f.instruction(&Instruction::LocalGet(index_local));
+        rpush_via_local(f, SCRATCH_BASE);
+    }
 
-    // block $exit
-    //   loop $continue
-    //     <body>
-    //     -- update index, check, branch
-    //   end
-    // end
+    ctx.loop_locals.push((index_local, limit_local));
+    if !needs_rs {
+        ctx.fast_loop_depth += 1;
+    }
+
     f.instruction(&Instruction::Block(BlockType::Empty));
     f.instruction(&Instruction::Loop(BlockType::Empty));
 
+    if needs_rs {
+        // Sync index local to return stack before body (so I/R@ reads current value)
+        rpop(f);
+        f.instruction(&Instruction::Drop);
+        f.instruction(&Instruction::LocalGet(index_local));
+        rpush_via_local(f, SCRATCH_BASE);
+    }
+
     emit_body(f, body, ctx);
 
-    // Pop current index from return stack into scratch local
-    rpop(f);
+    if needs_rs {
+        // Reload index from return stack (LEAVE may have modified it)
+        rpeek(f);
+        f.instruction(&Instruction::LocalSet(index_local));
+    }
 
     if is_plus_loop {
-        // +LOOP: Forth 2012 termination check.
-        // Exit when (old_index - limit) XOR (new_index - limit) is negative,
-        // or when the LEAVE flag is set (LEAVE sets index=limit, but +LOOP with
-        // step=0 would loop forever without this flag check).
-        f.instruction(&Instruction::LocalSet(SCRATCH_BASE));
         pop_to(f, SCRATCH_BASE + 2); // step from data stack
 
-        // Check leave flag first — if set, clear it and exit immediately
+        // Check leave flag — if set, clear it and exit immediately
         f.instruction(&Instruction::I32Const(SYSVAR_LEAVE_FLAG as i32))
             .instruction(&Instruction::I32Load(MEM4))
             .instruction(&Instruction::If(BlockType::Empty))
@@ -936,40 +988,28 @@ fn emit_do_loop(f: &mut Function, body: &[IrOp], is_plus_loop: bool, ctx: &EmitC
             .instruction(&Instruction::Br(2)) // exit: If(0) → Loop(1) → Block(2)
             .instruction(&Instruction::End);
 
-        // Peek limit from return stack
-        rpeek(f);
-        f.instruction(&Instruction::LocalSet(SCRATCH_BASE + 1));
-
-        // Compute old_index - limit
-        // SCRATCH_BASE+3 = old_index - limit
-        f.instruction(&Instruction::LocalGet(SCRATCH_BASE))
-            .instruction(&Instruction::LocalGet(SCRATCH_BASE + 1))
+        // old_index - limit
+        f.instruction(&Instruction::LocalGet(index_local))
+            .instruction(&Instruction::LocalGet(limit_local))
             .instruction(&Instruction::I32Sub)
             .instruction(&Instruction::LocalSet(SCRATCH_BASE + 3));
 
         // new_index = old_index + step
-        f.instruction(&Instruction::LocalGet(SCRATCH_BASE))
+        f.instruction(&Instruction::LocalGet(index_local))
             .instruction(&Instruction::LocalGet(SCRATCH_BASE + 2))
             .instruction(&Instruction::I32Add)
-            .instruction(&Instruction::LocalSet(SCRATCH_BASE));
-
-        // Push updated index to return stack (use SCRATCH_BASE+4 as temp to preserve step)
-        f.instruction(&Instruction::LocalGet(SCRATCH_BASE));
-        rpush_via_local(f, SCRATCH_BASE + 4);
+            .instruction(&Instruction::LocalSet(index_local));
 
         // Forth 2012 +LOOP termination:
         // exit = ((old-limit) XOR (new-limit)) AND ((old-limit) XOR step) < 0
-        // xor1 = (old-limit) XOR (new-limit)
         f.instruction(&Instruction::LocalGet(SCRATCH_BASE + 3)) // old - limit
-            .instruction(&Instruction::LocalGet(SCRATCH_BASE)) // new_index
-            .instruction(&Instruction::LocalGet(SCRATCH_BASE + 1)) // limit
+            .instruction(&Instruction::LocalGet(index_local)) // new_index
+            .instruction(&Instruction::LocalGet(limit_local)) // limit
             .instruction(&Instruction::I32Sub) // new - limit
             .instruction(&Instruction::I32Xor); // xor1
-        // xor2 = (old-limit) XOR step
         f.instruction(&Instruction::LocalGet(SCRATCH_BASE + 3)) // old - limit
-            .instruction(&Instruction::LocalGet(SCRATCH_BASE + 2)) // step (preserved!)
+            .instruction(&Instruction::LocalGet(SCRATCH_BASE + 2)) // step
             .instruction(&Instruction::I32Xor); // xor2
-        // exit = (xor1 AND xor2) < 0
         f.instruction(&Instruction::I32And)
             .instruction(&Instruction::I32Const(0))
             .instruction(&Instruction::I32LtS)
@@ -979,21 +1019,26 @@ fn emit_do_loop(f: &mut Function, body: &[IrOp], is_plus_loop: bool, ctx: &EmitC
             .instruction(&Instruction::End); // end block
     } else {
         // LOOP: simple increment by 1
-        f.instruction(&Instruction::I32Const(1))
+        f.instruction(&Instruction::LocalGet(index_local))
+            .instruction(&Instruction::I32Const(1))
             .instruction(&Instruction::I32Add)
-            .instruction(&Instruction::LocalSet(SCRATCH_BASE));
+            .instruction(&Instruction::LocalSet(index_local));
 
-        // Peek limit from return stack
-        rpeek(f);
-        f.instruction(&Instruction::LocalSet(SCRATCH_BASE + 1));
-
-        // Push updated index back to return stack
-        f.instruction(&Instruction::LocalGet(SCRATCH_BASE));
-        rpush_via_local(f, SCRATCH_BASE + 2);
+        // Check leave flag (needed even for simple LOOP since LEAVE is a host function)
+        if needs_rs {
+            f.instruction(&Instruction::I32Const(SYSVAR_LEAVE_FLAG as i32))
+                .instruction(&Instruction::I32Load(MEM4))
+                .instruction(&Instruction::If(BlockType::Empty))
+                .instruction(&Instruction::I32Const(SYSVAR_LEAVE_FLAG as i32))
+                .instruction(&Instruction::I32Const(0))
+                .instruction(&Instruction::I32Store(MEM4))
+                .instruction(&Instruction::Br(2)) // exit: If→Loop→Block
+                .instruction(&Instruction::End);
+        }
 
         // if index >= limit, exit
-        f.instruction(&Instruction::LocalGet(SCRATCH_BASE))
-            .instruction(&Instruction::LocalGet(SCRATCH_BASE + 1))
+        f.instruction(&Instruction::LocalGet(index_local))
+            .instruction(&Instruction::LocalGet(limit_local))
             .instruction(&Instruction::I32GeS)
             .instruction(&Instruction::BrIf(1)) // break to $exit
             .instruction(&Instruction::Br(0)) // continue loop
@@ -1001,11 +1046,17 @@ fn emit_do_loop(f: &mut Function, body: &[IrOp], is_plus_loop: bool, ctx: &EmitC
             .instruction(&Instruction::End); // end block
     }
 
-    // Clean up: pop index and limit from return stack, clear leave flag
-    rpop(f);
-    f.instruction(&Instruction::Drop);
-    rpop(f);
-    f.instruction(&Instruction::Drop);
+    if !needs_rs {
+        ctx.fast_loop_depth -= 1;
+    }
+    ctx.loop_locals.pop();
+
+    if needs_rs {
+        rpop(f);
+        f.instruction(&Instruction::Drop);
+        rpop(f);
+        f.instruction(&Instruction::Drop);
+    }
     f.instruction(&Instruction::I32Const(SYSVAR_LEAVE_FLAG as i32))
         .instruction(&Instruction::I32Const(0))
         .instruction(&Instruction::I32Store(MEM4));
@@ -1672,6 +1723,117 @@ fn needs_f64_locals(ops: &[IrOp]) -> bool {
     false
 }
 
+/// Check if a DO/LOOP body needs return stack access.
+///
+/// When false, the loop can use pure WASM locals for index/limit without
+/// syncing to the return stack. This is safe when the body has no calls
+/// (which might be LEAVE/J/UNLOOP) and no explicit return stack ops.
+fn body_needs_return_stack(ops: &[IrOp]) -> bool {
+    for op in ops {
+        match op {
+            IrOp::Call(_) | IrOp::TailCall(_) | IrOp::Execute => return true,
+            IrOp::ToR | IrOp::FromR => return true,
+            // RFetch (I) is handled by loop locals in the fast path — not a problem.
+            // LoopJ is also handled by loop locals.
+            // Only explicit >R / R> / calls force the slow path.
+            IrOp::If {
+                then_body,
+                else_body,
+            } => {
+                if body_needs_return_stack(then_body) {
+                    return true;
+                }
+                if let Some(eb) = else_body {
+                    if body_needs_return_stack(eb) {
+                        return true;
+                    }
+                }
+            }
+            IrOp::DoLoop { body, .. }
+            | IrOp::BeginUntil { body }
+            | IrOp::BeginAgain { body } => {
+                if body_needs_return_stack(body) {
+                    return true;
+                }
+            }
+            IrOp::BeginWhileRepeat { test, body } => {
+                if body_needs_return_stack(test) || body_needs_return_stack(body) {
+                    return true;
+                }
+            }
+            IrOp::BeginDoubleWhileRepeat {
+                outer_test,
+                inner_test,
+                body,
+                after_repeat,
+                else_body,
+            } => {
+                if body_needs_return_stack(outer_test)
+                    || body_needs_return_stack(inner_test)
+                    || body_needs_return_stack(body)
+                    || body_needs_return_stack(after_repeat)
+                {
+                    return true;
+                }
+                if let Some(eb) = else_body {
+                    if body_needs_return_stack(eb) {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Count the maximum DO/LOOP nesting depth in an IR body.
+/// Each nesting level needs 2 WASM locals (index, limit).
+fn count_loop_depth(ops: &[IrOp]) -> u32 {
+    let mut max: u32 = 0;
+    for op in ops {
+        match op {
+            IrOp::DoLoop { body, .. } => {
+                max = max.max(1 + count_loop_depth(body));
+            }
+            IrOp::If {
+                then_body,
+                else_body,
+            } => {
+                max = max.max(count_loop_depth(then_body));
+                if let Some(eb) = else_body {
+                    max = max.max(count_loop_depth(eb));
+                }
+            }
+            IrOp::BeginUntil { body }
+            | IrOp::BeginAgain { body } => {
+                max = max.max(count_loop_depth(body));
+            }
+            IrOp::BeginWhileRepeat { test, body } => {
+                max = max.max(count_loop_depth(test)).max(count_loop_depth(body));
+            }
+            IrOp::BeginDoubleWhileRepeat {
+                outer_test,
+                inner_test,
+                body,
+                after_repeat,
+                else_body,
+            } => {
+                max = max
+                    .max(count_loop_depth(outer_test))
+                    .max(count_loop_depth(inner_test))
+                    .max(count_loop_depth(body))
+                    .max(count_loop_depth(after_repeat));
+                if let Some(eb) = else_body {
+                    max = max.max(count_loop_depth(eb));
+                }
+            }
+            _ => {}
+        }
+    }
+    max
+}
+
 /// Estimate scratch locals a function body needs (not counting cached DSP).
 fn count_scratch_locals(ops: &[IrOp]) -> u32 {
     let mut max: u32 = 4; // baseline scratch space (indices SCRATCH_BASE..SCRATCH_BASE+3)
@@ -1850,13 +2012,15 @@ pub fn compile_word(
     let promoted = config.stack_to_local_promotion && is_promotable(body);
     let scratch_count = count_scratch_locals(body);
     let forth_local_count = count_forth_locals(body);
+    let loop_depth = count_loop_depth(body);
+    let loop_local_count = loop_depth * 2; // 2 locals per nesting level (index, limit)
     let num_locals = if promoted {
         let (preload, _) = compute_stack_needs(body);
         let promoted_count = count_promoted_locals(body, preload);
         // 1 (cached DSP) + promoted locals (scratch locals not needed in promoted path)
-        1 + promoted_count + forth_local_count
+        1 + promoted_count + forth_local_count + loop_local_count
     } else {
-        1 + scratch_count + forth_local_count
+        1 + scratch_count + forth_local_count + loop_local_count
     };
     let has_floats = needs_f64_locals(body);
     let num_f64: u32 = if has_floats { 2 } else { 0 };
@@ -1872,10 +2036,14 @@ pub fn compile_word(
     } else {
         1 + scratch_count
     };
-    let ctx = EmitCtx {
+    let loop_local_base = forth_local_base + forth_local_count;
+    let mut ctx = EmitCtx {
         f64_local_0: num_locals,
         f64_local_1: num_locals + 1,
         forth_local_base,
+        loop_local_base,
+        loop_locals: Vec::new(),
+        fast_loop_depth: 0,
     };
 
     // Prologue: cache $dsp global into local 0
@@ -1892,7 +2060,7 @@ pub fn compile_word(
         }
         emit_promoted_epilogue(&mut func, &mut sim);
     } else {
-        emit_body(&mut func, body, &ctx);
+        emit_body(&mut func, body, &mut ctx);
     }
 
     // Epilogue: write cached DSP back to the $dsp global
@@ -1928,7 +2096,7 @@ fn emit_consolidated_body(
     f: &mut Function,
     ops: &[IrOp],
     local_fn_map: &HashMap<WordId, u32>,
-    ctx: &EmitCtx,
+    ctx: &mut EmitCtx,
 ) {
     for op in ops {
         emit_consolidated_op(f, op, local_fn_map, ctx);
@@ -1944,7 +2112,7 @@ fn emit_consolidated_op(
     f: &mut Function,
     op: &IrOp,
     local_fn_map: &HashMap<WordId, u32>,
-    ctx: &EmitCtx,
+    ctx: &mut EmitCtx,
 ) {
     match op {
         IrOp::Call(word_id) => {
@@ -2068,65 +2236,76 @@ fn emit_consolidated_op(
 }
 
 /// Emit a DO...LOOP / DO...+LOOP with consolidated call support for the body.
+/// Same fast/slow path logic as `emit_do_loop`.
 fn emit_consolidated_do_loop(
     f: &mut Function,
     body: &[IrOp],
     is_plus_loop: bool,
     local_fn_map: &HashMap<WordId, u32>,
-    ctx: &EmitCtx,
+    ctx: &mut EmitCtx,
 ) {
-    // DO ( limit index -- )
-    pop_to(f, SCRATCH_BASE); // index
-    pop_to(f, SCRATCH_BASE + 1); // limit
+    let loop_depth = ctx.loop_locals.len() as u32;
+    let index_local = ctx.loop_local_base + loop_depth * 2;
+    let limit_local = ctx.loop_local_base + loop_depth * 2 + 1;
+    let needs_rs = body_needs_return_stack(body);
 
-    // Push limit then index to return stack
-    f.instruction(&Instruction::LocalGet(SCRATCH_BASE + 1));
-    rpush_via_local(f, SCRATCH_BASE + 2);
-    f.instruction(&Instruction::LocalGet(SCRATCH_BASE));
-    rpush_via_local(f, SCRATCH_BASE + 2);
+    pop_to(f, index_local);
+    pop_to(f, limit_local);
+
+    if needs_rs {
+        f.instruction(&Instruction::LocalGet(limit_local));
+        rpush_via_local(f, SCRATCH_BASE);
+        f.instruction(&Instruction::LocalGet(index_local));
+        rpush_via_local(f, SCRATCH_BASE);
+    }
+
+    ctx.loop_locals.push((index_local, limit_local));
+    if !needs_rs {
+        ctx.fast_loop_depth += 1;
+    }
 
     f.instruction(&Instruction::Block(BlockType::Empty));
     f.instruction(&Instruction::Loop(BlockType::Empty));
 
+    if needs_rs {
+        rpop(f);
+        f.instruction(&Instruction::Drop);
+        f.instruction(&Instruction::LocalGet(index_local));
+        rpush_via_local(f, SCRATCH_BASE);
+    }
+
     emit_consolidated_body(f, body, local_fn_map, ctx);
 
-    // Pop current index from return stack into scratch local
-    rpop(f);
+    if needs_rs {
+        rpeek(f);
+        f.instruction(&Instruction::LocalSet(index_local));
+    }
 
     if is_plus_loop {
-        f.instruction(&Instruction::LocalSet(SCRATCH_BASE));
-        pop_to(f, SCRATCH_BASE + 2); // step from data stack
+        pop_to(f, SCRATCH_BASE + 2); // step
 
-        // Check leave flag — if set, clear it and exit immediately
         f.instruction(&Instruction::I32Const(SYSVAR_LEAVE_FLAG as i32))
             .instruction(&Instruction::I32Load(MEM4))
             .instruction(&Instruction::If(BlockType::Empty))
             .instruction(&Instruction::I32Const(SYSVAR_LEAVE_FLAG as i32))
             .instruction(&Instruction::I32Const(0))
             .instruction(&Instruction::I32Store(MEM4))
-            .instruction(&Instruction::Br(2)) // exit: If(0) → Loop(1) → Block(2)
+            .instruction(&Instruction::Br(2))
             .instruction(&Instruction::End);
 
-        rpeek(f);
-        f.instruction(&Instruction::LocalSet(SCRATCH_BASE + 1));
-
-        f.instruction(&Instruction::LocalGet(SCRATCH_BASE))
-            .instruction(&Instruction::LocalGet(SCRATCH_BASE + 1))
+        f.instruction(&Instruction::LocalGet(index_local))
+            .instruction(&Instruction::LocalGet(limit_local))
             .instruction(&Instruction::I32Sub)
             .instruction(&Instruction::LocalSet(SCRATCH_BASE + 3));
 
-        f.instruction(&Instruction::LocalGet(SCRATCH_BASE))
+        f.instruction(&Instruction::LocalGet(index_local))
             .instruction(&Instruction::LocalGet(SCRATCH_BASE + 2))
             .instruction(&Instruction::I32Add)
-            .instruction(&Instruction::LocalSet(SCRATCH_BASE));
+            .instruction(&Instruction::LocalSet(index_local));
 
-        f.instruction(&Instruction::LocalGet(SCRATCH_BASE));
-        rpush_via_local(f, SCRATCH_BASE + 4);
-
-        // Forth 2012: ((old-limit) XOR (new-limit)) AND ((old-limit) XOR step) < 0
         f.instruction(&Instruction::LocalGet(SCRATCH_BASE + 3))
-            .instruction(&Instruction::LocalGet(SCRATCH_BASE))
-            .instruction(&Instruction::LocalGet(SCRATCH_BASE + 1))
+            .instruction(&Instruction::LocalGet(index_local))
+            .instruction(&Instruction::LocalGet(limit_local))
             .instruction(&Instruction::I32Sub)
             .instruction(&Instruction::I32Xor);
         f.instruction(&Instruction::LocalGet(SCRATCH_BASE + 3))
@@ -2140,18 +2319,24 @@ fn emit_consolidated_do_loop(
             .instruction(&Instruction::End)
             .instruction(&Instruction::End);
     } else {
-        f.instruction(&Instruction::I32Const(1))
+        f.instruction(&Instruction::LocalGet(index_local))
+            .instruction(&Instruction::I32Const(1))
             .instruction(&Instruction::I32Add)
-            .instruction(&Instruction::LocalSet(SCRATCH_BASE));
+            .instruction(&Instruction::LocalSet(index_local));
 
-        rpeek(f);
-        f.instruction(&Instruction::LocalSet(SCRATCH_BASE + 1));
+        if needs_rs {
+            f.instruction(&Instruction::I32Const(SYSVAR_LEAVE_FLAG as i32))
+                .instruction(&Instruction::I32Load(MEM4))
+                .instruction(&Instruction::If(BlockType::Empty))
+                .instruction(&Instruction::I32Const(SYSVAR_LEAVE_FLAG as i32))
+                .instruction(&Instruction::I32Const(0))
+                .instruction(&Instruction::I32Store(MEM4))
+                .instruction(&Instruction::Br(2))
+                .instruction(&Instruction::End);
+        }
 
-        f.instruction(&Instruction::LocalGet(SCRATCH_BASE));
-        rpush_via_local(f, SCRATCH_BASE + 2);
-
-        f.instruction(&Instruction::LocalGet(SCRATCH_BASE))
-            .instruction(&Instruction::LocalGet(SCRATCH_BASE + 1))
+        f.instruction(&Instruction::LocalGet(index_local))
+            .instruction(&Instruction::LocalGet(limit_local))
             .instruction(&Instruction::I32GeS)
             .instruction(&Instruction::BrIf(1))
             .instruction(&Instruction::Br(0))
@@ -2159,11 +2344,17 @@ fn emit_consolidated_do_loop(
             .instruction(&Instruction::End);
     }
 
-    // Clean up: pop index and limit from return stack, clear leave flag
-    rpop(f);
-    f.instruction(&Instruction::Drop);
-    rpop(f);
-    f.instruction(&Instruction::Drop);
+    if !needs_rs {
+        ctx.fast_loop_depth -= 1;
+    }
+    ctx.loop_locals.pop();
+
+    if needs_rs {
+        rpop(f);
+        f.instruction(&Instruction::Drop);
+        rpop(f);
+        f.instruction(&Instruction::Drop);
+    }
     f.instruction(&Instruction::I32Const(SYSVAR_LEAVE_FLAG as i32))
         .instruction(&Instruction::I32Const(0))
         .instruction(&Instruction::I32Store(MEM4));
@@ -2321,7 +2512,9 @@ fn compile_multi_word_module(
     for (_word_id, body) in words {
         let scratch_count = count_scratch_locals(body);
         let forth_local_count = count_forth_locals(body);
-        let num_locals = 1 + scratch_count + forth_local_count;
+        let loop_depth = count_loop_depth(body);
+        let loop_local_count = loop_depth * 2;
+        let num_locals = 1 + scratch_count + forth_local_count + loop_local_count;
         let has_floats = needs_f64_locals(body);
         let num_f64: u32 = if has_floats { 2 } else { 0 };
         let mut locals_decl = vec![(num_locals, ValType::I32)];
@@ -2329,10 +2522,15 @@ fn compile_multi_word_module(
             locals_decl.push((num_f64, ValType::F64));
         }
         let mut func = Function::new(locals_decl);
-        let ctx = EmitCtx {
+        let forth_local_base = 1 + scratch_count;
+        let loop_local_base = forth_local_base + forth_local_count;
+        let mut ctx = EmitCtx {
             f64_local_0: num_locals,
             f64_local_1: num_locals + 1,
-            forth_local_base: 1 + scratch_count,
+            forth_local_base,
+            loop_local_base,
+            loop_locals: Vec::new(),
+            fast_loop_depth: 0,
         };
 
         // Prologue: cache $dsp global into local 0
@@ -2340,7 +2538,7 @@ fn compile_multi_word_module(
             .instruction(&Instruction::LocalSet(CACHED_DSP_LOCAL));
 
         // Body with consolidated call support
-        emit_consolidated_body(&mut func, body, local_fn_map, &ctx);
+        emit_consolidated_body(&mut func, body, local_fn_map, &mut ctx);
 
         // Epilogue: write cached DSP back to the $dsp global
         func.instruction(&Instruction::LocalGet(CACHED_DSP_LOCAL))

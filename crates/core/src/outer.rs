@@ -2255,8 +2255,8 @@ impl ForthVM {
         // -- Priority 1: Loop support --
         // I -- push loop index (top of return stack)
         self.register_primitive("I", false, vec![IrOp::RFetch])?;
-        // J -- outer loop counter (third item on return stack)
-        self.register_j()?;
+        // J -- outer loop counter
+        self.register_primitive("J", false, vec![IrOp::LoopJ])?;
         // UNLOOP -- remove loop parameters from return stack
         self.register_primitive(
             "UNLOOP",
@@ -2514,44 +2514,6 @@ impl ForthVM {
     // -----------------------------------------------------------------------
     // Priority 1: Loop support host functions
     // -----------------------------------------------------------------------
-
-    /// Register J (outer loop counter) as a host function.
-    /// During nested DO loops the return stack looks like:
-    ///   ... `outer_limit` `outer_index` `inner_limit` `inner_index`  (`inner_index` on top)
-    /// J reads the outer index = rsp + 8 (skip inner index and inner limit).
-    fn register_j(&mut self) -> anyhow::Result<()> {
-        let memory = self.memory;
-        let dsp = self.dsp;
-        let rsp = self.rsp;
-
-        let func = Func::new(
-            &mut self.store,
-            FuncType::new(&self.engine, [], []),
-            move |mut caller, _params, _results| {
-                let rsp_val = rsp.get(&mut caller).unwrap_i32() as u32;
-                // rsp points to inner_index, rsp+4 = inner_limit, rsp+8 = outer_index
-                let addr = (rsp_val + 8) as usize;
-                let data = memory.data(&caller);
-                let b: [u8; 4] = data[addr..addr + 4].try_into().unwrap();
-                let value = i32::from_le_bytes(b);
-                // Push onto data stack
-                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
-                let mem_len = memory.data(&caller).len() as u32;
-                if sp < CELL_SIZE || sp > mem_len {
-                    return Err(wasmtime::Error::msg("data stack overflow in J"));
-                }
-                let new_sp = sp - CELL_SIZE;
-                let data = memory.data_mut(&mut caller);
-                let bytes = value.to_le_bytes();
-                data[new_sp as usize..new_sp as usize + 4].copy_from_slice(&bytes);
-                dsp.set(&mut caller, Val::I32(new_sp as i32))?;
-                Ok(())
-            },
-        );
-
-        self.register_host_primitive("J", false, func)?;
-        Ok(())
-    }
 
     /// Register LEAVE as a host function.
     /// Sets the loop index equal to the limit and sets the leave flag

@@ -119,6 +119,9 @@ pub enum IrOp {
     FromR,
     /// Copy from return stack: ( -- x ) ( R: x -- x )
     RFetch,
+    /// Read outer DO/LOOP index (J): ( -- n )
+    /// Compiled to local.get when loop locals are available.
+    LoopJ,
 
     // -- Forth locals (from {: ... :} syntax) --
     /// Get Forth local variable N: ( -- x )
