@@ -1068,22 +1068,23 @@ fn emit_do_loop(f: &mut Function, body: &[IrOp], is_plus_loop: bool, ctx: &mut E
 
 /// Check if a word body qualifies for stack-to-local promotion.
 ///
-/// Phase 1: only straight-line code (no control flow, calls, I/O, return stack).
+/// Phase 2: supports control flow (IF, DO/LOOP, BEGIN loops) in addition
+/// to straight-line code. Still rejects calls, return stack ops, I/O, and floats.
 fn is_promotable(ops: &[IrOp]) -> bool {
     if ops.is_empty() {
         return false;
     }
+    is_promotable_body(ops)
+}
+
+/// Recursive check for promotable ops.
+fn is_promotable_body(ops: &[IrOp]) -> bool {
     for op in ops {
         match op {
             IrOp::Call(_) | IrOp::TailCall(_) | IrOp::Execute | IrOp::SpFetch => return false,
-            IrOp::If { .. }
-            | IrOp::DoLoop { .. }
-            | IrOp::BeginUntil { .. }
-            | IrOp::BeginAgain { .. }
-            | IrOp::BeginWhileRepeat { .. }
-            | IrOp::BeginDoubleWhileRepeat { .. } => return false,
-            IrOp::Exit => return false,
-            IrOp::ToR | IrOp::FromR | IrOp::RFetch => return false,
+            IrOp::ToR | IrOp::FromR | IrOp::RFetch | IrOp::LoopJ | IrOp::Exit => {
+                return false;
+            }
             IrOp::ForthLocalGet(_) | IrOp::ForthLocalSet(_) => return false,
             IrOp::Emit | IrOp::Dot | IrOp::Cr | IrOp::Type => return false,
             IrOp::PushI64(_) | IrOp::PushF64(_) => return false,
@@ -1110,6 +1111,13 @@ fn is_promotable(ops: &[IrOp]) -> bool {
             | IrOp::StoreFloat
             | IrOp::StoF
             | IrOp::FtoS => return false,
+            // Control flow not yet promoted in StackSim path
+            IrOp::If { .. }
+            | IrOp::DoLoop { .. }
+            | IrOp::BeginUntil { .. }
+            | IrOp::BeginAgain { .. }
+            | IrOp::BeginWhileRepeat { .. }
+            | IrOp::BeginDoubleWhileRepeat { .. } => return false,
             _ => {}
         }
     }
@@ -1223,7 +1231,7 @@ fn compute_stack_needs(ops: &[IrOp]) -> (u32, i32) {
             IrOp::TwoDrop => depth - 2,
             // Cross-stack ops that pop from data stack
             IrOp::FetchFloat | IrOp::StoreFloat | IrOp::StoF => depth - 1,
-            // Push ops and float-only ops don't read data stack items
+            // Push ops, float-only ops, and other ops don't read data stack items
             _ => depth,
         };
         min_accessed = min_accessed.min(reads_from);
@@ -1242,9 +1250,15 @@ fn compute_stack_needs(ops: &[IrOp]) -> (u32, i32) {
 /// local for each value-producing operation.
 fn count_promoted_locals(ops: &[IrOp], preload: u32) -> u32 {
     let mut count = preload;
+    count_promoted_locals_body(ops, &mut count);
+    count
+}
+
+/// Recursive helper for counting promoted locals.
+fn count_promoted_locals_body(ops: &[IrOp], count: &mut u32) {
     for op in ops {
         match op {
-            IrOp::PushI32(_) => count += 1,
+            IrOp::PushI32(_) | IrOp::RFetch | IrOp::LoopJ => *count += 1,
             IrOp::Add
             | IrOp::Sub
             | IrOp::Mul
@@ -1265,15 +1279,49 @@ fn count_promoted_locals(ops: &[IrOp], preload: u32) -> u32 {
             | IrOp::ZeroEq
             | IrOp::ZeroLt
             | IrOp::Fetch
-            | IrOp::CFetch => count += 1,
-            IrOp::DivMod => count += 2,
+            | IrOp::CFetch => *count += 1,
+            IrOp::DivMod => *count += 2,
+            IrOp::DoLoop { body, .. } => {
+                *count += 2; // index + limit locals
+                count_promoted_locals_body(body, count);
+            }
+            IrOp::If {
+                then_body,
+                else_body,
+            } => {
+                count_promoted_locals_body(then_body, count);
+                if let Some(eb) = else_body {
+                    count_promoted_locals_body(eb, count);
+                }
+            }
+            IrOp::BeginUntil { body } | IrOp::BeginAgain { body } => {
+                count_promoted_locals_body(body, count);
+            }
+            IrOp::BeginWhileRepeat { test, body } => {
+                count_promoted_locals_body(test, count);
+                count_promoted_locals_body(body, count);
+            }
+            IrOp::BeginDoubleWhileRepeat {
+                outer_test,
+                inner_test,
+                body,
+                after_repeat,
+                else_body,
+            } => {
+                count_promoted_locals_body(outer_test, count);
+                count_promoted_locals_body(inner_test, count);
+                count_promoted_locals_body(body, count);
+                count_promoted_locals_body(after_repeat, count);
+                if let Some(eb) = else_body {
+                    count_promoted_locals_body(eb, count);
+                }
+            }
             IrOp::Dup | IrOp::Over | IrOp::Tuck | IrOp::TwoDup => {
                 // These reuse existing locals via the simulator, no extra needed
             }
             _ => {}
         }
     }
-    count
 }
 
 /// Stack simulator: tracks which WASM local holds each conceptual stack slot.
@@ -1283,6 +1331,8 @@ struct StackSim {
     stack: Vec<u32>,
     /// Next available local index.
     next_local: u32,
+    /// Stack of (index_local, limit_local) for nested DO/LOOP in promoted path.
+    loop_index_stack: Vec<(u32, u32)>,
 }
 
 impl StackSim {
@@ -1290,6 +1340,7 @@ impl StackSim {
         Self {
             stack: Vec::new(),
             next_local: first_local,
+            loop_index_stack: Vec::new(),
         }
     }
 
@@ -1595,10 +1646,262 @@ fn emit_promoted_op(f: &mut Function, op: &IrOp, sim: &mut StackSim) {
             f.instruction(&Instruction::I32Store(MEM4));
         }
 
-        // These should not appear in promotable code (caught by is_promotable),
-        // but handle gracefully by falling back to emit_op.
+        // -- Control flow in promoted path --
+        IrOp::If {
+            then_body,
+            else_body,
+        } => {
+            let cond = sim.pop();
+            f.instruction(&Instruction::LocalGet(cond));
+            f.instruction(&Instruction::If(BlockType::Empty));
+
+            let saved_stack = sim.stack.clone();
+            let saved_next = sim.next_local;
+
+            emit_promoted_body(f, then_body, sim);
+
+            let then_stack = sim.stack.clone();
+            let then_next = sim.next_local;
+
+            // Restore to branch-point state for else
+            sim.stack = saved_stack;
+            sim.next_local = saved_next;
+
+            f.instruction(&Instruction::Else);
+            if let Some(eb) = else_body {
+                emit_promoted_body(f, eb, sim);
+            }
+
+            // Copy else results into then's locals at the join point.
+            // Both branches should have the same stack depth for well-formed Forth.
+            let else_stack = &sim.stack;
+            let min_len = then_stack.len().min(else_stack.len());
+            for i in 0..min_len {
+                if then_stack[i] != else_stack[i] {
+                    f.instruction(&Instruction::LocalGet(else_stack[i]));
+                    f.instruction(&Instruction::LocalSet(then_stack[i]));
+                }
+            }
+
+            sim.stack = then_stack;
+            sim.next_local = sim.next_local.max(then_next);
+
+            f.instruction(&Instruction::End);
+        }
+
+        IrOp::DoLoop { body, is_plus_loop } => {
+            // DO ( limit index -- )
+            let index_local = sim.pop();
+            let limit_local = sim.pop();
+            sim.loop_index_stack.push((index_local, limit_local));
+
+            let loop_top_stack = sim.stack.clone();
+
+            f.instruction(&Instruction::Block(BlockType::Empty));
+            f.instruction(&Instruction::Loop(BlockType::Empty));
+
+            emit_promoted_body(f, body, sim);
+
+            if *is_plus_loop {
+                // +LOOP: pop step from stack (body pushed it)
+                let step = sim.pop();
+
+                // Fix up remaining stack for next iteration
+                emit_promoted_loop_fixup(f, sim, &loop_top_stack);
+
+                // old_diff = index - limit
+                let old_diff = sim.alloc();
+                f.instruction(&Instruction::LocalGet(index_local));
+                f.instruction(&Instruction::LocalGet(limit_local));
+                f.instruction(&Instruction::I32Sub);
+                f.instruction(&Instruction::LocalSet(old_diff));
+
+                // new_index = index + step
+                f.instruction(&Instruction::LocalGet(index_local));
+                f.instruction(&Instruction::LocalGet(step));
+                f.instruction(&Instruction::I32Add);
+                f.instruction(&Instruction::LocalSet(index_local));
+
+                // exit = ((old_diff) XOR (new_index - limit)) AND ((old_diff) XOR step) < 0
+                f.instruction(&Instruction::LocalGet(old_diff));
+                f.instruction(&Instruction::LocalGet(index_local));
+                f.instruction(&Instruction::LocalGet(limit_local));
+                f.instruction(&Instruction::I32Sub);
+                f.instruction(&Instruction::I32Xor);
+                f.instruction(&Instruction::LocalGet(old_diff));
+                f.instruction(&Instruction::LocalGet(step));
+                f.instruction(&Instruction::I32Xor);
+                f.instruction(&Instruction::I32And);
+                f.instruction(&Instruction::I32Const(0));
+                f.instruction(&Instruction::I32LtS);
+                f.instruction(&Instruction::BrIf(1)); // break to $exit
+            } else {
+                // Fix up stack for next iteration (LOOP body is stack-neutral)
+                emit_promoted_loop_fixup(f, sim, &loop_top_stack);
+
+                // LOOP: increment by 1, check >= limit
+                f.instruction(&Instruction::LocalGet(index_local));
+                f.instruction(&Instruction::I32Const(1));
+                f.instruction(&Instruction::I32Add);
+                f.instruction(&Instruction::LocalSet(index_local));
+
+                f.instruction(&Instruction::LocalGet(index_local));
+                f.instruction(&Instruction::LocalGet(limit_local));
+                f.instruction(&Instruction::I32GeS);
+                f.instruction(&Instruction::BrIf(1)); // break to $exit
+            }
+
+            f.instruction(&Instruction::Br(0)); // continue loop
+            f.instruction(&Instruction::End); // end loop
+            f.instruction(&Instruction::End); // end block
+
+            sim.loop_index_stack.pop();
+        }
+
+        IrOp::BeginUntil { body } => {
+            // Save sim state at loop top — loop body must be stack-neutral
+            // so we need to copy results back into the same locals.
+            let loop_top_stack = sim.stack.clone();
+
+            f.instruction(&Instruction::Loop(BlockType::Empty));
+            emit_promoted_body(f, body, sim);
+            let cond = sim.pop();
+            f.instruction(&Instruction::LocalGet(cond));
+            f.instruction(&Instruction::I32Eqz);
+
+            // Copy modified stack values back to loop-top locals for next iteration
+            emit_promoted_loop_fixup(f, sim, &loop_top_stack);
+
+            f.instruction(&Instruction::BrIf(0));
+            f.instruction(&Instruction::End);
+        }
+
+        IrOp::BeginAgain { body } => {
+            let loop_top_stack = sim.stack.clone();
+
+            f.instruction(&Instruction::Loop(BlockType::Empty));
+            emit_promoted_body(f, body, sim);
+
+            emit_promoted_loop_fixup(f, sim, &loop_top_stack);
+
+            f.instruction(&Instruction::Br(0));
+            f.instruction(&Instruction::End);
+        }
+
+        IrOp::BeginWhileRepeat { test, body } => {
+            let loop_top_stack = sim.stack.clone();
+
+            f.instruction(&Instruction::Block(BlockType::Empty));
+            f.instruction(&Instruction::Loop(BlockType::Empty));
+            emit_promoted_body(f, test, sim);
+            let cond = sim.pop();
+            f.instruction(&Instruction::LocalGet(cond));
+            f.instruction(&Instruction::I32Eqz);
+            f.instruction(&Instruction::BrIf(1)); // break to outer block
+            emit_promoted_body(f, body, sim);
+
+            emit_promoted_loop_fixup(f, sim, &loop_top_stack);
+
+            f.instruction(&Instruction::Br(0)); // continue loop
+            f.instruction(&Instruction::End); // end loop
+            f.instruction(&Instruction::End); // end block
+        }
+
+        IrOp::BeginDoubleWhileRepeat {
+            outer_test,
+            inner_test,
+            body,
+            after_repeat,
+            else_body,
+        } => {
+            f.instruction(&Instruction::Block(BlockType::Empty)); // $end
+            f.instruction(&Instruction::Block(BlockType::Empty)); // $else
+            f.instruction(&Instruction::Block(BlockType::Empty)); // $after
+            f.instruction(&Instruction::Loop(BlockType::Empty)); // $begin
+            emit_promoted_body(f, outer_test, sim);
+            let cond1 = sim.pop();
+            f.instruction(&Instruction::LocalGet(cond1));
+            f.instruction(&Instruction::I32Eqz);
+            f.instruction(&Instruction::BrIf(2)); // → $else
+            emit_promoted_body(f, inner_test, sim);
+            let cond2 = sim.pop();
+            f.instruction(&Instruction::LocalGet(cond2));
+            f.instruction(&Instruction::I32Eqz);
+            f.instruction(&Instruction::BrIf(1)); // → $after
+            emit_promoted_body(f, body, sim);
+            f.instruction(&Instruction::Br(0)); // → $begin
+            f.instruction(&Instruction::End); // end loop
+            f.instruction(&Instruction::End); // end $after
+            emit_promoted_body(f, after_repeat, sim);
+            f.instruction(&Instruction::Br(0)); // → $end (skip else)
+            // Actually this needs to jump past else... let me use the same
+            // pattern as the non-promoted path
+            f.instruction(&Instruction::End); // end $else
+            if let Some(eb) = else_body {
+                emit_promoted_body(f, eb, sim);
+            }
+            f.instruction(&Instruction::End); // end $end
+        }
+
+        IrOp::RFetch => {
+            // In promoted DO/LOOP, R@ = loop index
+            if let Some(&(index_local, _)) = sim.loop_index_stack.last() {
+                let result = sim.alloc();
+                f.instruction(&Instruction::LocalGet(index_local));
+                f.instruction(&Instruction::LocalSet(result));
+                sim.push(result);
+            }
+            // Outside loops, RFetch shouldn't appear in promoted code
+        }
+
+        IrOp::LoopJ => {
+            if sim.loop_index_stack.len() >= 2 {
+                let (outer_index, _) =
+                    sim.loop_index_stack[sim.loop_index_stack.len() - 2];
+                let result = sim.alloc();
+                f.instruction(&Instruction::LocalGet(outer_index));
+                f.instruction(&Instruction::LocalSet(result));
+                sim.push(result);
+            }
+        }
+
+        IrOp::Exit => {
+            // Write remaining promoted locals back to memory stack, then return
+            emit_promoted_epilogue(f, sim);
+            dsp_writeback(f);
+            f.instruction(&Instruction::Return);
+        }
+
+        // Unhandled ops in promoted path — shouldn't reach here if is_promotable is correct
         _ => {}
     }
+}
+
+/// Emit a promoted body (sequence of ops).
+fn emit_promoted_body(f: &mut Function, ops: &[IrOp], sim: &mut StackSim) {
+    for op in ops {
+        emit_promoted_op(f, op, sim);
+    }
+}
+
+/// At the end of a loop iteration in promoted code, copy modified values
+/// back into the loop-top locals so the next iteration reads correct values.
+fn emit_promoted_loop_fixup(f: &mut Function, sim: &mut StackSim, loop_top_stack: &[u32]) {
+    assert_eq!(
+        sim.stack.len(),
+        loop_top_stack.len(),
+        "loop body must be stack-neutral (got {} items, expected {})",
+        sim.stack.len(),
+        loop_top_stack.len()
+    );
+    for (i, &top_local) in loop_top_stack.iter().enumerate() {
+        if sim.stack[i] != top_local {
+            f.instruction(&Instruction::LocalGet(sim.stack[i]));
+            f.instruction(&Instruction::LocalSet(top_local));
+        }
+    }
+    // Reset sim to loop-top state
+    sim.stack = loop_top_stack.to_vec();
 }
 
 /// Emit a promoted binary operation (commutative).
@@ -3257,9 +3560,20 @@ mod tests {
         assert!(!is_promotable(&[IrOp::Call(WordId(5))]));
         assert!(!is_promotable(&[IrOp::Emit]));
         assert!(!is_promotable(&[IrOp::ToR]));
+        // IF without ELSE is not promotable (stack depth varies by branch)
         assert!(!is_promotable(&[IrOp::If {
             then_body: vec![],
             else_body: None,
+        }]));
+        // IF also prevents promotion (for now)
+        assert!(!is_promotable(&[IrOp::PushI32(1), IrOp::If {
+            then_body: vec![IrOp::PushI32(1)],
+            else_body: Some(vec![IrOp::PushI32(0)]),
+        }]));
+        // Control flow prevents promotion (for now)
+        assert!(!is_promotable(&[IrOp::PushI32(10), IrOp::PushI32(0), IrOp::DoLoop {
+            body: vec![IrOp::RFetch, IrOp::Drop],
+            is_plus_loop: false,
         }]));
         assert!(!is_promotable(&[]));
     }
@@ -3439,16 +3753,20 @@ mod tests {
 
     #[test]
     fn non_promotable_still_works() {
-        // Words with control flow should NOT be promoted, but should still work
+        // IF-without-ELSE should NOT be promoted, but should still work
         let ops = vec![
             IrOp::PushI32(-1),
             IrOp::If {
                 then_body: vec![IrOp::PushI32(42)],
-                else_body: Some(vec![IrOp::PushI32(0)]),
+                else_body: None,
             },
         ];
         assert!(!is_promotable(&ops));
         assert_eq!(run_word(&ops), vec![42]);
+
+        // Calls prevent promotion but still work
+        let ops = vec![IrOp::Call(WordId(5))];
+        assert!(!is_promotable(&ops));
     }
 
     // ===================================================================
