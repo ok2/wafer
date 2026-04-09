@@ -12,26 +12,29 @@ This document describes every optimization that makes sense for WAFER, why it ma
 
 ## Status Summary
 
-| #  | Optimization             | Level        | Status      | Impact  |
-| -- | ------------------------ | ------------ | ----------- | ------- |
-| 1  | Stack-to-Local Promotion | Codegen      | Phase 1     | Highest |
-| 2  | Peephole Optimization    | IR pass      | Done        | High    |
-| 3  | Constant Folding         | IR pass      | Done        | High    |
-| 4  | Inlining                 | IR pass      | Done        | High    |
-| 5  | Strength Reduction       | IR pass      | Done        | Medium  |
-| 6  | Dead Code Elimination    | IR pass      | Done        | Medium  |
-| 7  | Tail Call Optimization   | IR + Codegen | Done        | Medium  |
-| 8  | Consolidation            | Architecture | Done        | High    |
-| 9  | Compound IR Operations   | IR + Codegen | Done        | Medium  |
-| 10 | Codegen Improvements     | Codegen      | Done        | Medium  |
-| 11 | wasmtime Configuration   | Runtime      | Done        | Low     |
-| 12 | Dictionary Hash Index    | Runtime      | Done        | Low     |
-| 13 | Startup Batching         | Architecture | Done        | Low     |
-| 14 | Float / Double-Cell      | Codegen      | Not started | Future  |
+| #  | Optimization              | Level        | Status      | Impact  |
+| -- | ------------------------- | ------------ | ----------- | ------- |
+| 1  | Stack-to-Local Promotion  | Codegen      | Phase 2     | Highest |
+| 2  | Peephole Optimization     | IR pass      | Done        | High    |
+| 3  | Constant Folding          | IR pass      | Done        | High    |
+| 4  | Inlining                  | IR pass      | Done        | High    |
+| 5  | Strength Reduction        | IR pass      | Done        | Medium  |
+| 6  | Dead Code Elimination     | IR pass      | Done        | Medium  |
+| 7  | Tail Call Optimization    | IR + Codegen | Done        | Medium  |
+| 8  | Consolidation             | Architecture | Done        | High    |
+| 9  | Compound IR Operations    | IR + Codegen | Done        | Medium  |
+| 10 | Codegen Improvements      | Codegen      | Done        | High    |
+| 11 | wasmtime Configuration    | Runtime      | Done        | Low     |
+| 12 | Dictionary Hash Index     | Runtime      | Done        | Low     |
+| 13 | Startup Batching          | Architecture | Done        | Low     |
+| 14 | Self-Recursive Direct Call| Codegen      | Done        | High    |
+| 15 | Float / Double-Cell       | Codegen      | Not started | Future  |
 
 ## 1. Stack-to-Local Promotion
 
-**Status: Phase 1 done.** Straight-line words (no control flow, calls, or I/O) use WASM locals instead of memory stack. Stack manipulation ops (Swap, Rot, Nip, Tuck, Dup, Drop) emit zero WASM instructions. Switchable via `WaferConfig::codegen.stack_to_local_promotion`.
+**Status: Phase 2 done.** Words with straight-line code, DO/LOOP, and IF/ELSE use WASM locals instead of memory stack. Stack manipulation ops (Swap, Rot, Nip, Tuck, Dup, Drop) emit zero WASM instructions. Loop index/limit kept in WASM locals (zero return stack traffic). Switchable via `WaferConfig::codegen.stack_to_local_promotion`.
+
+Phase 1 covered straight-line code only. Phase 2 extends to DO/LOOP (with stack-neutrality check) and IF/ELSE/THEN (with equal-branch-effect check). BEGIN loops and BeginDoubleWhileRepeat are not yet promoted.
 
 ### The Problem
 
@@ -342,7 +345,7 @@ These can be added as new `IrOp` variants recognized by peephole and emitted by 
 
 ## 10. Codegen Improvements
 
-**Status: Done (DSP caching).** `$dsp` cached in WASM local 0, written back before calls and at function exit. Commutative optimization and loop index in local are future work.
+**Status: Done.** DSP cached in WASM local 0, DO/LOOP index/limit in WASM locals (fast path when body has no calls/RS ops), J compiled as IR primitive (was host function). Self-recursive `call` optimization in section 14.
 
 These are improvements within `codegen.rs` `emit_op()` that do not require new IR operations.
 
@@ -390,7 +393,11 @@ i32.add               ;; result on wasm stack
 
 ### Loop Index in Local
 
-`DO...LOOP` currently stores the loop index and limit on the return stack (in memory). Keep them in WASM locals for the duration of the loop body. This makes `I` (read loop index) a simple `local.get` instead of a memory load from the return stack.
+**Status: Done.** DO/LOOP index and limit are kept in WASM locals. Two codegen paths:
+- **Fast path** (body has no calls, no `>R`/`R>`): pure locals, zero return stack traffic. `I` reads from `local.get`. `J` also reads from outer loop's local.
+- **Slow path** (body has calls or explicit RS ops): locals used for loop control but synced to return stack for LEAVE/UNLOOP compatibility.
+
+`J` was converted from a host function (WASM-to-Rust roundtrip) to an IR primitive (`IrOp::LoopJ`) that compiles to `local.get` of the outer loop's index local.
 
 ## 11. wasmtime Configuration
 
@@ -430,31 +437,46 @@ Currently, each of the 80+ primitives registered at boot creates a separate WASM
 
 Batch all IR-based primitives into a single WASM module with multiple exported functions. One `Module::new()` + one `Instance::new()` replaces 80+ pairs. This is a subset of what Consolidation (section 8) achieves, but scoped to primitives only and simpler to implement.
 
-## 14. Float and Double-Cell Stack
+## 14. Self-Recursive Direct Call
+
+**Status: Done.** When a word calls itself (RECURSE), the codegen emits `call WORD_FUNC` (direct call to the same function) instead of `call_indirect` through the function table. This eliminates the table lookup and signature check overhead.
+
+### Impact
+
+Fibonacci(25) with ~243K recursive calls:
+- `call_indirect`: ~21ns/call → 5.0ms total
+- Direct `call`: ~7ns/call → 1.6ms total (3x faster)
+- gforth: ~14ns/call → 3.4ms total
+
+The optimization is implemented in `emit_op` for `IrOp::Call`: when `ctx.self_word_id == Some(word_id)`, emit `call WORD_FUNC` (function index 1 in the word's own module). The `self_word_id` is derived from `CodegenConfig::base_fn_index`.
+
+## 15. Float and Double-Cell Stack
 
 **Status: Not started.** `PushI64` and `PushF64` exist as IR ops but are stubs in codegen. Float stack operations are currently all host functions.
 
 The float stack lives in its own memory region (0x2540--0x2D40). Float operations will have the same memory-based overhead as integer operations, but worse: `f64` values are 8 bytes, doubling the memory traffic per push/pop. Stack-to-local promotion (section 1) is even more impactful for floats because WASM has native `f64` locals and operand stack support.
 
-## Suggested Implementation Order
+## Current Performance vs Gforth
 
-Ordered by effort-to-impact ratio (cheapest wins first):
+All optimizations enabled, release mode, measured with UTIME:
 
-| Priority | Optimization                                       | Effort  | Unlocks                                         |
-| -------- | -------------------------------------------------- | ------- | ----------------------------------------------- |
-| 1        | Peephole optimization                              | Low     | Immediate code size reduction                   |
-| 2        | Constant folding                                   | Low     | Composes with peephole                          |
-| 3        | Tail call detection                                | Low     | Recursive word optimization                     |
-| 4        | Dictionary hash index                              | Low     | Faster compilation                              |
-| 5        | wasmtime config tuning                             | Trivial | Caching, interruption                           |
-| 6        | Codegen improvements (global caching, loop locals) | Medium  | ~30% fewer instructions                         |
-| 7        | Inlining                                           | Medium  | Unlocks cross-word folding and peephole         |
-| 8        | Strength reduction                                 | Low     | Best after inlining exists                      |
-| 9        | Dead code elimination                              | Low     | Best after constant folding exists              |
-| 10       | Compound IR operations                             | Medium  | Cumulative gains                                |
-| 11       | Stack-to-local promotion                           | High    | The single biggest speedup (~7x for arithmetic) |
-| 12       | Startup batching                                   | Medium  | Faster boot                                     |
-| 13       | Consolidation                                      | High    | Direct calls, cross-word optimization           |
-| 14       | Float/double-cell                                  | Medium  | Depends on stack-to-local                       |
+```
+Benchmark                   WAFER     CONSOL     gforth      WAFER/gf
+Fibonacci(25)                1629       1535       3422        0.45x
+Factorial(12)x10K             340        339        638        0.53x
+GCD-bench(500)                 18         15         30        0.50x
+NestedLoops(50)                84         73        720        0.10x
+Collatz(2K)                  1212       1202       3914        0.31x
+```
 
-Stack-to-local promotion has the highest impact but also the highest implementation cost. The passes before it (peephole, folding, inlining) are simpler and their benefits multiply when stack-to-local promotion is eventually added. Consolidation is last because it requires storing IR bodies and restructuring the module generation -- it benefits most from having all other passes working first.
+Times in microseconds. WAFER/gf < 1.0 means WAFER is faster.
+
+## Remaining Opportunities
+
+| Optimization | Status | Potential Impact |
+| --- | --- | --- |
+| BEGIN loop promotion | Not started | Would speed up GCD-style tight loops further |
+| BeginDoubleWhileRepeat promotion | Not started | Rare pattern, low priority |
+| LEAVE as IR primitive | Not started | Would enable fast-path for loops with LEAVE |
+| Float stack-to-local | Not started | Eliminate float stack memory traffic |
+| WASM tail calls proposal | Waiting on wasmtime | Would eliminate stack growth for tail-recursive words |

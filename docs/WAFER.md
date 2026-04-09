@@ -27,7 +27,7 @@ tests/
     forth2012-test-suite/   Forth 2012 compliance test suite (submodule)
 ```
 
-The compiler and runtime lives in `outer.rs` (~10,400 lines). Codegen is in `codegen.rs` (~2,800 lines). The optimizer is in `optimizer.rs` (~800 lines). Everything else is supporting infrastructure.
+The compiler and runtime lives in `outer.rs` (~10,500 lines). Codegen is in `codegen.rs` (~3,900 lines). The optimizer is in `optimizer.rs` (~800 lines). Everything else is supporting infrastructure.
 
 ## What Happens When You Start WAFER
 
@@ -282,6 +282,10 @@ When the compiler encounters a word reference during compilation, it emits:
 (call_indirect (type $void) (table 0))    ;; indirect call through the table
 ```
 
+**Self-recursive optimization**: When a word calls itself (RECURSE), the codegen detects this and emits a direct `call` instead of `call_indirect`, eliminating the table lookup and signature check (~3x faster for recursive words like Fibonacci).
+
+**After CONSOLIDATE**: All `call_indirect` between words in the consolidated module are replaced with direct `call` instructions, giving similar benefits for cross-word calls.
+
 At runtime, wasmtime resolves the table entry and calls the target function. Because all functions share the same memory, globals, and table, state passes between words through the data stack in linear memory. There are no function parameters or return values at the WASM level -- everything goes through the stack.
 
 This is subroutine threading: each word is a subroutine, and calling a word is an indirect function call.
@@ -362,13 +366,14 @@ Note: `EMIT` is an IR primitive -- it compiles to WASM code that calls the impor
 
 WAFER generates all WASM modules in memory. No `.wasm` files are written to disk. No caches, no configuration files, no persistent state. Every time you start WAFER, it rebuilds everything from scratch.
 
-The `--consolidate` CLI flag is reserved for a planned feature: compiling all words into a single optimized WASM module for ahead-of-time deployment. This is not yet implemented.
+The `CONSOLIDATE` word (available at the REPL and in source files) recompiles all defined words into a single optimized WASM module with direct `call` instructions. The `wafer build` subcommand compiles Forth source to standalone `.wasm` files or native executables.
 
 ## Running the Tests
 
 ```bash
-cargo test --workspace              # All unit tests (~220)
+cargo test --workspace              # All tests (~450)
 cargo test -p wafer-core --test compliance   # Forth 2012 compliance suite
+cargo test -p wafer-core --test comparison -- --nocapture --ignored  # vs gforth benchmarks
 cargo run -p wafer -- file.fth      # Execute a Forth source file
 echo '5 3 + .' | cargo run -p wafer # Pipe input (non-interactive)
 ```

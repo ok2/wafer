@@ -7,8 +7,10 @@ An optimizing Forth 2012 compiler targeting WebAssembly. WAFER JIT-compiles each
 ## Highlights
 
 - **200+ words** across 12 Forth 2012 word sets, all at **100% compliance**
-- **Optimizing compiler** with 6 IR passes + stack-to-local promotion + consolidation
+- **Optimizing compiler** with 6 IR passes + stack-to-local promotion (loops + IF) + consolidation
+- **Faster than gforth** on all benchmarks in release mode (2-10x faster)
 - **JIT compilation** — each `:` definition compiles to its own WASM module
+- **Self-recursive direct calls** — RECURSE compiles to native `call` instead of `call_indirect`
 - **Consolidation mode** — recompile all words into a single optimized WASM module
 - **Interactive REPL** with line editing (rustyline)
 
@@ -73,16 +75,34 @@ If you already cloned without `--recurse-submodules`, fetch the Forth 2012 test 
 git submodule update --init
 ```
 
+## Performance
+
+WAFER beats gforth (the GNU Forth reference implementation) on all benchmarks in release mode:
+
+```
+Benchmark                   WAFER     CONSOL     gforth      WAFER/gf
+Fibonacci(25)                1629       1535       3422        0.45x
+Factorial(12)x10K             340        339        638        0.53x
+GCD-bench(500)                 18         15         30        0.50x
+NestedLoops(50)                84         73        720        0.10x
+Collatz(2K)                  1212       1202       3914        0.31x
+```
+
+Times in microseconds. WAFER/gf < 1.0 means WAFER is faster. CONSOL = after `CONSOLIDATE`.
+
 ## Testing
 
 ```bash
-# All tests (392 currently passing)
+# All tests (~450 currently passing)
 cargo test --workspace
 
 # Forth 2012 compliance suite
 cargo test -p wafer-core --test compliance
 
-# Optimization benchmark report
+# Cross-engine comparison (WAFER vs gforth, requires gforth)
+cargo test -p wafer-core --test comparison -- --nocapture --ignored
+
+# Optimization benchmark report (WAFER-internal)
 cargo test -p wafer-core --test benchmark_report -- --nocapture --ignored
 
 # Lints
@@ -98,9 +118,9 @@ Forth Source -> Outer Interpreter -> IR -> [Optimize] -> WASM Codegen (wasm-enco
                                                     (shared memory + table)
 ```
 
-- **Subroutine threading** via WASM function tables and `call_indirect`
+- **Subroutine threading** via WASM function tables (`call_indirect` for cross-word, direct `call` for self-recursion)
 - **JIT mode**: each new word compiles to a separate WASM module linked to shared memory/globals/table
-- **IR-based pipeline** with 6 optimization passes (peephole, constant folding, strength reduction, DCE, tail call detection, inlining) plus stack-to-local promotion and consolidation
+- **IR-based pipeline** with 6 optimization passes (peephole, constant folding, strength reduction, DCE, tail call detection, inlining) plus stack-to-local promotion (with loop and IF/ELSE support), DO/LOOP index locals, and consolidation
 - **Dictionary**: linked-list word headers in simulated linear memory
 
 ## Project Structure
