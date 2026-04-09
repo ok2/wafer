@@ -213,7 +213,7 @@ pub struct ForthVM {
     toplevel_ir: Vec<IrOp>,
     /// When true, interpretation-mode execution is recorded into `toplevel_ir`.
     recording_toplevel: bool,
-    /// Saved states for MARKER words: marker_id -> MarkerState
+    /// Saved states for MARKER words: `marker_id` -> `MarkerState`
     marker_states: HashMap<u32, MarkerState>,
     /// Pending MARKER restore: after a marker word executes, restore this state
     pending_marker_restore: Arc<Mutex<Option<u32>>>,
@@ -2794,7 +2794,7 @@ impl ForthVM {
     }
 
     /// IMMEDIATE -- toggle the immediate flag on the most recently defined word.
-    /// Called via pending_define when IMMEDIATE is executed from compiled code.
+    /// Called via `pending_define` when IMMEDIATE is executed from compiled code.
     fn set_immediate(&mut self) -> anyhow::Result<()> {
         self.dictionary
             .set_immediate()
@@ -2899,7 +2899,7 @@ impl ForthVM {
     }
 
     /// Register `_MARKER_RESTORE_` host function.
-    /// ( marker_id -- ) Signals the outer interpreter to restore state.
+    /// ( `marker_id` -- ) Signals the outer interpreter to restore state.
     fn register_marker_restore(&mut self) -> anyhow::Result<()> {
         let memory = self.memory;
         let dsp = self.dsp;
@@ -4879,22 +4879,22 @@ impl ForthVM {
             let mut p = self.pending_marker_restore.lock().unwrap();
             p.take()
         };
-        if let Some(id) = marker_id {
-            if let Some(state) = self.marker_states.remove(&id) {
-                self.dictionary.restore_state(state.dict_state);
-                self.user_here = state.user_here;
-                self.next_table_index = state.next_table_index;
-                self.word_pfa_map = state.word_pfa_map;
-                self.ir_bodies = state.ir_bodies;
-                self.does_definitions = state.does_definitions;
-                self.host_word_names = state.host_word_names;
-                self.two_value_words = state.two_value_words;
-                self.fvalue_words = state.fvalue_words;
-                self.sync_here_cell();
-                self.rebuild_word_lookup();
-                // Remove any marker states that were created after this one
-                self.marker_states.retain(|&k, _| k < id);
-            }
+        if let Some(id) = marker_id
+            && let Some(state) = self.marker_states.remove(&id)
+        {
+            self.dictionary.restore_state(state.dict_state);
+            self.user_here = state.user_here;
+            self.next_table_index = state.next_table_index;
+            self.word_pfa_map = state.word_pfa_map;
+            self.ir_bodies = state.ir_bodies;
+            self.does_definitions = state.does_definitions;
+            self.host_word_names = state.host_word_names;
+            self.two_value_words = state.two_value_words;
+            self.fvalue_words = state.fvalue_words;
+            self.sync_here_cell();
+            self.rebuild_word_lookup();
+            // Remove any marker states that were created after this one
+            self.marker_states.retain(|&k, _| k < id);
         }
         Ok(())
     }
@@ -5764,7 +5764,7 @@ impl ForthVM {
                 FuncType::new(&self.engine, [], []),
                 move |_caller, _params, _results| {
                     let order = so.lock().unwrap();
-                    if order.first().is_some() {
+                    if !order.is_empty() {
                         // Use pending to set current_wid (needs dictionary access)
                         drop(order);
                         pending.lock().unwrap().push(33);

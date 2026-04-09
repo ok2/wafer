@@ -235,7 +235,7 @@ struct EmitCtx {
     /// Base WASM local index for DO/LOOP index/limit local pairs.
     /// Each nested loop uses 2 locals: (index, limit).
     loop_local_base: u32,
-    /// Stack of (index_local, limit_local) for active DO/LOOP nesting.
+    /// Stack of (`index_local`, `limit_local`) for active DO/LOOP nesting.
     /// Innermost loop is last. Used to compile `J` as local.get.
     loop_locals: Vec<(u32, u32)>,
     /// Nesting depth of DO/LOOPs that use the fast path (no RS sync).
@@ -1439,7 +1439,7 @@ struct StackSim {
     stack: Vec<u32>,
     /// Next available local index.
     next_local: u32,
-    /// Stack of (index_local, limit_local) for nested DO/LOOP in promoted path.
+    /// Stack of (`index_local`, `limit_local`) for nested DO/LOOP in promoted path.
     loop_index_stack: Vec<(u32, u32)>,
 }
 
@@ -2153,10 +2153,10 @@ fn body_needs_return_stack(ops: &[IrOp]) -> bool {
                 if body_needs_return_stack(then_body) {
                     return true;
                 }
-                if let Some(eb) = else_body {
-                    if body_needs_return_stack(eb) {
-                        return true;
-                    }
+                if let Some(eb) = else_body
+                    && body_needs_return_stack(eb)
+                {
+                    return true;
                 }
             }
             IrOp::DoLoop { body, .. } | IrOp::BeginUntil { body } | IrOp::BeginAgain { body } => {
@@ -2183,10 +2183,10 @@ fn body_needs_return_stack(ops: &[IrOp]) -> bool {
                 {
                     return true;
                 }
-                if let Some(eb) = else_body {
-                    if body_needs_return_stack(eb) {
-                        return true;
-                    }
+                if let Some(eb) = else_body
+                    && body_needs_return_stack(eb)
+                {
+                    return true;
                 }
             }
             _ => {}
@@ -2965,7 +2965,7 @@ fn compile_multi_word_module(
             let first_promoted = SCRATCH_BASE;
             let mut sim = StackSim::new(first_promoted);
             emit_promoted_prologue(&mut func, preload, &mut sim);
-            for op in body.iter() {
+            for op in body {
                 emit_promoted_op(&mut func, op, &mut sim);
             }
             emit_promoted_epilogue(&mut func, &mut sim);
@@ -3276,28 +3276,28 @@ mod tests {
 
         let dsp = Global::new(
             &mut store,
-            wasmtime::GlobalType::new(ValType::I32, Mutability::Var),
+            GlobalType::new(ValType::I32, Mutability::Var),
             Val::I32(DATA_STACK_TOP as i32),
         )
         .unwrap();
 
         let rsp = Global::new(
             &mut store,
-            wasmtime::GlobalType::new(ValType::I32, Mutability::Var),
+            GlobalType::new(ValType::I32, Mutability::Var),
             Val::I32(RETURN_STACK_TOP as i32),
         )
         .unwrap();
 
         let fsp = Global::new(
             &mut store,
-            wasmtime::GlobalType::new(ValType::I32, Mutability::Var),
+            GlobalType::new(ValType::I32, Mutability::Var),
             Val::I32(FLOAT_STACK_TOP as i32),
         )
         .unwrap();
 
         let table = Table::new(
             &mut store,
-            wasmtime::TableType::new(RefType::FUNCREF, 16, None),
+            TableType::new(RefType::FUNCREF, 16, None),
             Ref::Func(None),
         )
         .unwrap();
@@ -3305,7 +3305,7 @@ mod tests {
         let emit_ty = FuncType::new(&engine, [ValType::I32], []);
         let emit = Func::new(&mut store, emit_ty, |_caller, _params, _results| Ok(()));
 
-        let module = wasmtime::Module::new(&engine, &compiled.bytes).unwrap();
+        let module = Module::new(&engine, &compiled.bytes).unwrap();
         let instance = Instance::new(
             &mut store,
             &module,
@@ -3930,28 +3930,28 @@ mod tests {
 
         let dsp = Global::new(
             &mut store,
-            wasmtime::GlobalType::new(ValType::I32, Mutability::Var),
+            GlobalType::new(ValType::I32, Mutability::Var),
             Val::I32(DATA_STACK_TOP as i32),
         )
         .unwrap();
 
         let rsp = Global::new(
             &mut store,
-            wasmtime::GlobalType::new(ValType::I32, Mutability::Var),
+            GlobalType::new(ValType::I32, Mutability::Var),
             Val::I32(RETURN_STACK_TOP as i32),
         )
         .unwrap();
 
         let fsp = Global::new(
             &mut store,
-            wasmtime::GlobalType::new(ValType::I32, Mutability::Var),
+            GlobalType::new(ValType::I32, Mutability::Var),
             Val::I32(FLOAT_STACK_TOP as i32),
         )
         .unwrap();
 
         let table = Table::new(
             &mut store,
-            wasmtime::TableType::new(RefType::FUNCREF, 16, None),
+            TableType::new(RefType::FUNCREF, 16, None),
             Ref::Func(None),
         )
         .unwrap();
@@ -3959,7 +3959,7 @@ mod tests {
         let emit_ty = FuncType::new(&engine, [ValType::I32], []);
         let emit = Func::new(&mut store, emit_ty, |_caller, _params, _results| Ok(()));
 
-        let module = wasmtime::Module::new(&engine, &compiled.bytes).unwrap();
+        let module = Module::new(&engine, &compiled.bytes).unwrap();
         let instance = Instance::new(
             &mut store,
             &module,
@@ -3995,7 +3995,12 @@ mod tests {
 
     #[test]
     fn compile_push_f64_validates() {
-        let m = compile_word("test", &[IrOp::PushF64(3.14)], &default_config()).unwrap();
+        let m = compile_word(
+            "test",
+            &[IrOp::PushF64(std::f64::consts::PI)],
+            &default_config(),
+        )
+        .unwrap();
         validate_wasm(&m.bytes).unwrap();
     }
 
@@ -4015,7 +4020,8 @@ mod tests {
 
     #[test]
     fn execute_push_f64() {
-        assert_eq!(run_float_word(&[IrOp::PushF64(3.14)]), vec![3.14]);
+        let pi = std::f64::consts::PI;
+        assert_eq!(run_float_word(&[IrOp::PushF64(pi)]), vec![pi]);
     }
 
     #[test]
@@ -4145,14 +4151,15 @@ mod tests {
 
     #[test]
     fn execute_fetch_store_float() {
-        // Store 3.14 at address 0x100, then fetch it back
+        // Store PI at address 0x100, then fetch it back
+        let pi = std::f64::consts::PI;
         let ops = vec![
-            IrOp::PushF64(3.14),
+            IrOp::PushF64(pi),
             IrOp::PushI32(0x100),
             IrOp::StoreFloat,
             IrOp::PushI32(0x100),
             IrOp::FetchFloat,
         ];
-        assert_eq!(run_float_word(&ops), vec![3.14]);
+        assert_eq!(run_float_word(&ops), vec![pi]);
     }
 }

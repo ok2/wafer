@@ -33,7 +33,7 @@ pub const PAD_SIZE: u32 = 256;
 
 /// Pictured numeric output buffer (<# ... #>). Grows downward from top.
 pub const PICT_BUF_BASE: u32 = PAD_BASE + PAD_SIZE; // 0x0540
-/// Size of pictured output buffer (2*BITS_PER_CELL + 2 = 66 min, 128 for margin).
+/// Size of pictured output buffer (2*`BITS_PER_CELL` + 2 = 66 min, 128 for margin).
 pub const PICT_BUF_SIZE: u32 = 128;
 /// Top of pictured output buffer (HLD starts here, grows down).
 pub const PICT_BUF_TOP: u32 = PICT_BUF_BASE + PICT_BUF_SIZE;
@@ -108,17 +108,17 @@ mod tests {
     #[test]
     fn memory_regions_dont_overlap() {
         // Each region should start after the previous one ends
-        assert!(INPUT_BUFFER_BASE >= SYSVAR_BASE + SYSVAR_SIZE);
-        assert!(PAD_BASE >= INPUT_BUFFER_BASE + INPUT_BUFFER_SIZE);
-        assert!(DATA_STACK_BASE >= PAD_BASE + PAD_SIZE);
-        assert!(RETURN_STACK_BASE >= DATA_STACK_BASE + DATA_STACK_SIZE);
-        assert!(FLOAT_STACK_BASE >= RETURN_STACK_BASE + RETURN_STACK_SIZE);
-        assert!(DICTIONARY_BASE >= FLOAT_STACK_BASE + FLOAT_STACK_SIZE);
+        const { assert!(INPUT_BUFFER_BASE >= SYSVAR_BASE + SYSVAR_SIZE) };
+        const { assert!(PAD_BASE >= INPUT_BUFFER_BASE + INPUT_BUFFER_SIZE) };
+        const { assert!(DATA_STACK_BASE >= PAD_BASE + PAD_SIZE) };
+        const { assert!(RETURN_STACK_BASE >= DATA_STACK_BASE + DATA_STACK_SIZE) };
+        const { assert!(FLOAT_STACK_BASE >= RETURN_STACK_BASE + RETURN_STACK_SIZE) };
+        const { assert!(DICTIONARY_BASE >= FLOAT_STACK_BASE + FLOAT_STACK_SIZE) };
     }
 
     #[test]
     fn dictionary_starts_within_first_page() {
-        assert!(DICTIONARY_BASE < PAGE_SIZE);
+        const { assert!(DICTIONARY_BASE < PAGE_SIZE) };
     }
 
     #[test]
@@ -142,7 +142,6 @@ mod tests {
             SYSVAR_LEAVE_FLAG,
         ];
         for offset in all_offsets {
-            assert!(offset >= SYSVAR_BASE);
             assert!(offset + CELL_SIZE <= SYSVAR_BASE + SYSVAR_SIZE);
         }
     }

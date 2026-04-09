@@ -38,7 +38,7 @@ pub struct Dictionary {
     here: u32,
     /// Next available function table index.
     next_fn_index: u32,
-    /// Hash index: name -> Vec of (wid, word_addr, fn_index, is_immediate).
+    /// Hash index: name -> Vec of (wid, `word_addr`, `fn_index`, `is_immediate`).
     /// Multiple entries per name support different wordlists.
     index: HashMap<String, Vec<(u32, u32, u32, bool)>>,
     /// Current compilation wordlist ID.

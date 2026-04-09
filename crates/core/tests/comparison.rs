@@ -676,9 +676,7 @@ fn build_wafer_release() -> Option<String> {
 static WAFER_RELEASE: OnceLock<Option<String>> = OnceLock::new();
 
 fn find_wafer_release() -> Option<&'static str> {
-    WAFER_RELEASE
-        .get_or_init(|| build_wafer_release())
-        .as_deref()
+    WAFER_RELEASE.get_or_init(build_wafer_release).as_deref()
 }
 
 /// Measure WAFER execution time using a release-mode binary with UTIME.

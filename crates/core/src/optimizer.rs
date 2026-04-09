@@ -944,7 +944,7 @@ mod tests {
         // Should NOT inline (recursive), but tail call detect may convert
         assert!(matches!(
             result.last(),
-            Some(IrOp::Call(WordId(5))) | Some(IrOp::TailCall(WordId(5)))
+            Some(IrOp::Call(WordId(5)) | IrOp::TailCall(WordId(5)))
         ));
     }
 
