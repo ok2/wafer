@@ -713,6 +713,42 @@ fn measure_wafer_release(wafer: &str, bench: &PerfBenchmark) -> Option<u64> {
     Some(times[times.len() / 2])
 }
 
+/// Measure WAFER execution time after CONSOLIDATE (direct calls between all words).
+fn measure_wafer_consolidated(wafer: &str, bench: &PerfBenchmark) -> Option<u64> {
+    let code = format!(
+        "{define} CONSOLIDATE {run} \
+         : TIMED-BENCH UTIME {run} UTIME 2SWAP D- DROP . CR ; \
+         TIMED-BENCH TIMED-BENCH TIMED-BENCH",
+        define = bench.define,
+        run = bench.run_code,
+    );
+    let output = Command::new(wafer)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child.stdin.take().unwrap().write_all(code.as_bytes())?;
+            child.wait_with_output()
+        })
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut times: Vec<u64> = stdout
+        .trim()
+        .lines()
+        .filter_map(|l| l.trim().parse::<u64>().ok())
+        .collect();
+    times.sort();
+    if times.is_empty() {
+        return None;
+    }
+    Some(times[times.len() / 2])
+}
+
 /// Measure gforth execution time using Forth-level `utime` (excludes startup).
 /// Both engines run the exact same `run_code`, so the comparison is apples-to-apples.
 /// Returns microseconds, or None if gforth is unavailable.
@@ -788,23 +824,37 @@ fn performance_report() {
     println!("  WAFER vs Gforth Performance Comparison (release mode)");
     println!("{sep}\n");
     println!(
-        "{:<22} {:>12} {:>12} {:>12} {:>12}",
-        "Benchmark", "WAFER(us)", "gforth(us)", "gforth-fast", "WAFER/gf"
+        "{:<22} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "Benchmark", "WAFER", "CONSOL", "gforth", "gf-fast", "WAFER/gf"
+    );
+    println!(
+        "{:<22} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "", "(us)", "(us)", "(us)", "(us)", ""
     );
     println!("{thin}");
 
     for bench in &benchmarks {
-        let wafer = wafer_release.and_then(|w| measure_wafer_release(w, bench)).unwrap_or(0);
+        let wafer = wafer_release
+            .and_then(|w| measure_wafer_release(w, bench))
+            .unwrap_or(0);
+        let consol = wafer_release
+            .and_then(|w| measure_wafer_consolidated(w, bench))
+            .unwrap_or(0);
         let gf = gforth.and_then(|g| measure_gforth(g, bench));
         let gf_fast = gforth_fast.and_then(|g| measure_gforth(g, bench));
 
         let gf_str = gf.map_or_else(|| "-".to_string(), |v| format!("{v}"));
         let gf_fast_str = gf_fast.map_or_else(|| "-".to_string(), |v| format!("{v}"));
+        let best_wafer = if consol > 0 && consol < wafer {
+            consol
+        } else {
+            wafer
+        };
         let ratio = gf.map_or_else(
             || "-".to_string(),
             |g| {
                 if g > 0 {
-                    format!("{:.2}x", wafer as f64 / g as f64)
+                    format!("{:.2}x", best_wafer as f64 / g as f64)
                 } else {
                     "-".to_string()
                 }
@@ -812,13 +862,13 @@ fn performance_report() {
         );
 
         println!(
-            "{:<22} {:>12} {:>12} {:>12} {:>12}",
-            bench.name, wafer, gf_str, gf_fast_str, ratio
+            "{:<22} {:>10} {:>10} {:>10} {:>10} {:>10}",
+            bench.name, wafer, consol, gf_str, gf_fast_str, ratio
         );
     }
 
     println!("{thin}");
-    println!("  WAFER = all optimizations enabled");
-    println!("  WAFER/gf < 1.0 means WAFER is faster than gforth");
+    println!("  WAFER = all optimizations, CONSOL = after CONSOLIDATE");
+    println!("  WAFER/gf = best(WAFER,CONSOL) vs gforth, < 1.0 means WAFER faster");
     println!("{sep}\n");
 }

@@ -241,6 +241,9 @@ struct EmitCtx {
     /// Nesting depth of DO/LOOPs that use the fast path (no RS sync).
     /// When > 0, `RFetch` (I) reads from the loop local instead of rpeek.
     fast_loop_depth: u32,
+    /// The word being compiled (for self-recursion detection).
+    /// When `Call(id)` matches this, emit direct `call` instead of `call_indirect`.
+    self_word_id: Option<WordId>,
 }
 
 /// Decrement the FSP global by 8 (allocate space for one f64).
@@ -544,27 +547,31 @@ fn emit_op(f: &mut Function, op: &IrOp, ctx: &mut EmitCtx) {
 
         // -- Control flow ---------------------------------------------------
         IrOp::Call(word_id) => {
-            // Write back cached DSP before call
             dsp_writeback(f);
-            f.instruction(&Instruction::I32Const(word_id.0 as i32))
-                .instruction(&Instruction::CallIndirect {
-                    type_index: TYPE_VOID,
-                    table_index: TABLE,
-                });
-            // Reload cached DSP after call (callee may have modified it)
+            if ctx.self_word_id == Some(*word_id) {
+                // Self-recursion: direct call (avoids table lookup + signature check)
+                f.instruction(&Instruction::Call(WORD_FUNC));
+            } else {
+                f.instruction(&Instruction::I32Const(word_id.0 as i32))
+                    .instruction(&Instruction::CallIndirect {
+                        type_index: TYPE_VOID,
+                        table_index: TABLE,
+                    });
+            }
             dsp_reload(f);
         }
 
         IrOp::TailCall(word_id) => {
-            // Write back cached DSP before tail call
             dsp_writeback(f);
-            f.instruction(&Instruction::I32Const(word_id.0 as i32))
-                .instruction(&Instruction::CallIndirect {
-                    type_index: TYPE_VOID,
-                    table_index: TABLE,
-                });
-            // Callee's epilogue already wrote back to the global, so just return.
-            // No reload needed since we're not using the local after this.
+            if ctx.self_word_id == Some(*word_id) {
+                f.instruction(&Instruction::Call(WORD_FUNC));
+            } else {
+                f.instruction(&Instruction::I32Const(word_id.0 as i32))
+                    .instruction(&Instruction::CallIndirect {
+                        type_index: TYPE_VOID,
+                        table_index: TABLE,
+                    });
+            }
             f.instruction(&Instruction::Return);
         }
 
@@ -2418,6 +2425,7 @@ pub fn compile_word(
         loop_local_base,
         loop_locals: Vec::new(),
         fast_loop_depth: 0,
+        self_word_id: Some(WordId(config.base_fn_index)),
     };
 
     // Prologue: cache $dsp global into local 0
@@ -2918,6 +2926,7 @@ fn compile_multi_word_module(
             loop_local_base,
             loop_locals: Vec::new(),
             fast_loop_depth: 0,
+            self_word_id: None, // consolidated module uses direct calls via local_fn_map
         };
 
         // Prologue: cache $dsp global into local 0
