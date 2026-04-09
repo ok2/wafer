@@ -32,7 +32,11 @@ fn probe_gforth(candidate: &str) -> bool {
 fn find_gforth() -> Option<&'static str> {
     GFORTH_PATH
         .get_or_init(|| {
-            for candidate in &["/opt/homebrew/bin/gforth", "/usr/local/bin/gforth", "gforth"] {
+            for candidate in &[
+                "/opt/homebrew/bin/gforth",
+                "/usr/local/bin/gforth",
+                "gforth",
+            ] {
                 if probe_gforth(candidate) {
                     return Some(candidate.to_string());
                 }
@@ -83,7 +87,7 @@ fn run_wafer(code: &str) -> EngineResult {
                 return EngineResult {
                     output,
                     success: false,
-                }
+                };
             }
         }
     }
@@ -108,7 +112,7 @@ fn run_wafer_optimized(code: &str) -> EngineResult {
                 return EngineResult {
                     output,
                     success: false,
-                }
+                };
             }
         }
     }
@@ -132,7 +136,11 @@ fn run_gforth_engine(gforth: &str, code: &str) -> Option<EngineResult> {
     } else {
         format!("{flat} bye")
     };
-    let output = Command::new(gforth).arg("-e").arg(&with_bye).output().ok()?;
+    let output = Command::new(gforth)
+        .arg("-e")
+        .arg(&with_bye)
+        .output()
+        .ok()?;
     Some(EngineResult {
         output: String::from_utf8_lossy(&output.stdout).into_owned(),
         success: output.status.success(),
@@ -642,9 +650,7 @@ fn perf_benchmarks() -> Vec<PerfBenchmark> {
 fn build_wafer_release() -> Option<String> {
     // Find workspace root (two levels up from crates/core)
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let workspace_root = std::path::Path::new(manifest_dir)
-        .parent()?
-        .parent()?;
+    let workspace_root = std::path::Path::new(manifest_dir).parent()?.parent()?;
     let output = Command::new("cargo")
         .args(["build", "--release", "-p", "wafer"])
         .current_dir(workspace_root)
@@ -657,9 +663,8 @@ fn build_wafer_release() -> Option<String> {
         );
         return None;
     }
-    let target_dir = workspace_root.join(
-        std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".to_string()),
-    );
+    let target_dir = workspace_root
+        .join(std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".to_string()));
     let binary = target_dir.join("release/wafer");
     if binary.exists() {
         Some(binary.to_string_lossy().into_owned())

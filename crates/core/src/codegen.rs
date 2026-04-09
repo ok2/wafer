@@ -1118,7 +1118,10 @@ fn is_promotable_body(ops: &[IrOp]) -> bool {
             | IrOp::FtoS => return false,
             // IF with ELSE: promotable if both branches are promotable
             // and have the same net stack effect
-            IrOp::If { then_body, else_body } => {
+            IrOp::If {
+                then_body,
+                else_body,
+            } => {
                 let Some(eb) = else_body else {
                     return false;
                 };
@@ -1239,16 +1242,36 @@ fn compute_stack_needs_rec(ops: &[IrOp], depth: &mut i32, min_accessed: &mut i32
             IrOp::Over | IrOp::TwoDup => *depth - 2,
             IrOp::Swap | IrOp::Nip | IrOp::Tuck => *depth - 2,
             IrOp::Rot => *depth - 3,
-            IrOp::Add | IrOp::Sub | IrOp::Mul | IrOp::And | IrOp::Or | IrOp::Xor
-            | IrOp::Lshift | IrOp::Rshift | IrOp::ArithRshift
-            | IrOp::Eq | IrOp::NotEq | IrOp::Lt | IrOp::Gt | IrOp::LtUnsigned
-            | IrOp::DivMod | IrOp::Store | IrOp::CStore | IrOp::PlusStore => *depth - 2,
-            IrOp::Drop | IrOp::Negate | IrOp::Abs | IrOp::Invert
-            | IrOp::ZeroEq | IrOp::ZeroLt | IrOp::Fetch | IrOp::CFetch => *depth - 1,
+            IrOp::Add
+            | IrOp::Sub
+            | IrOp::Mul
+            | IrOp::And
+            | IrOp::Or
+            | IrOp::Xor
+            | IrOp::Lshift
+            | IrOp::Rshift
+            | IrOp::ArithRshift
+            | IrOp::Eq
+            | IrOp::NotEq
+            | IrOp::Lt
+            | IrOp::Gt
+            | IrOp::LtUnsigned
+            | IrOp::DivMod
+            | IrOp::Store
+            | IrOp::CStore
+            | IrOp::PlusStore => *depth - 2,
+            IrOp::Drop
+            | IrOp::Negate
+            | IrOp::Abs
+            | IrOp::Invert
+            | IrOp::ZeroEq
+            | IrOp::ZeroLt
+            | IrOp::Fetch
+            | IrOp::CFetch => *depth - 1,
             IrOp::TwoDrop => *depth - 2,
             IrOp::FetchFloat | IrOp::StoreFloat | IrOp::StoF => *depth - 1,
             // Control flow reads are handled by recursion below
-            IrOp::If { .. } => *depth - 1, // consumes condition
+            IrOp::If { .. } => *depth - 1,     // consumes condition
             IrOp::DoLoop { .. } => *depth - 2, // consumes limit + index
             _ => *depth,
         };
@@ -1256,7 +1279,10 @@ fn compute_stack_needs_rec(ops: &[IrOp], depth: &mut i32, min_accessed: &mut i32
 
         // Then: update depth. For control flow, recurse instead of using stack_delta.
         match op {
-            IrOp::If { then_body, else_body } => {
+            IrOp::If {
+                then_body,
+                else_body,
+            } => {
                 *depth -= 1; // consume condition
                 let saved = *depth;
                 compute_stack_needs_rec(then_body, depth, min_accessed);
@@ -1301,7 +1327,11 @@ fn compute_stack_needs_rec(ops: &[IrOp], depth: &mut i32, min_accessed: &mut i32
                 *depth = saved;
             }
             IrOp::BeginDoubleWhileRepeat {
-                outer_test, inner_test, body, after_repeat, else_body,
+                outer_test,
+                inner_test,
+                body,
+                after_repeat,
+                else_body,
             } => {
                 let saved = *depth;
                 compute_stack_needs_rec(outer_test, depth, min_accessed);
@@ -1934,8 +1964,7 @@ fn emit_promoted_op(f: &mut Function, op: &IrOp, sim: &mut StackSim) {
 
         IrOp::LoopJ => {
             if sim.loop_index_stack.len() >= 2 {
-                let (outer_index, _) =
-                    sim.loop_index_stack[sim.loop_index_stack.len() - 2];
+                let (outer_index, _) = sim.loop_index_stack[sim.loop_index_stack.len() - 2];
                 let result = sim.alloc();
                 f.instruction(&Instruction::LocalGet(outer_index));
                 f.instruction(&Instruction::LocalSet(result));
@@ -2130,9 +2159,7 @@ fn body_needs_return_stack(ops: &[IrOp]) -> bool {
                     }
                 }
             }
-            IrOp::DoLoop { body, .. }
-            | IrOp::BeginUntil { body }
-            | IrOp::BeginAgain { body } => {
+            IrOp::DoLoop { body, .. } | IrOp::BeginUntil { body } | IrOp::BeginAgain { body } => {
                 if body_needs_return_stack(body) {
                     return true;
                 }
@@ -2186,8 +2213,7 @@ fn count_loop_depth(ops: &[IrOp]) -> u32 {
                     max = max.max(count_loop_depth(eb));
                 }
             }
-            IrOp::BeginUntil { body }
-            | IrOp::BeginAgain { body } => {
+            IrOp::BeginUntil { body } | IrOp::BeginAgain { body } => {
                 max = max.max(count_loop_depth(body));
             }
             IrOp::BeginWhileRepeat { test, body } => {
@@ -3671,15 +3697,22 @@ mod tests {
             else_body: None,
         }]));
         // IF with ELSE is promotable
-        assert!(is_promotable(&[IrOp::PushI32(1), IrOp::If {
-            then_body: vec![IrOp::PushI32(1)],
-            else_body: Some(vec![IrOp::PushI32(0)]),
-        }]));
+        assert!(is_promotable(&[
+            IrOp::PushI32(1),
+            IrOp::If {
+                then_body: vec![IrOp::PushI32(1)],
+                else_body: Some(vec![IrOp::PushI32(0)]),
+            }
+        ]));
         // DO/LOOP with stack-neutral body is promotable
-        assert!(is_promotable(&[IrOp::PushI32(10), IrOp::PushI32(0), IrOp::DoLoop {
-            body: vec![IrOp::RFetch, IrOp::Drop],
-            is_plus_loop: false,
-        }]));
+        assert!(is_promotable(&[
+            IrOp::PushI32(10),
+            IrOp::PushI32(0),
+            IrOp::DoLoop {
+                body: vec![IrOp::RFetch, IrOp::Drop],
+                is_plus_loop: false,
+            }
+        ]));
         assert!(!is_promotable(&[]));
     }
 

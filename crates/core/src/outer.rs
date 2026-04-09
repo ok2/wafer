@@ -5148,10 +5148,8 @@ impl ForthVM {
                 let sp = dsp.get(&mut caller).unwrap_i32() as u32;
                 let new_sp = sp - 2 * CELL_SIZE;
                 let data = memory.data_mut(&mut caller);
-                data[new_sp as usize..new_sp as usize + 4]
-                    .copy_from_slice(&hi.to_le_bytes());
-                data[new_sp as usize + 4..new_sp as usize + 8]
-                    .copy_from_slice(&lo.to_le_bytes());
+                data[new_sp as usize..new_sp as usize + 4].copy_from_slice(&hi.to_le_bytes());
+                data[new_sp as usize + 4..new_sp as usize + 8].copy_from_slice(&lo.to_le_bytes());
                 dsp.set(&mut caller, Val::I32(new_sp as i32))?;
                 Ok(())
             },
