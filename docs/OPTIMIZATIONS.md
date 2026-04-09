@@ -12,23 +12,23 @@ This document describes every optimization that makes sense for WAFER, why it ma
 
 ## Status Summary
 
-| #  | Optimization              | Level        | Status      | Impact  |
-| -- | ------------------------- | ------------ | ----------- | ------- |
-| 1  | Stack-to-Local Promotion  | Codegen      | Phase 2     | Highest |
-| 2  | Peephole Optimization     | IR pass      | Done        | High    |
-| 3  | Constant Folding          | IR pass      | Done        | High    |
-| 4  | Inlining                  | IR pass      | Done        | High    |
-| 5  | Strength Reduction        | IR pass      | Done        | Medium  |
-| 6  | Dead Code Elimination     | IR pass      | Done        | Medium  |
-| 7  | Tail Call Optimization    | IR + Codegen | Done        | Medium  |
-| 8  | Consolidation             | Architecture | Done        | High    |
-| 9  | Compound IR Operations    | IR + Codegen | Done        | Medium  |
-| 10 | Codegen Improvements      | Codegen      | Done        | High    |
-| 11 | wasmtime Configuration    | Runtime      | Done        | Low     |
-| 12 | Dictionary Hash Index     | Runtime      | Done        | Low     |
-| 13 | Startup Batching          | Architecture | Done        | Low     |
-| 14 | Self-Recursive Direct Call| Codegen      | Done        | High    |
-| 15 | Float / Double-Cell       | Codegen      | Not started | Future  |
+| #  | Optimization               | Level        | Status      | Impact  |
+| -- | -------------------------- | ------------ | ----------- | ------- |
+| 1  | Stack-to-Local Promotion   | Codegen      | Phase 2     | Highest |
+| 2  | Peephole Optimization      | IR pass      | Done        | High    |
+| 3  | Constant Folding           | IR pass      | Done        | High    |
+| 4  | Inlining                   | IR pass      | Done        | High    |
+| 5  | Strength Reduction         | IR pass      | Done        | Medium  |
+| 6  | Dead Code Elimination      | IR pass      | Done        | Medium  |
+| 7  | Tail Call Optimization     | IR + Codegen | Done        | Medium  |
+| 8  | Consolidation              | Architecture | Done        | High    |
+| 9  | Compound IR Operations     | IR + Codegen | Done        | Medium  |
+| 10 | Codegen Improvements       | Codegen      | Done        | High    |
+| 11 | wasmtime Configuration     | Runtime      | Done        | Low     |
+| 12 | Dictionary Hash Index      | Runtime      | Done        | Low     |
+| 13 | Startup Batching           | Architecture | Done        | Low     |
+| 14 | Self-Recursive Direct Call | Codegen      | Done        | High    |
+| 15 | Float / Double-Cell        | Codegen      | Not started | Future  |
 
 ## 1. Stack-to-Local Promotion
 
@@ -394,6 +394,7 @@ i32.add               ;; result on wasm stack
 ### Loop Index in Local
 
 **Status: Done.** DO/LOOP index and limit are kept in WASM locals. Two codegen paths:
+
 - **Fast path** (body has no calls, no `>R`/`R>`): pure locals, zero return stack traffic. `I` reads from `local.get`. `J` also reads from outer loop's local.
 - **Slow path** (body has calls or explicit RS ops): locals used for loop control but synced to return stack for LEAVE/UNLOOP compatibility.
 
@@ -444,6 +445,7 @@ Batch all IR-based primitives into a single WASM module with multiple exported f
 ### Impact
 
 Fibonacci(25) with ~243K recursive calls:
+
 - `call_indirect`: ~21ns/call → 5.0ms total
 - Direct `call`: ~7ns/call → 1.6ms total (3x faster)
 - gforth: ~14ns/call → 3.4ms total
@@ -473,10 +475,10 @@ Times in microseconds. WAFER/gf < 1.0 means WAFER is faster.
 
 ## Remaining Opportunities
 
-| Optimization | Status | Potential Impact |
-| --- | --- | --- |
-| BEGIN loop promotion | Not started | Would speed up GCD-style tight loops further |
-| BeginDoubleWhileRepeat promotion | Not started | Rare pattern, low priority |
-| LEAVE as IR primitive | Not started | Would enable fast-path for loops with LEAVE |
-| Float stack-to-local | Not started | Eliminate float stack memory traffic |
-| WASM tail calls proposal | Waiting on wasmtime | Would eliminate stack growth for tail-recursive words |
+| Optimization                     | Status              | Potential Impact                                      |
+| -------------------------------- | ------------------- | ----------------------------------------------------- |
+| BEGIN loop promotion             | Not started         | Would speed up GCD-style tight loops further          |
+| BeginDoubleWhileRepeat promotion | Not started         | Rare pattern, low priority                            |
+| LEAVE as IR primitive            | Not started         | Would enable fast-path for loops with LEAVE           |
+| Float stack-to-local             | Not started         | Eliminate float stack memory traffic                  |
+| WASM tail calls proposal         | Waiting on wasmtime | Would eliminate stack growth for tail-recursive words |
