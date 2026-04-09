@@ -1082,9 +1082,7 @@ fn is_promotable_body(ops: &[IrOp]) -> bool {
     for op in ops {
         match op {
             IrOp::Call(_) | IrOp::TailCall(_) | IrOp::Execute | IrOp::SpFetch => return false,
-            IrOp::ToR | IrOp::FromR | IrOp::RFetch | IrOp::LoopJ | IrOp::Exit => {
-                return false;
-            }
+            IrOp::ToR | IrOp::FromR | IrOp::Exit => return false,
             IrOp::ForthLocalGet(_) | IrOp::ForthLocalSet(_) => return false,
             IrOp::Emit | IrOp::Dot | IrOp::Cr | IrOp::Type => return false,
             IrOp::PushI64(_) | IrOp::PushF64(_) => return false,
@@ -1111,10 +1109,38 @@ fn is_promotable_body(ops: &[IrOp]) -> bool {
             | IrOp::StoreFloat
             | IrOp::StoF
             | IrOp::FtoS => return false,
-            // Control flow not yet promoted in StackSim path
-            IrOp::If { .. }
-            | IrOp::DoLoop { .. }
-            | IrOp::BeginUntil { .. }
+            // IF with ELSE: promotable if both branches are promotable
+            // and have the same net stack effect
+            IrOp::If { then_body, else_body } => {
+                let Some(eb) = else_body else {
+                    return false;
+                };
+                if !is_promotable_body(then_body) || !is_promotable_body(eb) {
+                    return false;
+                }
+                // Both branches must have the same net stack effect
+                let (_, then_net) = compute_stack_needs(then_body);
+                let (_, else_net) = compute_stack_needs(eb);
+                if then_net != else_net {
+                    return false;
+                }
+            }
+            // DO/LOOP: promotable if body is promotable and stack-neutral
+            IrOp::DoLoop { body, is_plus_loop } => {
+                if !is_promotable_body(body) {
+                    return false;
+                }
+                if body.iter().any(|op| matches!(op, IrOp::Exit)) {
+                    return false;
+                }
+                let (_, body_net) = compute_stack_needs(body);
+                let expected = if *is_plus_loop { 1 } else { 0 };
+                if body_net != expected {
+                    return false;
+                }
+            }
+            // BEGIN loops and BeginDoubleWhileRepeat: not yet promoted
+            IrOp::BeginUntil { .. }
             | IrOp::BeginAgain { .. }
             | IrOp::BeginWhileRepeat { .. }
             | IrOp::BeginDoubleWhileRepeat { .. } => return false,
@@ -1171,6 +1197,8 @@ fn stack_delta(op: &IrOp) -> i32 {
         IrOp::FZeroEq | IrOp::FZeroLt | IrOp::FEq | IrOp::FLt | IrOp::FtoS => 1,
         // Cross-stack: pop from data stack
         IrOp::FetchFloat | IrOp::StoreFloat | IrOp::StoF => -1,
+        // Return stack reads push to data stack
+        IrOp::RFetch | IrOp::LoopJ => 1,
         _ => 0,
     }
 }
@@ -1185,64 +1213,107 @@ fn stack_delta(op: &IrOp) -> i32 {
 /// that any op reads from, not just the net depth after consumption.
 fn compute_stack_needs(ops: &[IrOp]) -> (u32, i32) {
     let mut depth: i32 = 0;
-    let mut min_accessed: i32 = 0; // most negative position accessed
-
-    for op in ops {
-        // Determine the deepest position this op reads from relative to
-        // current depth. Position 0 = top of stack = depth-1 from base.
-        let reads_from = match op {
-            // These read the top without consuming:
-            IrOp::Dup => depth - 1,
-            // Reads top and second without consuming:
-            IrOp::Over => depth - 2,
-            IrOp::TwoDup => depth - 2,
-            // Reads/rearranges top 2:
-            IrOp::Swap | IrOp::Nip | IrOp::Tuck => depth - 2,
-            // Reads/rearranges top 3:
-            IrOp::Rot => depth - 3,
-            // Binary ops consume 2:
-            IrOp::Add
-            | IrOp::Sub
-            | IrOp::Mul
-            | IrOp::And
-            | IrOp::Or
-            | IrOp::Xor
-            | IrOp::Lshift
-            | IrOp::Rshift
-            | IrOp::ArithRshift
-            | IrOp::Eq
-            | IrOp::NotEq
-            | IrOp::Lt
-            | IrOp::Gt
-            | IrOp::LtUnsigned
-            | IrOp::DivMod
-            | IrOp::Store
-            | IrOp::CStore
-            | IrOp::PlusStore => depth - 2,
-            // Unary ops consume 1:
-            IrOp::Drop
-            | IrOp::Negate
-            | IrOp::Abs
-            | IrOp::Invert
-            | IrOp::ZeroEq
-            | IrOp::ZeroLt
-            | IrOp::Fetch
-            | IrOp::CFetch => depth - 1,
-            IrOp::TwoDrop => depth - 2,
-            // Cross-stack ops that pop from data stack
-            IrOp::FetchFloat | IrOp::StoreFloat | IrOp::StoF => depth - 1,
-            // Push ops, float-only ops, and other ops don't read data stack items
-            _ => depth,
-        };
-        min_accessed = min_accessed.min(reads_from);
-        depth += stack_delta(op);
-    }
+    let mut min_accessed: i32 = 0;
+    compute_stack_needs_rec(ops, &mut depth, &mut min_accessed);
     let preload = if min_accessed < 0 {
         (-min_accessed) as u32
     } else {
         0
     };
     (preload, depth)
+}
+
+/// Recursive stack-needs analysis that descends into control flow bodies.
+fn compute_stack_needs_rec(ops: &[IrOp], depth: &mut i32, min_accessed: &mut i32) {
+    for op in ops {
+        // First: compute the deepest position this op reads from.
+        let reads_from = match op {
+            IrOp::Dup => *depth - 1,
+            IrOp::Over | IrOp::TwoDup => *depth - 2,
+            IrOp::Swap | IrOp::Nip | IrOp::Tuck => *depth - 2,
+            IrOp::Rot => *depth - 3,
+            IrOp::Add | IrOp::Sub | IrOp::Mul | IrOp::And | IrOp::Or | IrOp::Xor
+            | IrOp::Lshift | IrOp::Rshift | IrOp::ArithRshift
+            | IrOp::Eq | IrOp::NotEq | IrOp::Lt | IrOp::Gt | IrOp::LtUnsigned
+            | IrOp::DivMod | IrOp::Store | IrOp::CStore | IrOp::PlusStore => *depth - 2,
+            IrOp::Drop | IrOp::Negate | IrOp::Abs | IrOp::Invert
+            | IrOp::ZeroEq | IrOp::ZeroLt | IrOp::Fetch | IrOp::CFetch => *depth - 1,
+            IrOp::TwoDrop => *depth - 2,
+            IrOp::FetchFloat | IrOp::StoreFloat | IrOp::StoF => *depth - 1,
+            // Control flow reads are handled by recursion below
+            IrOp::If { .. } => *depth - 1, // consumes condition
+            IrOp::DoLoop { .. } => *depth - 2, // consumes limit + index
+            _ => *depth,
+        };
+        *min_accessed = (*min_accessed).min(reads_from);
+
+        // Then: update depth. For control flow, recurse instead of using stack_delta.
+        match op {
+            IrOp::If { then_body, else_body } => {
+                *depth -= 1; // consume condition
+                let saved = *depth;
+                compute_stack_needs_rec(then_body, depth, min_accessed);
+                if let Some(eb) = else_body {
+                    let then_depth = *depth;
+                    *depth = saved;
+                    compute_stack_needs_rec(eb, depth, min_accessed);
+                    // Use the then-branch depth (both should match for well-formed code)
+                    *depth = then_depth;
+                }
+            }
+            IrOp::DoLoop { body, is_plus_loop } => {
+                *depth -= 2; // consume limit + index
+                // Loop body is stack-neutral (net 0, or +1 for +LOOP step)
+                // We still recurse to track min_accessed inside the body.
+                let saved = *depth;
+                compute_stack_needs_rec(body, depth, min_accessed);
+                // Restore: body effect is consumed by loop control
+                *depth = saved;
+                if *is_plus_loop {
+                    // +LOOP body pushes 1 step value, consumed by loop control
+                }
+            }
+            IrOp::BeginUntil { body } => {
+                let saved = *depth;
+                compute_stack_needs_rec(body, depth, min_accessed);
+                // Body produces flag, consumed by UNTIL: net 0 for the whole construct
+                *depth = saved;
+            }
+            IrOp::BeginAgain { body } => {
+                let saved = *depth;
+                compute_stack_needs_rec(body, depth, min_accessed);
+                *depth = saved;
+            }
+            IrOp::BeginWhileRepeat { test, body } => {
+                let saved = *depth;
+                compute_stack_needs_rec(test, depth, min_accessed);
+                // WHILE consumes flag
+                *depth -= 1;
+                compute_stack_needs_rec(body, depth, min_accessed);
+                // Whole construct is stack-neutral
+                *depth = saved;
+            }
+            IrOp::BeginDoubleWhileRepeat {
+                outer_test, inner_test, body, after_repeat, else_body,
+            } => {
+                let saved = *depth;
+                compute_stack_needs_rec(outer_test, depth, min_accessed);
+                *depth -= 1;
+                compute_stack_needs_rec(inner_test, depth, min_accessed);
+                *depth -= 1;
+                compute_stack_needs_rec(body, depth, min_accessed);
+                compute_stack_needs_rec(after_repeat, depth, min_accessed);
+                if let Some(eb) = else_body {
+                    compute_stack_needs_rec(eb, depth, min_accessed);
+                }
+                *depth = saved;
+            }
+            // All other ops: use stack_delta
+            _ => {
+                *depth += stack_delta(op);
+            }
+        }
+    }
 }
 
 /// Count how many WASM locals the promoted code path needs (excluding cached
@@ -3565,13 +3636,13 @@ mod tests {
             then_body: vec![],
             else_body: None,
         }]));
-        // IF also prevents promotion (for now)
-        assert!(!is_promotable(&[IrOp::PushI32(1), IrOp::If {
+        // IF with ELSE is promotable
+        assert!(is_promotable(&[IrOp::PushI32(1), IrOp::If {
             then_body: vec![IrOp::PushI32(1)],
             else_body: Some(vec![IrOp::PushI32(0)]),
         }]));
-        // Control flow prevents promotion (for now)
-        assert!(!is_promotable(&[IrOp::PushI32(10), IrOp::PushI32(0), IrOp::DoLoop {
+        // DO/LOOP with stack-neutral body is promotable
+        assert!(is_promotable(&[IrOp::PushI32(10), IrOp::PushI32(0), IrOp::DoLoop {
             body: vec![IrOp::RFetch, IrOp::Drop],
             is_plus_loop: false,
         }]));
@@ -3764,9 +3835,16 @@ mod tests {
         assert!(!is_promotable(&ops));
         assert_eq!(run_word(&ops), vec![42]);
 
-        // Calls prevent promotion but still work
-        let ops = vec![IrOp::Call(WordId(5))];
-        assert!(!is_promotable(&ops));
+        // IF-with-ELSE IS promotable and works
+        let ops = vec![
+            IrOp::PushI32(-1),
+            IrOp::If {
+                then_body: vec![IrOp::PushI32(42)],
+                else_body: Some(vec![IrOp::PushI32(0)]),
+            },
+        ];
+        assert!(is_promotable(&ops));
+        assert_eq!(run_word(&ops), vec![42]);
     }
 
     // ===================================================================
