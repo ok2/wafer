@@ -1,0 +1,772 @@
+#![allow(dead_code)]
+//! Cross-engine comparison tests: WAFER vs gforth.
+//!
+//! Validates that WAFER produces identical output to gforth for standard
+//! Forth programs, and benchmarks performance of both engines.
+//!
+//! WAFER-only correctness:  `cargo test -p wafer-core --test comparison`
+//! Full comparison + perf:  `cargo test -p wafer-core --test comparison -- --nocapture --ignored`
+
+use std::process::Command;
+use std::sync::OnceLock;
+use std::time::Instant;
+
+use wafer_core::config::WaferConfig;
+use wafer_core::outer::ForthVM;
+
+// -----------------------------------------------------------------------
+// Gforth discovery (cached)
+// -----------------------------------------------------------------------
+
+static GFORTH_PATH: OnceLock<Option<String>> = OnceLock::new();
+static GFORTH_FAST_PATH: OnceLock<Option<String>> = OnceLock::new();
+
+fn probe_gforth(candidate: &str) -> bool {
+    Command::new(candidate)
+        .arg("-e")
+        .arg("bye")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn find_gforth() -> Option<&'static str> {
+    GFORTH_PATH
+        .get_or_init(|| {
+            for candidate in &["/opt/homebrew/bin/gforth", "/usr/local/bin/gforth", "gforth"] {
+                if probe_gforth(candidate) {
+                    return Some(candidate.to_string());
+                }
+            }
+            None
+        })
+        .as_deref()
+}
+
+fn find_gforth_fast() -> Option<&'static str> {
+    GFORTH_FAST_PATH
+        .get_or_init(|| {
+            for candidate in &[
+                "/opt/homebrew/bin/gforth-fast",
+                "/usr/local/bin/gforth-fast",
+                "gforth-fast",
+            ] {
+                if probe_gforth(candidate) {
+                    return Some(candidate.to_string());
+                }
+            }
+            None
+        })
+        .as_deref()
+}
+
+// -----------------------------------------------------------------------
+// Engine runners
+// -----------------------------------------------------------------------
+
+struct EngineResult {
+    output: String,
+    success: bool,
+}
+
+/// Run Forth code through WAFER (in-process via `ForthVM`).
+fn run_wafer(code: &str) -> EngineResult {
+    let mut vm = ForthVM::new().expect("Failed to create ForthVM");
+    let mut output = String::new();
+    for line in code.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match vm.evaluate(trimmed) {
+            Ok(()) => output.push_str(&vm.take_output()),
+            Err(_) => {
+                return EngineResult {
+                    output,
+                    success: false,
+                }
+            }
+        }
+    }
+    EngineResult {
+        output,
+        success: true,
+    }
+}
+
+/// Run Forth code through WAFER with all optimizations enabled.
+fn run_wafer_optimized(code: &str) -> EngineResult {
+    let mut vm = ForthVM::new_with_config(WaferConfig::all()).expect("Failed to create ForthVM");
+    let mut output = String::new();
+    for line in code.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match vm.evaluate(trimmed) {
+            Ok(()) => output.push_str(&vm.take_output()),
+            Err(_) => {
+                return EngineResult {
+                    output,
+                    success: false,
+                }
+            }
+        }
+    }
+    EngineResult {
+        output,
+        success: true,
+    }
+}
+
+/// Run Forth code through gforth. Returns `None` if gforth is unavailable.
+fn run_gforth_engine(gforth: &str, code: &str) -> Option<EngineResult> {
+    // Flatten to single line and append bye
+    let flat = code
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let with_bye = if flat.ends_with("bye") || flat.ends_with("BYE") {
+        flat
+    } else {
+        format!("{flat} bye")
+    };
+    let output = Command::new(gforth).arg("-e").arg(&with_bye).output().ok()?;
+    Some(EngineResult {
+        output: String::from_utf8_lossy(&output.stdout).into_owned(),
+        success: output.status.success(),
+    })
+}
+
+fn run_gforth(code: &str) -> Option<EngineResult> {
+    run_gforth_engine(find_gforth()?, code)
+}
+
+fn run_gforth_fast(code: &str) -> Option<EngineResult> {
+    run_gforth_engine(find_gforth_fast()?, code)
+}
+
+// -----------------------------------------------------------------------
+// Output normalization
+// -----------------------------------------------------------------------
+
+/// Normalize Forth output for comparison: trim trailing whitespace per line,
+/// collapse to single trailing newline.
+fn normalize(s: &str) -> String {
+    let trimmed: Vec<&str> = s.lines().map(str::trim_end).collect();
+    let mut result = trimmed.join("\n");
+    // Ensure exactly one trailing newline (or empty if no content)
+    let end = result.trim_end_matches('\n');
+    if !end.is_empty() {
+        result = format!("{end}\n");
+    } else {
+        result.clear();
+    }
+    result
+}
+
+// -----------------------------------------------------------------------
+// Assertion helpers
+// -----------------------------------------------------------------------
+
+/// Assert that WAFER produces the expected output for a program.
+fn assert_wafer_output(name: &str, code: &str, expected: &str) {
+    let result = run_wafer(code);
+    assert!(result.success, "{name}: WAFER execution failed");
+    assert_eq!(
+        normalize(&result.output),
+        normalize(expected),
+        "{name}: WAFER output mismatch\n  got:      {:?}\n  expected: {:?}",
+        result.output,
+        expected
+    );
+}
+
+/// Assert that WAFER and gforth produce identical output.
+/// Skips gracefully if gforth is unavailable.
+fn assert_same_output(name: &str, code: &str) {
+    let wafer = run_wafer(code);
+    assert!(wafer.success, "{name}: WAFER execution failed");
+
+    let Some(gforth) = run_gforth(code) else {
+        eprintln!("  SKIP {name}: gforth not available");
+        return;
+    };
+    assert!(gforth.success, "{name}: gforth execution failed");
+    assert_eq!(
+        normalize(&wafer.output),
+        normalize(&gforth.output),
+        "{name}: output differs\n  WAFER:  {:?}\n  gforth: {:?}",
+        wafer.output,
+        gforth.output
+    );
+}
+
+// -----------------------------------------------------------------------
+// Test program catalog
+// -----------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Category {
+    Arithmetic,
+    StackOps,
+    ControlFlow,
+    Loops,
+    Definitions,
+    Strings,
+    Recursion,
+    Memory,
+}
+
+struct Program {
+    name: &'static str,
+    code: &'static str,
+    expected: &'static str,
+    category: Category,
+}
+
+fn programs() -> Vec<Program> {
+    vec![
+        // -- Arithmetic --
+        Program {
+            name: "add",
+            code: "2 3 + . CR",
+            expected: "5 \n",
+            category: Category::Arithmetic,
+        },
+        Program {
+            name: "subtract",
+            code: "10 3 - . CR",
+            expected: "7 \n",
+            category: Category::Arithmetic,
+        },
+        Program {
+            name: "multiply",
+            code: "6 7 * . CR",
+            expected: "42 \n",
+            category: Category::Arithmetic,
+        },
+        Program {
+            name: "divide",
+            code: "100 7 / . CR",
+            expected: "14 \n",
+            category: Category::Arithmetic,
+        },
+        Program {
+            name: "mod",
+            code: "100 7 MOD . CR",
+            expected: "2 \n",
+            category: Category::Arithmetic,
+        },
+        Program {
+            name: "negate",
+            code: "7 NEGATE . CR",
+            expected: "-7 \n",
+            category: Category::Arithmetic,
+        },
+        Program {
+            name: "abs",
+            code: "5 ABS . CR -5 ABS . CR",
+            expected: "5 \n5 \n",
+            category: Category::Arithmetic,
+        },
+        Program {
+            name: "min-max",
+            code: "3 7 MIN . CR 3 7 MAX . CR",
+            expected: "3 \n7 \n",
+            category: Category::Arithmetic,
+        },
+        Program {
+            name: "divmod",
+            code: "100 7 /MOD . . CR",
+            expected: "14 2 \n",
+            category: Category::Arithmetic,
+        },
+        // -- Stack operations --
+        Program {
+            name: "swap",
+            code: "1 2 SWAP . . CR",
+            expected: "1 2 \n",
+            category: Category::StackOps,
+        },
+        Program {
+            name: "dup",
+            code: "5 DUP . . CR",
+            expected: "5 5 \n",
+            category: Category::StackOps,
+        },
+        Program {
+            name: "over",
+            code: "1 2 OVER . . . CR",
+            expected: "1 2 1 \n",
+            category: Category::StackOps,
+        },
+        Program {
+            name: "rot",
+            code: "1 2 3 ROT . . . CR",
+            expected: "1 3 2 \n",
+            category: Category::StackOps,
+        },
+        Program {
+            name: "2dup",
+            code: "1 2 2DUP . . . . CR",
+            expected: "2 1 2 1 \n",
+            category: Category::StackOps,
+        },
+        Program {
+            name: "depth",
+            code: "1 2 3 DEPTH . DROP DROP DROP CR",
+            expected: "3 \n",
+            category: Category::StackOps,
+        },
+        // -- Control flow --
+        Program {
+            name: "if-else",
+            code: ": SGN DUP 0> IF DROP 1 ELSE DUP 0< IF DROP -1 ELSE DROP 0 THEN THEN ;\n\
+                   5 SGN . CR -3 SGN . CR 0 SGN . CR",
+            expected: "1 \n-1 \n0 \n",
+            category: Category::ControlFlow,
+        },
+        Program {
+            name: "max-word",
+            code: ": MAX2 2DUP < IF SWAP THEN DROP ;\n\
+                   3 7 MAX2 . CR 9 2 MAX2 . CR",
+            expected: "7 \n9 \n",
+            category: Category::ControlFlow,
+        },
+        Program {
+            name: "abs-word",
+            code: ": MYABS DUP 0< IF NEGATE THEN ;\n\
+                   -5 MYABS . CR 3 MYABS . CR 0 MYABS . CR",
+            expected: "5 \n3 \n0 \n",
+            category: Category::ControlFlow,
+        },
+        // -- Loops --
+        Program {
+            name: "do-loop",
+            code: ": SUM10 0 10 0 DO I + LOOP ; SUM10 . CR",
+            expected: "45 \n",
+            category: Category::Loops,
+        },
+        Program {
+            name: "do-loop-emit",
+            code: ": COUNTDOWN 5 0 DO I . LOOP CR ; COUNTDOWN",
+            expected: "0 1 2 3 4 \n",
+            category: Category::Loops,
+        },
+        Program {
+            name: "plus-loop",
+            code: ": SUM-EVEN 0 10 0 DO I + 2 +LOOP ; SUM-EVEN . CR",
+            expected: "20 \n",
+            category: Category::Loops,
+        },
+        Program {
+            name: "begin-until",
+            code: ": COUNT-DOWN 5 BEGIN DUP . 1- DUP 0= UNTIL DROP CR ; COUNT-DOWN",
+            expected: "5 4 3 2 1 \n",
+            category: Category::Loops,
+        },
+        Program {
+            name: "begin-while-repeat",
+            code: ": COUNT-UP 0 BEGIN DUP 5 < WHILE DUP . 1+ REPEAT DROP CR ; COUNT-UP",
+            expected: "0 1 2 3 4 \n",
+            category: Category::Loops,
+        },
+        // -- Definitions --
+        Program {
+            name: "variable",
+            code: "VARIABLE X 42 X ! X @ . CR",
+            expected: "42 \n",
+            category: Category::Definitions,
+        },
+        Program {
+            name: "constant",
+            code: "7 CONSTANT SEVEN SEVEN . CR",
+            expected: "7 \n",
+            category: Category::Definitions,
+        },
+        Program {
+            name: "colon-def",
+            code: ": SQUARE DUP * ; 6 SQUARE . CR 11 SQUARE . CR",
+            expected: "36 \n121 \n",
+            category: Category::Definitions,
+        },
+        Program {
+            name: "create-does",
+            code: ": CONST CREATE , DOES> @ ;\n\
+                   99 CONST NINETY-NINE\n\
+                   NINETY-NINE . CR",
+            expected: "99 \n",
+            category: Category::Definitions,
+        },
+        // -- Strings --
+        Program {
+            name: "s-quote-type",
+            code: "S\" hello\" TYPE CR",
+            expected: "hello\n",
+            category: Category::Strings,
+        },
+        Program {
+            name: "dot-quote",
+            code: ".\" world\" CR",
+            expected: "world\n",
+            category: Category::Strings,
+        },
+        Program {
+            name: "char-emit",
+            code: ": EMIT-AB [CHAR] A EMIT [CHAR] B EMIT ; EMIT-AB CR",
+            expected: "AB\n",
+            category: Category::Strings,
+        },
+        // -- Recursion --
+        Program {
+            name: "fibonacci",
+            code: ": FIB DUP 2 < IF EXIT THEN DUP 1- RECURSE SWAP 2 - RECURSE + ;\n\
+                   25 FIB . CR",
+            expected: "75025 \n",
+            category: Category::Recursion,
+        },
+        Program {
+            name: "factorial",
+            code: ": FACT 1 SWAP 1+ 1 ?DO I * LOOP ; 12 FACT . CR",
+            expected: "479001600 \n",
+            category: Category::Recursion,
+        },
+        Program {
+            name: "gcd",
+            code: ": GCD BEGIN DUP WHILE TUCK MOD REPEAT DROP ; 48 36 GCD . CR",
+            expected: "12 \n",
+            category: Category::Recursion,
+        },
+        // -- Memory --
+        Program {
+            name: "create-allot",
+            code: "CREATE ARR 5 CELLS ALLOT\n\
+                   99 ARR 3 CELLS + !\n\
+                   ARR 3 CELLS + @ . CR",
+            expected: "99 \n",
+            category: Category::Memory,
+        },
+        Program {
+            name: "fill-sum",
+            code: "CREATE BUF 10 CELLS ALLOT\n\
+                   : FILL-BUF 10 0 DO I I * BUF I CELLS + ! LOOP ;\n\
+                   : SUM-BUF 0 10 0 DO BUF I CELLS + @ + LOOP ;\n\
+                   FILL-BUF SUM-BUF . CR",
+            expected: "285 \n",
+            category: Category::Memory,
+        },
+    ]
+}
+
+// -----------------------------------------------------------------------
+// WAFER-only correctness tests (always run in CI)
+// -----------------------------------------------------------------------
+
+fn run_category(cat: Category) {
+    for prog in programs().iter().filter(|p| p.category == cat) {
+        assert_wafer_output(prog.name, prog.code, prog.expected);
+    }
+}
+
+#[test]
+fn wafer_arithmetic() {
+    run_category(Category::Arithmetic);
+}
+
+#[test]
+fn wafer_stack_ops() {
+    run_category(Category::StackOps);
+}
+
+#[test]
+fn wafer_control_flow() {
+    run_category(Category::ControlFlow);
+}
+
+#[test]
+fn wafer_loops() {
+    run_category(Category::Loops);
+}
+
+#[test]
+fn wafer_definitions() {
+    run_category(Category::Definitions);
+}
+
+#[test]
+fn wafer_strings() {
+    run_category(Category::Strings);
+}
+
+#[test]
+fn wafer_recursion() {
+    run_category(Category::Recursion);
+}
+
+#[test]
+fn wafer_memory() {
+    run_category(Category::Memory);
+}
+
+/// Verify that all optimizations produce the same output as unoptimized.
+#[test]
+fn wafer_optimized_matches_unoptimized() {
+    for prog in programs() {
+        let base = run_wafer(prog.code);
+        let opt = run_wafer_optimized(prog.code);
+        assert!(base.success, "{}: unoptimized failed", prog.name);
+        assert!(opt.success, "{}: optimized failed", prog.name);
+        assert_eq!(
+            normalize(&base.output),
+            normalize(&opt.output),
+            "{}: optimized output differs from unoptimized",
+            prog.name
+        );
+    }
+}
+
+// -----------------------------------------------------------------------
+// Cross-engine behavioral comparison (requires gforth)
+// -----------------------------------------------------------------------
+
+#[test]
+#[ignore = "requires gforth installation"]
+fn compare_all_programs() {
+    if find_gforth().is_none() {
+        eprintln!("SKIP: gforth not found in PATH");
+        return;
+    }
+    let progs = programs();
+    let mut passed = 0;
+    let mut skipped = 0;
+    for prog in &progs {
+        let wafer = run_wafer(prog.code);
+        if !wafer.success {
+            panic!("{}: WAFER execution failed", prog.name);
+        }
+        let Some(gforth) = run_gforth(prog.code) else {
+            skipped += 1;
+            continue;
+        };
+        if !gforth.success {
+            eprintln!("  WARN {}: gforth execution failed, skipping", prog.name);
+            skipped += 1;
+            continue;
+        }
+        assert_eq!(
+            normalize(&wafer.output),
+            normalize(&gforth.output),
+            "{}: output differs\n  WAFER:  {:?}\n  gforth: {:?}",
+            prog.name,
+            wafer.output,
+            gforth.output
+        );
+        passed += 1;
+    }
+    eprintln!(
+        "\nBehavioral comparison: {passed} passed, {skipped} skipped (of {})",
+        progs.len()
+    );
+}
+
+// -----------------------------------------------------------------------
+// Performance comparison (requires gforth)
+// -----------------------------------------------------------------------
+
+struct PerfBenchmark {
+    name: &'static str,
+    define: &'static str,
+    /// The workload to time — should include its own iteration loop for
+    /// fast operations so that total execution time is measurable.
+    run_code: &'static str,
+    verify: &'static str,
+    expected: i32,
+    samples: u32, // Number of runs for WAFER median
+}
+
+fn perf_benchmarks() -> Vec<PerfBenchmark> {
+    vec![
+        PerfBenchmark {
+            name: "Fibonacci(25)",
+            define: ": FIB DUP 2 < IF EXIT THEN DUP 1- RECURSE SWAP 2 - RECURSE + ;",
+            run_code: "25 FIB DROP",
+            verify: "25 FIB",
+            expected: 75025,
+            samples: 5,
+        },
+        PerfBenchmark {
+            name: "Factorial(12)x10K",
+            define: ": FACT 1 SWAP 1+ 1 ?DO I * LOOP ; \
+                     : FACT-BENCH 10000 0 DO 12 FACT DROP LOOP ;",
+            run_code: "FACT-BENCH",
+            verify: "12 FACT",
+            expected: 479001600,
+            samples: 5,
+        },
+        PerfBenchmark {
+            name: "GCD-bench(500)",
+            define: ": GCD BEGIN DUP WHILE TUCK MOD REPEAT DROP ; \
+                     : GCD-BENCH 0 DO 10000 I 1+ GCD DROP LOOP ;",
+            run_code: "500 GCD-BENCH",
+            verify: "48 36 GCD",
+            expected: 12,
+            samples: 5,
+        },
+        PerfBenchmark {
+            name: "NestedLoops(20)",
+            define: ": NESTED 0 SWAP 0 DO I 0 ?DO I J + DROP LOOP LOOP ;",
+            run_code: "20 NESTED DROP",
+            verify: "5 NESTED",
+            expected: 0,
+            samples: 3,
+        },
+        PerfBenchmark {
+            name: "Collatz(2K)",
+            define: ": COLLATZ 0 SWAP BEGIN DUP 1 > WHILE \
+                     DUP 1 AND IF 3 * 1+ ELSE 2 / THEN \
+                     SWAP 1+ SWAP REPEAT DROP ; \
+                     : COLLATZ-BENCH 0 DO I 1+ COLLATZ DROP LOOP ;",
+            run_code: "2000 COLLATZ-BENCH",
+            verify: "27 COLLATZ",
+            expected: 111,
+            samples: 3,
+        },
+    ]
+}
+
+/// Measure WAFER execution time (microseconds, median of N samples).
+fn measure_wafer(config: &WaferConfig, bench: &PerfBenchmark) -> u64 {
+    let mut vm = ForthVM::new_with_config(config.clone()).expect("VM creation failed");
+    for line in bench.define.lines() {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            let _ = vm.evaluate(trimmed);
+        }
+    }
+    vm.take_output();
+
+    // Warm up
+    let _ = vm.evaluate(bench.run_code);
+    vm.take_output();
+
+    // Measure
+    let mut times = Vec::new();
+    for _ in 0..bench.samples {
+        let start = Instant::now();
+        let _ = vm.evaluate(bench.run_code);
+        times.push(start.elapsed());
+        vm.take_output();
+    }
+    times.sort();
+    times[times.len() / 2].as_micros() as u64
+}
+
+/// Measure gforth execution time using Forth-level `utime` (excludes startup).
+/// Both engines run the exact same `run_code`, so the comparison is apples-to-apples.
+/// Returns microseconds, or None if gforth is unavailable.
+fn measure_gforth(gforth: &str, bench: &PerfBenchmark) -> Option<u64> {
+    // The timing wrapper must be inside a word (DO/LOOP is compile-only in gforth).
+    // We take the median of 3 runs.
+    let code = format!(
+        "{define} {run} \
+         : TIMED-BENCH utime {run} utime 2swap d- drop . CR ; \
+         TIMED-BENCH TIMED-BENCH TIMED-BENCH bye",
+        define = bench.define,
+        run = bench.run_code,
+    );
+    let output = Command::new(gforth).arg("-e").arg(&code).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Parse the 3 timing values and take the median
+    let mut times: Vec<u64> = stdout
+        .trim()
+        .lines()
+        .filter_map(|l| l.trim().parse::<u64>().ok())
+        .collect();
+    times.sort();
+    if times.is_empty() {
+        return None;
+    }
+    Some(times[times.len() / 2])
+}
+
+#[test]
+#[ignore = "requires gforth installation"]
+fn performance_report() {
+    let gforth = find_gforth();
+    let gforth_fast = find_gforth_fast();
+    if gforth.is_none() {
+        eprintln!("SKIP: gforth not found");
+        return;
+    }
+
+    let benchmarks = perf_benchmarks();
+    let config_all = WaferConfig::all();
+
+    // Verify correctness first
+    for bench in &benchmarks {
+        let mut vm = ForthVM::new().expect("VM creation failed");
+        for line in bench.define.lines() {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                let _ = vm.evaluate(trimmed);
+            }
+        }
+        vm.take_output();
+        vm.evaluate(bench.verify)
+            .unwrap_or_else(|e| panic!("{}: verify failed: {e}", bench.name));
+        vm.take_output();
+        let stack = vm.data_stack();
+        assert_eq!(
+            stack.first().copied().unwrap_or(-1),
+            bench.expected,
+            "{}: wrong result",
+            bench.name
+        );
+    }
+
+    let sep = "=".repeat(80);
+    let thin = "-".repeat(80);
+    println!("\n{sep}");
+    println!("  WAFER vs Gforth Performance Comparison");
+    println!("{sep}\n");
+    println!(
+        "{:<22} {:>12} {:>12} {:>12} {:>12}",
+        "Benchmark", "WAFER(us)", "gforth(us)", "gforth-fast", "WAFER/gf"
+    );
+    println!("{thin}");
+
+    for bench in &benchmarks {
+        let wafer = measure_wafer(&config_all, bench);
+        let gf = gforth.and_then(|g| measure_gforth(g, bench));
+        let gf_fast = gforth_fast.and_then(|g| measure_gforth(g, bench));
+
+        let gf_str = gf.map_or_else(|| "-".to_string(), |v| format!("{v}"));
+        let gf_fast_str = gf_fast.map_or_else(|| "-".to_string(), |v| format!("{v}"));
+        let ratio = gf.map_or_else(
+            || "-".to_string(),
+            |g| {
+                if g > 0 {
+                    format!("{:.2}x", wafer as f64 / g as f64)
+                } else {
+                    "-".to_string()
+                }
+            },
+        );
+
+        println!(
+            "{:<22} {:>12} {:>12} {:>12} {:>12}",
+            bench.name, wafer, gf_str, gf_fast_str, ratio
+        );
+    }
+
+    println!("{thin}");
+    println!("  WAFER = all optimizations enabled");
+    println!("  WAFER/gf < 1.0 means WAFER is faster than gforth");
+    println!("{sep}\n");
+}
