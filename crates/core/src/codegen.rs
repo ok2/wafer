@@ -229,6 +229,9 @@ fn bool_to_forth_flag(f: &mut Function, tmp: u32) {
 struct EmitCtx {
     f64_local_0: u32,
     f64_local_1: u32,
+    /// Base WASM local index for Forth locals ({: ... :}).
+    /// Forth local N maps to WASM local `forth_local_base + N`.
+    forth_local_base: u32,
 }
 
 /// Decrement the FSP global by 8 (allocate space for one f64).
@@ -661,6 +664,15 @@ fn emit_op(f: &mut Function, op: &IrOp, ctx: &EmitCtx) {
             f.instruction(&Instruction::Return);
         }
 
+        // -- Forth locals ({: ... :}) -----------------------------------------
+        IrOp::ForthLocalGet(n) => {
+            f.instruction(&Instruction::LocalGet(ctx.forth_local_base + n));
+            push_via_local(f, SCRATCH_BASE);
+        }
+        IrOp::ForthLocalSet(n) => {
+            pop_to(f, ctx.forth_local_base + n);
+        }
+
         // -- Return stack ---------------------------------------------------
         IrOp::ToR => {
             pop(f);
@@ -941,20 +953,26 @@ fn emit_do_loop(f: &mut Function, body: &[IrOp], is_plus_loop: bool, ctx: &EmitC
             .instruction(&Instruction::I32Add)
             .instruction(&Instruction::LocalSet(SCRATCH_BASE));
 
-        // Push updated index to return stack
+        // Push updated index to return stack (use SCRATCH_BASE+4 as temp to preserve step)
         f.instruction(&Instruction::LocalGet(SCRATCH_BASE));
-        rpush_via_local(f, SCRATCH_BASE + 2);
+        rpush_via_local(f, SCRATCH_BASE + 4);
 
-        // Compute new_index - limit
-        // (old_index - limit) XOR (new_index - limit)
-        // If sign bit set (negative), exit
+        // Forth 2012 +LOOP termination:
+        // exit = ((old-limit) XOR (new-limit)) AND ((old-limit) XOR step) < 0
+        // xor1 = (old-limit) XOR (new-limit)
         f.instruction(&Instruction::LocalGet(SCRATCH_BASE + 3)) // old - limit
             .instruction(&Instruction::LocalGet(SCRATCH_BASE)) // new_index
             .instruction(&Instruction::LocalGet(SCRATCH_BASE + 1)) // limit
             .instruction(&Instruction::I32Sub) // new - limit
-            .instruction(&Instruction::I32Xor) // (old-limit) XOR (new-limit)
+            .instruction(&Instruction::I32Xor); // xor1
+        // xor2 = (old-limit) XOR step
+        f.instruction(&Instruction::LocalGet(SCRATCH_BASE + 3)) // old - limit
+            .instruction(&Instruction::LocalGet(SCRATCH_BASE + 2)) // step (preserved!)
+            .instruction(&Instruction::I32Xor); // xor2
+        // exit = (xor1 AND xor2) < 0
+        f.instruction(&Instruction::I32And)
             .instruction(&Instruction::I32Const(0))
-            .instruction(&Instruction::I32LtS) // < 0 means sign bit set
+            .instruction(&Instruction::I32LtS)
             .instruction(&Instruction::BrIf(1)) // break to $exit
             .instruction(&Instruction::Br(0)) // continue loop
             .instruction(&Instruction::End) // end loop
@@ -1015,6 +1033,7 @@ fn is_promotable(ops: &[IrOp]) -> bool {
             | IrOp::BeginDoubleWhileRepeat { .. } => return false,
             IrOp::Exit => return false,
             IrOp::ToR | IrOp::FromR | IrOp::RFetch => return false,
+            IrOp::ForthLocalGet(_) | IrOp::ForthLocalSet(_) => return false,
             IrOp::Emit | IrOp::Dot | IrOp::Cr | IrOp::Type => return false,
             IrOp::PushI64(_) | IrOp::PushF64(_) => return false,
             IrOp::FDup
@@ -1659,7 +1678,13 @@ fn count_scratch_locals(ops: &[IrOp]) -> u32 {
     for op in ops {
         match op {
             IrOp::Rot | IrOp::Tuck => max = max.max(4),
-            IrOp::DoLoop { body, .. } => max = max.max(count_scratch_locals(body)),
+            IrOp::DoLoop { body, is_plus_loop } => {
+                // +LOOP needs 5 scratch locals (SCRATCH_BASE..SCRATCH_BASE+4)
+                if *is_plus_loop {
+                    max = max.max(5);
+                }
+                max = max.max(count_scratch_locals(body));
+            }
             IrOp::BeginUntil { body } => max = max.max(count_scratch_locals(body)),
             IrOp::BeginAgain { body } => max = max.max(count_scratch_locals(body)),
             IrOp::BeginWhileRepeat { test, body } => {
@@ -1691,6 +1716,36 @@ fn count_scratch_locals(ops: &[IrOp]) -> u32 {
                 if let Some(eb) = else_body {
                     max = max.max(count_scratch_locals(eb));
                 }
+            }
+            _ => {}
+        }
+    }
+    max
+}
+
+/// Count the number of Forth locals used in an IR body.
+/// Returns the maximum local index + 1 (0 if no locals used).
+fn count_forth_locals(ops: &[IrOp]) -> u32 {
+    let mut max: u32 = 0;
+    for op in ops {
+        match op {
+            IrOp::ForthLocalGet(n) | IrOp::ForthLocalSet(n) => max = max.max(*n + 1),
+            IrOp::If {
+                then_body,
+                else_body,
+            } => {
+                max = max.max(count_forth_locals(then_body));
+                if let Some(eb) = else_body {
+                    max = max.max(count_forth_locals(eb));
+                }
+            }
+            IrOp::DoLoop { body, .. } | IrOp::BeginUntil { body } | IrOp::BeginAgain { body } => {
+                max = max.max(count_forth_locals(body));
+            }
+            IrOp::BeginWhileRepeat { test, body } => {
+                max = max
+                    .max(count_forth_locals(test))
+                    .max(count_forth_locals(body));
             }
             _ => {}
         }
@@ -1794,13 +1849,14 @@ pub fn compile_word(
     // Determine whether to use stack-to-local promotion
     let promoted = config.stack_to_local_promotion && is_promotable(body);
     let scratch_count = count_scratch_locals(body);
+    let forth_local_count = count_forth_locals(body);
     let num_locals = if promoted {
         let (preload, _) = compute_stack_needs(body);
         let promoted_count = count_promoted_locals(body, preload);
         // 1 (cached DSP) + promoted locals (scratch locals not needed in promoted path)
-        1 + promoted_count
+        1 + promoted_count + forth_local_count
     } else {
-        1 + scratch_count
+        1 + scratch_count + forth_local_count
     };
     let has_floats = needs_f64_locals(body);
     let num_f64: u32 = if has_floats { 2 } else { 0 };
@@ -1809,9 +1865,17 @@ pub fn compile_word(
         locals_decl.push((num_f64, ValType::F64));
     }
     let mut func = Function::new(locals_decl);
+    let forth_local_base = if promoted {
+        let (preload, _) = compute_stack_needs(body);
+        let promoted_count = count_promoted_locals(body, preload);
+        1 + promoted_count
+    } else {
+        1 + scratch_count
+    };
     let ctx = EmitCtx {
         f64_local_0: num_locals,
         f64_local_1: num_locals + 1,
+        forth_local_base,
     };
 
     // Prologue: cache $dsp global into local 0
@@ -2057,13 +2121,18 @@ fn emit_consolidated_do_loop(
             .instruction(&Instruction::LocalSet(SCRATCH_BASE));
 
         f.instruction(&Instruction::LocalGet(SCRATCH_BASE));
-        rpush_via_local(f, SCRATCH_BASE + 2);
+        rpush_via_local(f, SCRATCH_BASE + 4);
 
+        // Forth 2012: ((old-limit) XOR (new-limit)) AND ((old-limit) XOR step) < 0
         f.instruction(&Instruction::LocalGet(SCRATCH_BASE + 3))
             .instruction(&Instruction::LocalGet(SCRATCH_BASE))
             .instruction(&Instruction::LocalGet(SCRATCH_BASE + 1))
             .instruction(&Instruction::I32Sub)
-            .instruction(&Instruction::I32Xor)
+            .instruction(&Instruction::I32Xor);
+        f.instruction(&Instruction::LocalGet(SCRATCH_BASE + 3))
+            .instruction(&Instruction::LocalGet(SCRATCH_BASE + 2))
+            .instruction(&Instruction::I32Xor);
+        f.instruction(&Instruction::I32And)
             .instruction(&Instruction::I32Const(0))
             .instruction(&Instruction::I32LtS)
             .instruction(&Instruction::BrIf(1))
@@ -2250,7 +2319,9 @@ fn compile_multi_word_module(
     // -- Code section: emit each function body --
     let mut code = CodeSection::new();
     for (_word_id, body) in words {
-        let num_locals = 1 + count_scratch_locals(body);
+        let scratch_count = count_scratch_locals(body);
+        let forth_local_count = count_forth_locals(body);
+        let num_locals = 1 + scratch_count + forth_local_count;
         let has_floats = needs_f64_locals(body);
         let num_f64: u32 = if has_floats { 2 } else { 0 };
         let mut locals_decl = vec![(num_locals, ValType::I32)];
@@ -2261,6 +2332,7 @@ fn compile_multi_word_module(
         let ctx = EmitCtx {
             f64_local_0: num_locals,
             f64_local_1: num_locals + 1,
+            forth_local_base: 1 + scratch_count,
         };
 
         // Prologue: cache $dsp global into local 0

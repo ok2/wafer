@@ -120,6 +120,12 @@ pub enum IrOp {
     /// Copy from return stack: ( -- x ) ( R: x -- x )
     RFetch,
 
+    // -- Forth locals (from {: ... :} syntax) --
+    /// Get Forth local variable N: ( -- x )
+    ForthLocalGet(u32),
+    /// Set Forth local variable N: ( x -- )
+    ForthLocalSet(u32),
+
     // -- I/O --
     /// Output character: ( char -- )
     Emit,

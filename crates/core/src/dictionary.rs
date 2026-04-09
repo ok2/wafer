@@ -38,8 +38,13 @@ pub struct Dictionary {
     here: u32,
     /// Next available function table index.
     next_fn_index: u32,
-    /// Hash index for O(1) word lookup: name -> (`word_addr`, `fn_index`, `is_immediate`).
-    index: HashMap<String, (u32, u32, bool)>,
+    /// Hash index: name -> Vec of (wid, word_addr, fn_index, is_immediate).
+    /// Multiple entries per name support different wordlists.
+    index: HashMap<String, Vec<(u32, u32, u32, bool)>>,
+    /// Current compilation wordlist ID.
+    current_wid: u32,
+    /// Current search order (list of wordlist IDs, first = top).
+    search_order: Vec<u32>,
 }
 
 /// Align an address upward to a 4-byte boundary.
@@ -58,6 +63,8 @@ impl Dictionary {
             here: DICTIONARY_BASE,
             next_fn_index: 0,
             index: HashMap::new(),
+            current_wid: 1, // FORTH wordlist
+            search_order: vec![1],
         }
     }
 
@@ -116,6 +123,11 @@ impl Dictionary {
         Ok(WordId(fn_index))
     }
 
+    /// Get the next available function index (without consuming it).
+    pub fn next_fn_index(&self) -> u32 {
+        self.next_fn_index
+    }
+
     /// Reserve a function index without creating a dictionary entry.
     /// Used for anonymous host functions (e.g., float literals during compilation).
     pub fn reserve_fn_index(&mut self) {
@@ -157,15 +169,25 @@ impl Dictionary {
         }
     }
 
-    /// Look up a word by name. Returns (`word_address`, `word_id`, `is_immediate`).
-    /// Uses the hash index for O(1) lookup, with linked-list fallback.
-    /// Skips HIDDEN words.
+    /// Look up a word by name using the current search order.
+    /// Falls back to searching all wordlists if not found in search order.
     pub fn find(&self, name: &str) -> Option<(u32, WordId, bool)> {
         let search_name = name.to_ascii_uppercase();
 
-        // Fast path: hash index lookup
-        if let Some(&(word_addr, fn_index, is_immediate)) = self.index.get(&search_name) {
-            return Some((word_addr, WordId(fn_index), is_immediate));
+        // Fast path: hash index lookup with search order
+        if let Some(entries) = self.index.get(&search_name) {
+            // Search in order: first matching wordlist wins
+            for &wid in &self.search_order {
+                for &(w, word_addr, fn_index, is_imm) in entries.iter().rev() {
+                    if w == wid {
+                        return Some((word_addr, WordId(fn_index), is_imm));
+                    }
+                }
+            }
+            // Fallback: return newest entry across all wordlists
+            if let Some(&(_wid, word_addr, fn_index, is_immediate)) = entries.last() {
+                return Some((word_addr, WordId(fn_index), is_immediate));
+            }
         }
 
         // Fallback: linked-list walk (for words not yet in the index)
@@ -206,6 +228,41 @@ impl Dictionary {
         }
 
         None
+    }
+
+    /// Look up a word searching only the given wordlist order.
+    pub fn find_in_order(&self, name: &str, order: &[u32]) -> Option<(u32, WordId, bool)> {
+        let search_name = name.to_ascii_uppercase();
+        if let Some(entries) = self.index.get(&search_name) {
+            for &wid in order {
+                for &(w, word_addr, fn_index, is_imm) in entries.iter().rev() {
+                    if w == wid {
+                        return Some((word_addr, WordId(fn_index), is_imm));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Look up a word in a single wordlist. Used by SEARCH-WORDLIST.
+    pub fn find_in_wid(&self, name: &str, wid: u32) -> Option<(u32, WordId, bool)> {
+        self.find_in_order(name, &[wid])
+    }
+
+    /// Get/set the current compilation wordlist.
+    pub fn current_wid(&self) -> u32 {
+        self.current_wid
+    }
+
+    /// Set the current compilation wordlist.
+    pub fn set_current_wid(&mut self, wid: u32) {
+        self.current_wid = wid;
+    }
+
+    /// Set the search order.
+    pub fn set_search_order(&mut self, order: &[u32]) {
+        self.search_order = order.to_vec();
     }
 
     /// Get the current HERE pointer.
@@ -336,7 +393,7 @@ impl Dictionary {
     }
 
     /// Toggle the IMMEDIATE flag on the most recent word.
-    pub fn toggle_immediate(&mut self) -> WaferResult<()> {
+    pub fn set_immediate(&mut self) -> WaferResult<()> {
         if self.latest == 0 && self.here == DICTIONARY_BASE {
             return Err(WaferError::CompileError("no word defined yet".to_string()));
         }
@@ -344,7 +401,7 @@ impl Dictionary {
         if flags_addr >= self.memory.len() {
             return Err(WaferError::InvalidAddress(self.latest + 4));
         }
-        self.memory[flags_addr] ^= flags::IMMEDIATE;
+        self.memory[flags_addr] |= flags::IMMEDIATE;
         // Update the index if the word is visible (not hidden)
         if self.memory[flags_addr] & flags::HIDDEN == 0 {
             self.update_index(self.latest);
@@ -382,7 +439,14 @@ impl Dictionary {
         let is_immediate = flags_byte & flags::IMMEDIATE != 0;
         let code_addr = align4(word_addr + 5 + name_len as u32);
         let fn_index = self.read_u32_unchecked(code_addr);
-        self.index.insert(name, (word_addr, fn_index, is_immediate));
+        let wid = self.current_wid;
+        let entries = self.index.entry(name).or_default();
+        // Update existing entry for this wordlist, or add new one
+        if let Some(entry) = entries.iter_mut().find(|e| e.0 == wid && e.1 == word_addr) {
+            entry.3 = is_immediate; // update immediate flag
+        } else {
+            entries.push((wid, word_addr, fn_index, is_immediate));
+        }
     }
 
     /// Compute the address of the code field for the word at `word_addr`.
@@ -415,6 +479,33 @@ impl Dictionary {
             self.memory[a + 3],
         ])
     }
+
+    /// Save a snapshot of the dictionary state for MARKER.
+    pub fn save_state(&self) -> DictionaryState {
+        DictionaryState {
+            latest: self.latest,
+            here: self.here,
+            next_fn_index: self.next_fn_index,
+            index: self.index.clone(),
+        }
+    }
+
+    /// Restore a previously saved dictionary state (for MARKER).
+    pub fn restore_state(&mut self, state: DictionaryState) {
+        self.latest = state.latest;
+        self.here = state.here;
+        self.next_fn_index = state.next_fn_index;
+        self.index = state.index;
+    }
+}
+
+/// Snapshot of dictionary state saved by MARKER.
+#[derive(Clone)]
+pub struct DictionaryState {
+    latest: u32,
+    here: u32,
+    next_fn_index: u32,
+    index: HashMap<String, Vec<(u32, u32, u32, bool)>>,
 }
 
 impl Default for Dictionary {
@@ -514,7 +605,7 @@ mod tests {
     }
 
     #[test]
-    fn toggle_immediate() {
+    fn set_immediate() {
         let mut dict = Dictionary::new();
         dict.create("MYWORD", false).unwrap();
         dict.reveal();
@@ -523,15 +614,15 @@ mod tests {
         let (_, _, is_imm) = dict.find("MYWORD").unwrap();
         assert!(!is_imm);
 
-        // Toggle to immediate
-        dict.toggle_immediate().unwrap();
+        // Set to immediate
+        dict.set_immediate().unwrap();
         let (_, _, is_imm) = dict.find("MYWORD").unwrap();
         assert!(is_imm);
 
-        // Toggle back
-        dict.toggle_immediate().unwrap();
+        // Calling again keeps it immediate (set, not toggle)
+        dict.set_immediate().unwrap();
         let (_, _, is_imm) = dict.find("MYWORD").unwrap();
-        assert!(!is_imm);
+        assert!(is_imm);
     }
 
     #[test]
@@ -807,9 +898,9 @@ mod tests {
     }
 
     #[test]
-    fn toggle_immediate_no_word_errors() {
+    fn set_immediate_no_word_errors() {
         let mut dict = Dictionary::new();
-        let result = dict.toggle_immediate();
+        let result = dict.set_immediate();
         assert!(result.is_err());
     }
 }

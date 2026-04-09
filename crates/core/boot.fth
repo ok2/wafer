@@ -8,8 +8,8 @@
 
 \ DEPTH ( -- n )  number of items on the data stack
 \ SP@ must come first so it reads the dsp before DEPTH's own literal push.
-\ DATA_STACK_TOP = 5440, uses arithmetic right shift for / 4
-: DEPTH  SP@ 5440 SWAP - 2 RSHIFT ;
+\ DATA_STACK_TOP = 5632 (0x1600), uses arithmetic right shift for / 4
+: DEPTH  SP@ 5632 SWAP - 2 RSHIFT ;
 
 \ PICK ( xn..x0 n -- xn..x0 xn )  copy nth stack item
 : PICK  1+ CELLS SP@ + @ ;
@@ -188,10 +188,10 @@
 : SPACES  0 ?DO SPACE LOOP ;
 
 \ Pictured numeric output constants
-\ PAD_BASE = 0x0440, PAD_SIZE = 256, SYSVAR_HLD = 28
+\ PICT_BUF_TOP = 0x05C0 = 1472, SYSVAR_HLD = 28
 
 \ <# ( -- )  begin pictured numeric output
-: <#  1344 28 ! ;
+: <#  1472 28 ! ;
 
 \ HOLD ( char -- )  add character to pictured output
 : HOLD  28 @ 1- DUP 28 ! C! ;
@@ -220,7 +220,7 @@
 : #S  BEGIN # 2DUP OR 0= UNTIL ;
 
 \ #> ( ud -- c-addr u )  end pictured output, return string
-: #>  2DROP 28 @ 1344 OVER - ;
+: #>  2DROP 28 @ 1472 OVER - ;
 
 \ Formatted output built on pictured numeric output
 

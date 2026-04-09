@@ -31,9 +31,21 @@ pub const PAD_BASE: u32 = INPUT_BUFFER_BASE + INPUT_BUFFER_SIZE; // 0x0440
 /// Size of PAD.
 pub const PAD_SIZE: u32 = 256;
 
+/// Pictured numeric output buffer (<# ... #>). Grows downward from top.
+pub const PICT_BUF_BASE: u32 = PAD_BASE + PAD_SIZE; // 0x0540
+/// Size of pictured output buffer (2*BITS_PER_CELL + 2 = 66 min, 128 for margin).
+pub const PICT_BUF_SIZE: u32 = 128;
+/// Top of pictured output buffer (HLD starts here, grows down).
+pub const PICT_BUF_TOP: u32 = PICT_BUF_BASE + PICT_BUF_SIZE;
+
+/// WORD buffer — transient counted-string area for WORD output.
+pub const WORD_BUF_BASE: u32 = PICT_BUF_TOP; // 0x05C0
+/// Size of WORD buffer (max name 31 + 1 length + padding).
+pub const WORD_BUF_SIZE: u32 = 64;
+
 /// Data stack region (fallback when types are unknown).
 /// Grows downward from the top of this region.
-pub const DATA_STACK_BASE: u32 = PAD_BASE + PAD_SIZE; // 0x0540
+pub const DATA_STACK_BASE: u32 = WORD_BUF_BASE + WORD_BUF_SIZE; // 0x0600
 /// Size of data stack region.
 pub const DATA_STACK_SIZE: u32 = 4096; // 1024 cells
 

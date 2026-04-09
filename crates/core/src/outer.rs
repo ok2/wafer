@@ -18,7 +18,7 @@ use wasmtime::{
 
 use crate::codegen::{CodegenConfig, CompiledModule, compile_consolidated_module, compile_word};
 use crate::config::WaferConfig;
-use crate::dictionary::{Dictionary, WordId};
+use crate::dictionary::{Dictionary, DictionaryState, WordId};
 use crate::ir::IrOp;
 use crate::memory::{
     CELL_SIZE, DATA_STACK_TOP, FLOAT_SIZE, FLOAT_STACK_BASE, FLOAT_STACK_TOP, INPUT_BUFFER_BASE,
@@ -32,7 +32,7 @@ use crate::optimizer::optimize;
 // ---------------------------------------------------------------------------
 
 /// Control-flow entry on the compile-time control stack.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum ControlEntry {
     If {
         then_body: Vec<IrOp>,
@@ -108,6 +108,7 @@ struct VmHost {
 // ---------------------------------------------------------------------------
 
 /// Stored definition for a DOES>-based defining word.
+#[derive(Clone)]
 struct DoesDefinition {
     /// The IR for the create-part (code between CREATE and DOES>).
     create_ir: Vec<IrOp>,
@@ -115,6 +116,19 @@ struct DoesDefinition {
     does_action_id: WordId,
     /// Whether the definition included CREATE before DOES>.
     has_create: bool,
+}
+
+/// Saved VM state for a MARKER word.
+struct MarkerState {
+    dict_state: DictionaryState,
+    user_here: u32,
+    next_table_index: u32,
+    word_pfa_map: HashMap<u32, u32>,
+    ir_bodies: HashMap<WordId, Vec<IrOp>>,
+    does_definitions: HashMap<WordId, DoesDefinition>,
+    host_word_names: HashMap<WordId, String>,
+    two_value_words: std::collections::HashSet<u32>,
+    fvalue_words: std::collections::HashSet<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -170,7 +184,7 @@ pub struct ForthVM {
     saw_create_in_def: bool,
     // Pending action from compiled defining/parsing words
     // 0 = none, 1 = CONSTANT, 2 = VARIABLE, 3 = CREATE, 4 = EVALUATE
-    pending_define: Arc<Mutex<i32>>,
+    pending_define: Arc<Mutex<Vec<i32>>>,
     // Pending word IDs to compile (used by COMPILE, / POSTPONE mechanism)
     pending_compile: Arc<Mutex<Vec<u32>>>,
     // Pending DOES> patch: (does_action_id) to apply after word execution
@@ -199,6 +213,21 @@ pub struct ForthVM {
     toplevel_ir: Vec<IrOp>,
     /// When true, interpretation-mode execution is recorded into `toplevel_ir`.
     recording_toplevel: bool,
+    /// Saved states for MARKER words: marker_id -> MarkerState
+    marker_states: HashMap<u32, MarkerState>,
+    /// Pending MARKER restore: after a marker word executes, restore this state
+    pending_marker_restore: Arc<Mutex<Option<u32>>>,
+    /// Conditional compilation skip depth: >0 means we're skipping tokens for [IF]/[ELSE]
+    conditional_skip_depth: u32,
+    /// Local variable names for the current definition ({: ... :} syntax)
+    compiling_locals: Vec<String>,
+    /// Substitution table for SUBSTITUTE/REPLACES (String word set)
+    substitutions: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    /// Search order: list of wordlist IDs (first = top of search order).
+    /// Shared via Arc so host functions can modify it directly.
+    search_order: Arc<Mutex<Vec<u32>>>,
+    /// Next wordlist ID to allocate (shared).
+    next_wid: Arc<Mutex<u32>>,
 }
 
 impl ForthVM {
@@ -296,7 +325,7 @@ impl ForthVM {
             saw_create_in_def: false,
             word_pfa_map: HashMap::new(),
             word_pfa_map_shared: None,
-            pending_define: Arc::new(Mutex::new(0)),
+            pending_define: Arc::new(Mutex::new(Vec::new())),
             pending_compile: Arc::new(Mutex::new(Vec::new())),
             pending_does_patch: Arc::new(Mutex::new(None)),
             throw_code: Arc::new(Mutex::new(None)),
@@ -311,6 +340,13 @@ impl ForthVM {
             deferred_ir: Vec::new(),
             toplevel_ir: Vec::new(),
             recording_toplevel: false,
+            marker_states: HashMap::new(),
+            pending_marker_restore: Arc::new(Mutex::new(None)),
+            conditional_skip_depth: 0,
+            compiling_locals: Vec::new(),
+            substitutions: Arc::new(Mutex::new(HashMap::new())),
+            search_order: Arc::new(Mutex::new(vec![1])),
+            next_wid: Arc::new(Mutex::new(2)),
         };
 
         vm.register_primitives()?;
@@ -337,6 +373,7 @@ impl ForthVM {
                     self.compiling_ir.clear();
                     self.control_stack.clear();
                     self.compiling_word_id = None;
+                    self.compiling_locals.clear();
                     return Err(e);
                 }
             }
@@ -509,6 +546,22 @@ impl ForthVM {
     fn interpret_token(&mut self, token: &str) -> anyhow::Result<()> {
         let token_upper = token.to_ascii_uppercase();
 
+        // Conditional compilation skip: when conditional_skip_depth > 0,
+        // only process [IF]/[ELSE]/[THEN] for depth tracking, skip everything else.
+        if self.conditional_skip_depth > 0 {
+            match token_upper.as_str() {
+                "[IF]" => self.conditional_skip_depth += 1,
+                "[ELSE]" if self.conditional_skip_depth == 1 => {
+                    self.conditional_skip_depth = 0;
+                }
+                "[THEN]" => {
+                    self.conditional_skip_depth -= 1;
+                }
+                _ => {} // All other tokens are parsed and discarded
+            }
+            return Ok(());
+        }
+
         // Handle colon definition start
         if token_upper == ":" {
             return self.start_colon_def();
@@ -529,22 +582,41 @@ impl ForthVM {
         // Words that must be handled in the outer interpreter because they
         // modify Rust-side VM state that host functions cannot access.
         match token_upper.as_str() {
-            "IMMEDIATE" => {
-                self.dictionary
-                    .toggle_immediate()
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-                // Update the word_lookup with the new immediate flag
-                let latest = self.dictionary.latest();
-                if let Ok(name) = self.dictionary.word_name(latest)
-                    && let Some((_, word_id, is_imm)) = self.dictionary.find(&name)
-                {
-                    self.sync_word_lookup(&name, word_id, is_imm);
-                }
-                return Ok(());
-            }
             "]" => {
                 // Switch to compile mode (can be used outside a colon definition)
                 self.state = -1;
+                return Ok(());
+            }
+            "[IF]" => {
+                let flag = self.pop_data_stack()?;
+                if flag == 0 {
+                    self.conditional_skip_depth = 1;
+                }
+                return Ok(());
+            }
+            "[ELSE]" => {
+                // We're in the TRUE branch; skip to matching [THEN]
+                self.conditional_skip_depth = 1;
+                return Ok(());
+            }
+            "[THEN]" => {
+                // No-op — marks end of conditional
+                return Ok(());
+            }
+            "[DEFINED]" => {
+                let name = self
+                    .next_token()
+                    .ok_or_else(|| anyhow::anyhow!("[DEFINED]: expected name"))?;
+                let found = self.dictionary.find(&name).is_some();
+                self.push_data_stack(if found { -1 } else { 0 })?;
+                return Ok(());
+            }
+            "[UNDEFINED]" => {
+                let name = self
+                    .next_token()
+                    .ok_or_else(|| anyhow::anyhow!("[UNDEFINED]: expected name"))?;
+                let found = self.dictionary.find(&name).is_some();
+                self.push_data_stack(if found { 0 } else { -1 })?;
                 return Ok(());
             }
             _ => {}
@@ -643,7 +715,6 @@ impl ForthVM {
             "CONSTANT" => return self.define_constant(),
             "CREATE" => return self.define_create(),
             "VALUE" => return self.define_value(),
-            "DEFER" => return self.define_defer(),
             "DOES>" => return self.interpret_does(),
             "'" => return self.interpret_tick(),
             "[CHAR]" => {
@@ -672,6 +743,17 @@ impl ForthVM {
             "FCONSTANT" => return self.define_fconstant(),
             "FVALUE" => return self.define_fvalue(),
             "CONSOLIDATE" => return self.consolidate(),
+            "SYNONYM" => return self.define_synonym(),
+            "ORDER" => {
+                let so = self.search_order.lock().unwrap();
+                let output = format!(
+                    "Search order: {:?} Compilation: {}\n",
+                    *so,
+                    self.dictionary.current_wid()
+                );
+                self.output.lock().unwrap().push_str(&output);
+                return Ok(());
+            }
             _ => {}
         }
 
@@ -790,15 +872,12 @@ impl ForthVM {
                 self.user_here += len;
                 self.sync_here_cell();
 
-                // Find TYPE and ABORT word IDs
-                let type_call = self.dictionary.find("TYPE").map(|(_, id, _)| id);
-                let abort_call = self.dictionary.find("ABORT").map(|(_, id, _)| id);
-                let mut then_body = vec![IrOp::PushI32(addr as i32), IrOp::PushI32(len as i32)];
-                if let Some(type_id) = type_call {
-                    then_body.push(IrOp::Call(type_id));
-                }
-                if let Some(abort_id) = abort_call {
-                    then_body.push(IrOp::Call(abort_id));
+                // ABORT" throws -2 without displaying the message.
+                // The message (addr, len) is saved but not typed here.
+                let throw_call = self.dictionary.find("THROW").map(|(_, id, _)| id);
+                let mut then_body = vec![IrOp::PushI32(-2)];
+                if let Some(throw_id) = throw_call {
+                    then_body.push(IrOp::Call(throw_id));
                 }
                 self.push_ir(IrOp::If {
                     then_body,
@@ -990,10 +1069,23 @@ impl ForthVM {
                 }
                 return Ok(());
             }
+            "{:" => {
+                return self.compile_locals_block();
+            }
             _ => {}
         }
 
-        // Look up in dictionary
+        // Check for local variable reference (locals supersede dictionary words)
+        if let Some(idx) = self
+            .compiling_locals
+            .iter()
+            .position(|n| n.eq_ignore_ascii_case(token))
+        {
+            self.push_ir(IrOp::ForthLocalGet(idx as u32));
+            return Ok(());
+        }
+
+        // Look up in dictionary (search order, then fallback to all wordlists)
         if let Some((_addr, word_id, is_immediate)) = self.dictionary.find(token) {
             if is_immediate {
                 // Execute immediately even in compile mode
@@ -1300,6 +1392,12 @@ impl ForthVM {
                     });
                 // compiling_ir is now empty, collects the after_repeat code
             }
+            Some(ControlEntry::Begin { body: prefix }) => {
+                // BEGIN...REPEAT (no WHILE) — treat as BEGIN...AGAIN (infinite loop)
+                let body = std::mem::take(&mut self.compiling_ir);
+                self.compiling_ir = prefix;
+                self.compiling_ir.push(IrOp::BeginAgain { body });
+            }
             _ => anyhow::bail!("REPEAT without matching BEGIN...WHILE"),
         }
         Ok(())
@@ -1511,13 +1609,80 @@ impl ForthVM {
         optimize(ir, &self.config.opt, bodies)
     }
 
+    /// Parse a `{: args | locals -- comment :}` block and compile local initializations.
+    fn compile_locals_block(&mut self) -> anyhow::Result<()> {
+        let mut args: Vec<String> = Vec::new();
+        let mut in_comment = false;
+        let mut in_uninit = false;
+
+        loop {
+            let tok = self
+                .next_token()
+                .ok_or_else(|| anyhow::anyhow!("{{: missing :}}"))?;
+            let tok_upper = tok.to_ascii_uppercase();
+            match tok_upper.as_str() {
+                ":}" => break,
+                "--" => {
+                    in_comment = true;
+                }
+                "|" => {
+                    in_uninit = true;
+                }
+                _ => {
+                    if in_comment {
+                        continue; // Skip comment tokens
+                    }
+                    if in_uninit {
+                        // Uninitialized local — just add to the map, no stack pop
+                        self.compiling_locals.push(tok_upper);
+                    } else {
+                        // Stack-initialized arg
+                        args.push(tok_upper);
+                    }
+                }
+            }
+        }
+
+        // Add args to locals map (they go first)
+        let base = self.compiling_locals.len();
+        for arg in &args {
+            self.compiling_locals.insert(base, arg.clone());
+        }
+        // Actually, args should be at the start of the locals list
+        // with the first arg having the lowest index
+        let n_args = args.len();
+        let mut new_locals = args;
+        // Append any already-added uninit locals
+        new_locals.extend(self.compiling_locals.drain(base..));
+        self.compiling_locals.splice(base..base, new_locals);
+
+        // Compile: pop args from data stack into locals (in reverse order)
+        // The first arg is deepest on the stack, last arg is on top
+        for i in (0..n_args).rev() {
+            self.push_ir(IrOp::ForthLocalSet((base + i) as u32));
+        }
+
+        Ok(())
+    }
+
     fn finish_colon_def(&mut self) -> anyhow::Result<()> {
         if self.state == 0 {
             anyhow::bail!("not in compile mode");
         }
-        if !self.control_stack.is_empty() {
-            anyhow::bail!("unresolved control structure");
+        // Auto-close unclosed IF structures (supports unstructured control flow)
+        while let Some(entry) = self.control_stack.last() {
+            match entry {
+                ControlEntry::If { .. } | ControlEntry::IfElse { .. } => {
+                    // Treat as implicit THEN at end of definition
+                    self.compile_then()?;
+                }
+                _ => {
+                    anyhow::bail!("unresolved control structure");
+                }
+            }
         }
+
+        self.compiling_locals.clear();
 
         let name = self
             .compiling_name
@@ -1744,6 +1909,13 @@ impl ForthVM {
         self.handle_pending_define()?;
         // Handle pending DOES> patch (runtime DOES> from double-DOES> words)
         self.handle_pending_does_patch()?;
+        // Handle pending COMPILE, operations (used by [ ... ] sequences)
+        self.handle_pending_compile();
+        // Handle pending MARKER restore
+        self.handle_pending_marker_restore()?;
+        // Sync search order from shared state to dictionary
+        let so = self.search_order.lock().unwrap().clone();
+        self.dictionary.set_search_order(&so);
         Ok(())
     }
 
@@ -2186,6 +2358,9 @@ impl ForthVM {
         self.register_evaluate_word()?;
         self.register_word_word()?;
 
+        // MARKER restore host function
+        self.register_marker_restore()?;
+
         // 2@, 2!: defined in boot.fth
 
         // Pictured numeric output
@@ -2273,6 +2448,13 @@ impl ForthVM {
         // COMPARE: defined in boot.fth
         self.register_search()?;
         // /STRING, BLANK, -TRAILING: defined in boot.fth
+        self.register_string_substitution()?;
+
+        // -- Programming-Tools word set --
+        self.register_n_to_r()?;
+
+        // -- Search-Order word set --
+        self.register_search_order()?;
 
         // -- Floating-Point word set --
         self.register_float_words()?;
@@ -2612,6 +2794,55 @@ impl ForthVM {
         Ok(())
     }
 
+    /// SYNONYM ( "newname" "oldname" -- ) create an alias.
+    fn define_synonym(&mut self) -> anyhow::Result<()> {
+        let new_name = self
+            .next_token()
+            .ok_or_else(|| anyhow::anyhow!("SYNONYM: expected newname"))?;
+        let old_name = self
+            .next_token()
+            .ok_or_else(|| anyhow::anyhow!("SYNONYM: expected oldname"))?;
+
+        if let Some((_addr, word_id, is_imm)) = self.dictionary.find(&old_name) {
+            // Create a new word that calls the old one
+            let new_word_id = self
+                .dictionary
+                .create(&new_name, is_imm)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+            let ir_body = vec![IrOp::Call(word_id)];
+            self.ir_bodies.insert(new_word_id, ir_body.clone());
+            let config = CodegenConfig {
+                base_fn_index: new_word_id.0,
+                table_size: self.table_size(),
+                stack_to_local_promotion: self.config.codegen.stack_to_local_promotion,
+            };
+            let compiled = compile_word(&new_name, &ir_body, &config)
+                .map_err(|e| anyhow::anyhow!("codegen error for SYNONYM: {e}"))?;
+            self.instantiate_and_install(&compiled, new_word_id)?;
+            self.dictionary.reveal();
+            self.next_table_index = self.next_table_index.max(new_word_id.0 + 1);
+        } else {
+            anyhow::bail!("SYNONYM: unknown word: {old_name}");
+        }
+        Ok(())
+    }
+
+    /// IMMEDIATE -- toggle the immediate flag on the most recently defined word.
+    /// Called via pending_define when IMMEDIATE is executed from compiled code.
+    fn set_immediate(&mut self) -> anyhow::Result<()> {
+        self.dictionary
+            .set_immediate()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let latest = self.dictionary.latest();
+        if let Ok(name) = self.dictionary.word_name(latest)
+            && let Some((_, word_id, is_imm)) = self.dictionary.find(&name)
+        {
+            self.sync_word_lookup(&name, word_id, is_imm);
+        }
+        Ok(())
+    }
+
     /// BUFFER: ( u "name" -- ) create a named buffer of u bytes.
     fn define_buffer(&mut self) -> anyhow::Result<()> {
         let size = self.pop_data_stack()? as u32;
@@ -2652,19 +2883,40 @@ impl ForthVM {
     }
 
     /// MARKER <name> -- create a marker that restores dictionary state.
-    /// This is a stub implementation that creates a no-op word.
+    /// Saves a snapshot of the VM; when the marker word is executed, restores it.
     fn define_marker(&mut self) -> anyhow::Result<()> {
         let name = self
             .next_token()
             .ok_or_else(|| anyhow::anyhow!("MARKER: expected name"))?;
+
+        // Save state BEFORE creating the marker word itself
+        let saved = MarkerState {
+            dict_state: self.dictionary.save_state(),
+            user_here: self.user_here,
+            next_table_index: self.next_table_index,
+            word_pfa_map: self.word_pfa_map.clone(),
+            ir_bodies: self.ir_bodies.clone(),
+            does_definitions: self.does_definitions.clone(),
+            host_word_names: self.host_word_names.clone(),
+            two_value_words: self.two_value_words.clone(),
+            fvalue_words: self.fvalue_words.clone(),
+        };
 
         let word_id = self
             .dictionary
             .create(&name, false)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        // Stub: marker word does nothing when executed
-        let ir_body = vec![];
+        // Store the saved state keyed by word_id
+        self.marker_states.insert(word_id.0, saved);
+
+        // Compile the marker word: push marker_id, call _MARKER_RESTORE_
+        let restore_id = self
+            .dictionary
+            .find("_MARKER_RESTORE_")
+            .map(|(_, id, _)| id)
+            .ok_or_else(|| anyhow::anyhow!("_MARKER_RESTORE_ not found"))?;
+        let ir_body = vec![IrOp::PushI32(word_id.0 as i32), IrOp::Call(restore_id)];
         self.ir_bodies.insert(word_id, ir_body.clone());
         let config = CodegenConfig {
             base_fn_index: word_id.0,
@@ -2678,6 +2930,33 @@ impl ForthVM {
         self.dictionary.reveal();
         self.next_table_index = self.next_table_index.max(word_id.0 + 1);
 
+        Ok(())
+    }
+
+    /// Register `_MARKER_RESTORE_` host function.
+    /// ( marker_id -- ) Signals the outer interpreter to restore state.
+    fn register_marker_restore(&mut self) -> anyhow::Result<()> {
+        let memory = self.memory;
+        let dsp = self.dsp;
+        let pending = Arc::clone(&self.pending_marker_restore);
+
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                // Pop marker_id from data stack
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let data = memory.data(&caller);
+                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
+                let marker_id = u32::from_le_bytes(b);
+                let new_sp = sp + 4;
+                dsp.set(&mut caller, Val::I32(new_sp as i32)).unwrap();
+                *pending.lock().unwrap() = Some(marker_id);
+                Ok(())
+            },
+        );
+
+        self.register_host_primitive("_MARKER_RESTORE_", false, func)?;
         Ok(())
     }
 
@@ -2761,6 +3040,16 @@ impl ForthVM {
         let name = self
             .next_token()
             .ok_or_else(|| anyhow::anyhow!("TO: expected name"))?;
+
+        // Check if target is a local variable
+        if let Some(idx) = self
+            .compiling_locals
+            .iter()
+            .position(|n| n.eq_ignore_ascii_case(&name))
+        {
+            self.push_ir(IrOp::ForthLocalSet(idx as u32));
+            return Ok(());
+        }
 
         if let Some((_addr, word_id, _imm)) = self.dictionary.find(&name) {
             if let Some(&pfa) = self.word_pfa_map.get(&word_id.0) {
@@ -3111,17 +3400,20 @@ impl ForthVM {
 
     /// IMMEDIATE -- toggle immediate flag on the most recent word.
     fn register_immediate_word(&mut self) -> anyhow::Result<()> {
-        // IMMEDIATE needs to call dictionary.toggle_immediate().
+        // IMMEDIATE needs to call dictionary.set_immediate().
         // Since the host function can't access self.dictionary directly,
         // we use the WASM memory to track this... actually, we handle IMMEDIATE
         // as a special token in interpret_token instead.
         //
-        // But we still want it in the dictionary so it can be found.
-        // Let's make it a no-op host function and handle it in interpret_token.
+        // Use pending_define mechanism so IMMEDIATE works from compiled code.
+        let pending = Arc::clone(&self.pending_define);
         let func = Func::new(
             &mut self.store,
             FuncType::new(&self.engine, [], []),
-            move |_caller, _params, _results| Ok(()),
+            move |_caller, _params, _results| {
+                pending.lock().unwrap().push(12);
+                Ok(())
+            },
         );
 
         self.register_host_primitive("IMMEDIATE", false, func)?;
@@ -3231,7 +3523,7 @@ impl ForthVM {
         Ok(())
     }
 
-    /// ENVIRONMENT? -- ( c-addr u -- false ) query system parameters.
+    /// ENVIRONMENT? -- ( c-addr u -- false | value true ) query system parameters.
     fn register_environment_q(&mut self) -> anyhow::Result<()> {
         let memory = self.memory;
         let dsp = self.dsp;
@@ -3241,12 +3533,34 @@ impl ForthVM {
             FuncType::new(&self.engine, [], []),
             move |mut caller, _params, _results| {
                 let sp = dsp.get(&mut caller).unwrap_i32() as u32;
-                // Pop two args (c-addr u), push FALSE
-                let new_sp = sp + 4; // net: pop 2, push 1 = sp + 4
-                let data = memory.data_mut(&mut caller);
-                let bytes = 0i32.to_le_bytes();
-                data[new_sp as usize..new_sp as usize + 4].copy_from_slice(&bytes);
-                dsp.set(&mut caller, Val::I32(new_sp as i32))?;
+                let data = memory.data(&caller);
+                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
+                let u = u32::from_le_bytes(b);
+                let b: [u8; 4] = data[(sp + 4) as usize..(sp + 8) as usize]
+                    .try_into()
+                    .unwrap();
+                let addr = u32::from_le_bytes(b);
+                let query = String::from_utf8_lossy(&data[addr as usize..(addr + u) as usize])
+                    .to_ascii_uppercase();
+
+                match query.as_str() {
+                    "#LOCALS" => {
+                        // Return (16 TRUE) — support at least 16 locals
+                        let data = memory.data_mut(&mut caller);
+                        data[(sp + 4) as usize..(sp + 8) as usize]
+                            .copy_from_slice(&16i32.to_le_bytes());
+                        data[sp as usize..sp as usize + 4].copy_from_slice(&(-1i32).to_le_bytes()); // TRUE
+                        dsp.set(&mut caller, Val::I32(sp as i32))?;
+                    }
+                    _ => {
+                        // Unknown: pop 2, push FALSE
+                        let new_sp = sp + 4;
+                        let data = memory.data_mut(&mut caller);
+                        data[new_sp as usize..new_sp as usize + 4]
+                            .copy_from_slice(&0i32.to_le_bytes());
+                        dsp.set(&mut caller, Val::I32(new_sp as i32))?;
+                    }
+                }
                 Ok(())
             },
         );
@@ -3527,9 +3841,8 @@ impl ForthVM {
             };
         let word_len = word_bytes.len();
 
-        // Store as counted string in WASM memory (at a transient buffer area)
-        // Use PAD area for transient storage
-        let buf_addr = crate::memory::PAD_BASE;
+        // Store as counted string in WASM memory (at a dedicated WORD buffer)
+        let buf_addr = crate::memory::WORD_BUF_BASE;
         let data = self.memory.data_mut(&mut self.store);
         data[buf_addr as usize] = word_len as u8;
         data[buf_addr as usize + 1..buf_addr as usize + 1 + word_len].copy_from_slice(word_bytes);
@@ -3709,14 +4022,23 @@ impl ForthVM {
         let saved_name = self.compiling_name.take();
         let saved_word_id = self.compiling_word_id.take();
         let saved_control = std::mem::take(&mut self.control_stack);
+        let saved_locals = std::mem::take(&mut self.compiling_locals);
 
         self.compiling_ir.clear();
         self.compiling_name = Some("_does_action_".to_string());
         self.compiling_word_id = Some(does_word_id);
 
-        for token in &first_tokens {
-            self.compile_token(token)?;
+        // Replay does-body tokens via the input buffer so that words like {: can
+        // use next_token() to read subsequent tokens (e.g., local names up to :}).
+        let saved_input = std::mem::take(&mut self.input_buffer);
+        let saved_pos = self.input_pos;
+        self.input_buffer = first_tokens.join(" ");
+        self.input_pos = 0;
+        while let Some(token) = self.next_token() {
+            self.compile_token(&token)?;
         }
+        self.input_buffer = saved_input;
+        self.input_pos = saved_pos;
 
         // If there's a second DOES>, append code to patch the word at runtime
         if let Some(second_action_id) = second_does_action_id {
@@ -3743,6 +4065,7 @@ impl ForthVM {
         self.compiling_name = saved_name;
         self.compiling_word_id = saved_word_id;
         self.control_stack = saved_control;
+        self.compiling_locals = saved_locals;
 
         // Register the defining word as a "does-defining" word.
         let has_create = self.saw_create_in_def;
@@ -3834,13 +4157,12 @@ impl ForthVM {
             // Track for DOES> patching
             self.last_created_info = Some((self.dictionary.latest(), pfa));
 
-            // Step 3: Execute the create-part IR
-            let tmp_word_id = self
-                .dictionary
-                .create("_create_part_", false)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            self.dictionary.reveal();
-            self.next_table_index = self.next_table_index.max(tmp_word_id.0 + 1);
+            // Step 3: Execute the create-part IR using a reserved fn index
+            // (don't create a dictionary entry — that would change `latest()`)
+            let tmp_fn_idx = self.dictionary.next_fn_index();
+            self.dictionary.reserve_fn_index();
+            let tmp_word_id = WordId(tmp_fn_idx);
+            self.next_table_index = self.next_table_index.max(tmp_fn_idx + 1);
 
             let config = CodegenConfig {
                 base_fn_index: tmp_word_id.0,
@@ -4281,7 +4603,7 @@ impl ForthVM {
                 &mut self.store,
                 FuncType::new(&self.engine, [], []),
                 move |_caller, _params, _results| {
-                    *pending.lock().unwrap() = 1;
+                    pending.lock().unwrap().push(1);
                     Ok(())
                 },
             );
@@ -4295,7 +4617,7 @@ impl ForthVM {
                 &mut self.store,
                 FuncType::new(&self.engine, [], []),
                 move |_caller, _params, _results| {
-                    *pending.lock().unwrap() = 2;
+                    pending.lock().unwrap().push(2);
                     Ok(())
                 },
             );
@@ -4309,7 +4631,7 @@ impl ForthVM {
                 &mut self.store,
                 FuncType::new(&self.engine, [], []),
                 move |_caller, _params, _results| {
-                    *pending.lock().unwrap() = 3;
+                    pending.lock().unwrap().push(3);
                     Ok(())
                 },
             );
@@ -4323,7 +4645,7 @@ impl ForthVM {
                 &mut self.store,
                 FuncType::new(&self.engine, [], []),
                 move |_caller, _params, _results| {
-                    *pending.lock().unwrap() = 9;
+                    pending.lock().unwrap().push(9);
                     Ok(())
                 },
             );
@@ -4337,11 +4659,25 @@ impl ForthVM {
                 &mut self.store,
                 FuncType::new(&self.engine, [], []),
                 move |_caller, _params, _results| {
-                    *pending.lock().unwrap() = 10;
+                    pending.lock().unwrap().push(10);
                     Ok(())
                 },
             );
             self.register_host_primitive("2VARIABLE", false, func)?;
+        }
+
+        // DEFER: sets pending_define to 11
+        {
+            let pending = Arc::clone(&self.pending_define);
+            let func = Func::new(
+                &mut self.store,
+                FuncType::new(&self.engine, [], []),
+                move |_caller, _params, _results| {
+                    pending.lock().unwrap().push(11);
+                    Ok(())
+                },
+            );
+            self.register_host_primitive("DEFER", false, func)?;
         }
 
         Ok(())
@@ -4354,7 +4690,7 @@ impl ForthVM {
             &mut self.store,
             FuncType::new(&self.engine, [], []),
             move |_caller, _params, _results| {
-                *pending.lock().unwrap() = 4;
+                pending.lock().unwrap().push(4);
                 Ok(())
             },
         );
@@ -4422,8 +4758,8 @@ impl ForthVM {
                 data[SYSVAR_TO_IN as usize..SYSVAR_TO_IN as usize + 4]
                     .copy_from_slice(&to_in.to_le_bytes());
 
-                // Store counted string at PAD
-                let buf_addr = crate::memory::PAD_BASE;
+                // Store counted string at dedicated WORD buffer
+                let buf_addr = crate::memory::WORD_BUF_BASE;
                 data[buf_addr as usize] = word_len as u8;
                 let src_start = (INPUT_BUFFER_BASE + start) as usize;
                 let dst_start = buf_addr as usize + 1;
@@ -4487,25 +4823,38 @@ impl ForthVM {
 
     /// Check for and handle pending defining actions after word execution.
     fn handle_pending_define(&mut self) -> anyhow::Result<()> {
-        let action = {
+        let actions: Vec<i32> = {
             let mut pending = self.pending_define.lock().unwrap();
-            let a = *pending;
-            *pending = 0;
-            a
+            std::mem::take(&mut *pending)
         };
-        match action {
-            1 => self.define_constant(),
-            2 => self.define_variable(),
-            3 => self.define_create(),
-            4 => self.interpret_evaluate(),
-            5 => self.interpret_word(),
-            6 => self.interpret_find(),
-            7 => self.interpret_parse(),
-            8 => self.interpret_parse_name(),
-            9 => self.define_2constant(),
-            10 => self.define_2variable(),
-            _ => Ok(()),
+        for action in actions {
+            match action {
+                1 => self.define_constant()?,
+                2 => self.define_variable()?,
+                3 => self.define_create()?,
+                4 => self.interpret_evaluate()?,
+                5 => self.interpret_word()?,
+                6 => self.interpret_find()?,
+                7 => self.interpret_parse()?,
+                8 => self.interpret_parse_name()?,
+                9 => self.define_2constant()?,
+                10 => self.define_2variable()?,
+                11 => self.define_defer()?,
+                12 => self.set_immediate()?,
+                20 => self.do_get_current()?,
+                21 => self.do_set_current()?,
+                25 => self.do_search_wordlist()?,
+                33 => {
+                    // DEFINITIONS: set current_wid to top of search order
+                    let so = self.search_order.lock().unwrap();
+                    if let Some(&top) = so.first() {
+                        self.dictionary.set_current_wid(top);
+                    }
+                }
+                _ => {}
+            }
         }
+        Ok(())
     }
 
     /// Drain `pending_compile` and push `IrOp::Call` for each entry into `compiling_ir`.
@@ -4557,6 +4906,34 @@ impl ForthVM {
         Ok(())
     }
 
+    /// Handle a pending MARKER restore.
+    /// When a marker word executes, it signals via `pending_marker_restore`
+    /// to roll back the dictionary and VM state to when the marker was created.
+    fn handle_pending_marker_restore(&mut self) -> anyhow::Result<()> {
+        let marker_id = {
+            let mut p = self.pending_marker_restore.lock().unwrap();
+            p.take()
+        };
+        if let Some(id) = marker_id {
+            if let Some(state) = self.marker_states.remove(&id) {
+                self.dictionary.restore_state(state.dict_state);
+                self.user_here = state.user_here;
+                self.next_table_index = state.next_table_index;
+                self.word_pfa_map = state.word_pfa_map;
+                self.ir_bodies = state.ir_bodies;
+                self.does_definitions = state.does_definitions;
+                self.host_word_names = state.host_word_names;
+                self.two_value_words = state.two_value_words;
+                self.fvalue_words = state.fvalue_words;
+                self.sync_here_cell();
+                self.rebuild_word_lookup();
+                // Remove any marker states that were created after this one
+                self.marker_states.retain(|&k, _| k < id);
+            }
+        }
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // Backslash comment as a compilable immediate word
     // -----------------------------------------------------------------------
@@ -4602,6 +4979,17 @@ impl ForthVM {
             |_caller, _params, _results| Ok(()),
         );
         self.register_host_primitive("(", true, func)?;
+
+        // Register [IF], [ELSE], [THEN], [DEFINED], [UNDEFINED] as immediate no-ops
+        // so they are findable by WORD+FIND. Actual logic is in interpret_token.
+        for name in &["[IF]", "[ELSE]", "[THEN]", "[DEFINED]", "[UNDEFINED]"] {
+            let func = Func::new(
+                &mut self.store,
+                FuncType::new(&self.engine, [], []),
+                |_caller, _params, _results| Ok(()),
+            );
+            self.register_host_primitive(name, true, func)?;
+        }
 
         Ok(())
     }
@@ -5170,6 +5558,558 @@ impl ForthVM {
         Ok(())
     }
 
+    // -- Search-Order pending handlers --
+
+    /// GET-CURRENT ( -- wid )
+    fn do_get_current(&mut self) -> anyhow::Result<()> {
+        let wid = self.dictionary.current_wid() as i32;
+        self.push_data_stack(wid)
+    }
+
+    /// SET-CURRENT ( wid -- )
+    fn do_set_current(&mut self) -> anyhow::Result<()> {
+        let wid = self.pop_data_stack()? as u32;
+        self.dictionary.set_current_wid(wid);
+        Ok(())
+    }
+
+    /// SEARCH-WORDLIST ( c-addr u wid -- 0 | xt 1 | xt -1 )
+    fn do_search_wordlist(&mut self) -> anyhow::Result<()> {
+        let wid = self.pop_data_stack()? as u32;
+        let u = self.pop_data_stack()? as u32;
+        let addr = self.pop_data_stack()? as u32;
+
+        let data = self.memory.data(&self.store);
+        let name = String::from_utf8_lossy(&data[addr as usize..(addr + u) as usize]).to_string();
+
+        if let Some((_word_addr, word_id, is_imm)) = self.dictionary.find_in_wid(&name, wid) {
+            self.push_data_stack(word_id.0 as i32)?;
+            self.push_data_stack(if is_imm { 1 } else { -1 })?;
+        } else {
+            self.push_data_stack(0)?;
+        }
+        Ok(())
+    }
+
+    /// Register Search-Order word set words.
+    fn register_search_order(&mut self) -> anyhow::Result<()> {
+        // FORTH-WORDLIST ( -- wid )
+        self.register_primitive("FORTH-WORDLIST", false, vec![IrOp::PushI32(1)])?;
+
+        // GET-CURRENT ( -- wid )
+        // Returns the current compilation wordlist from pending mechanism
+        let pending = Arc::clone(&self.pending_define);
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |_caller, _params, _results| {
+                pending.lock().unwrap().push(20); // GET-CURRENT action
+                Ok(())
+            },
+        );
+        self.register_host_primitive("GET-CURRENT", false, func)?;
+
+        // SET-CURRENT ( wid -- )
+        let pending = Arc::clone(&self.pending_define);
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |_caller, _params, _results| {
+                pending.lock().unwrap().push(21); // SET-CURRENT action
+                Ok(())
+            },
+        );
+        self.register_host_primitive("SET-CURRENT", false, func)?;
+
+        // WORDLIST ( -- wid ) — directly allocates and pushes
+        {
+            let nw = Arc::clone(&self.next_wid);
+            let memory = self.memory;
+            let dsp_g = self.dsp;
+            let func = Func::new(
+                &mut self.store,
+                FuncType::new(&self.engine, [], []),
+                move |mut caller, _params, _results| {
+                    let mut nw_val = nw.lock().unwrap();
+                    let wid = *nw_val;
+                    *nw_val += 1;
+                    drop(nw_val);
+                    let sp = dsp_g.get(&mut caller).unwrap_i32() as u32;
+                    let new_sp = sp - CELL_SIZE;
+                    let data = memory.data_mut(&mut caller);
+                    data[new_sp as usize..new_sp as usize + 4]
+                        .copy_from_slice(&(wid as i32).to_le_bytes());
+                    dsp_g.set(&mut caller, Val::I32(new_sp as i32))?;
+                    Ok(())
+                },
+            );
+            self.register_host_primitive("WORDLIST", false, func)?;
+        }
+
+        // GET-ORDER ( -- widn ... wid1 n ) — directly pushes search order
+        {
+            let so = Arc::clone(&self.search_order);
+            let memory = self.memory;
+            let dsp_g = self.dsp;
+            let func = Func::new(
+                &mut self.store,
+                FuncType::new(&self.engine, [], []),
+                move |mut caller, _params, _results| {
+                    let order = so.lock().unwrap().clone();
+                    let n = order.len() as u32;
+                    let sp = dsp_g.get(&mut caller).unwrap_i32() as u32;
+                    let new_sp = sp - (n + 1) * CELL_SIZE;
+                    let data = memory.data_mut(&mut caller);
+                    // wid1 (top of search order) = closest to n on stack
+                    // widn (bottom of search order) = deepest on stack
+                    for (i, &wid) in order.iter().enumerate() {
+                        let addr = (new_sp + CELL_SIZE + i as u32 * CELL_SIZE) as usize;
+                        data[addr..addr + 4].copy_from_slice(&(wid as i32).to_le_bytes());
+                    }
+                    data[new_sp as usize..new_sp as usize + 4]
+                        .copy_from_slice(&(n as i32).to_le_bytes());
+                    dsp_g.set(&mut caller, Val::I32(new_sp as i32))?;
+                    Ok(())
+                },
+            );
+            self.register_host_primitive("GET-ORDER", false, func)?;
+        }
+
+        // SET-ORDER ( widn ... wid1 n -- ) — directly pops and sets search order
+        {
+            let so = Arc::clone(&self.search_order);
+            let memory = self.memory;
+            let dsp_g = self.dsp;
+            let func = Func::new(
+                &mut self.store,
+                FuncType::new(&self.engine, [], []),
+                move |mut caller, _params, _results| {
+                    let sp = dsp_g.get(&mut caller).unwrap_i32() as u32;
+                    let data = memory.data(&caller);
+                    let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
+                    let n = i32::from_le_bytes(b);
+
+                    if n == -1 {
+                        *so.lock().unwrap() = vec![1];
+                        dsp_g.set(&mut caller, Val::I32((sp + CELL_SIZE) as i32))?;
+                    } else {
+                        let n = n as u32;
+                        let mut order = Vec::new();
+                        // wid1 is just above n on stack, widn is deepest
+                        for i in 0..n {
+                            let addr = (sp + CELL_SIZE + i * CELL_SIZE) as usize;
+                            let data = memory.data(&caller);
+                            let b: [u8; 4] = data[addr..addr + 4].try_into().unwrap();
+                            order.push(u32::from_le_bytes(b));
+                        }
+                        *so.lock().unwrap() = order;
+                        dsp_g.set(&mut caller, Val::I32((sp + (1 + n) * CELL_SIZE) as i32))?;
+                    }
+                    Ok(())
+                },
+            );
+            self.register_host_primitive("SET-ORDER", false, func)?;
+        }
+
+        // ONLY ( -- ) set minimum search order
+        {
+            let so = Arc::clone(&self.search_order);
+            let func = Func::new(
+                &mut self.store,
+                FuncType::new(&self.engine, [], []),
+                move |_caller, _params, _results| {
+                    *so.lock().unwrap() = vec![1];
+                    Ok(())
+                },
+            );
+            self.register_host_primitive("ONLY", false, func)?;
+        }
+
+        // ALSO ( -- ) duplicate top of search order
+        {
+            let so = Arc::clone(&self.search_order);
+            let func = Func::new(
+                &mut self.store,
+                FuncType::new(&self.engine, [], []),
+                move |_caller, _params, _results| {
+                    let mut order = so.lock().unwrap();
+                    if let Some(&top) = order.first() {
+                        order.insert(0, top);
+                    }
+                    Ok(())
+                },
+            );
+            self.register_host_primitive("ALSO", false, func)?;
+        }
+
+        // PREVIOUS ( -- ) remove top of search order
+        {
+            let so = Arc::clone(&self.search_order);
+            let func = Func::new(
+                &mut self.store,
+                FuncType::new(&self.engine, [], []),
+                move |_caller, _params, _results| {
+                    let mut order = so.lock().unwrap();
+                    if !order.is_empty() {
+                        order.remove(0);
+                    }
+                    Ok(())
+                },
+            );
+            self.register_host_primitive("PREVIOUS", false, func)?;
+        }
+
+        // DEFINITIONS ( -- ) set compilation wordlist to top of search order
+        {
+            let so = Arc::clone(&self.search_order);
+            let pending = Arc::clone(&self.pending_define);
+            let func = Func::new(
+                &mut self.store,
+                FuncType::new(&self.engine, [], []),
+                move |_caller, _params, _results| {
+                    let order = so.lock().unwrap();
+                    if order.first().is_some() {
+                        // Use pending to set current_wid (needs dictionary access)
+                        drop(order);
+                        pending.lock().unwrap().push(33);
+                    }
+                    Ok(())
+                },
+            );
+            self.register_host_primitive("DEFINITIONS", false, func)?;
+        }
+
+        // FORTH ( -- ) replace top of search order with FORTH wordlist
+        {
+            let so = Arc::clone(&self.search_order);
+            let func = Func::new(
+                &mut self.store,
+                FuncType::new(&self.engine, [], []),
+                move |_caller, _params, _results| {
+                    let mut order = so.lock().unwrap();
+                    if !order.is_empty() {
+                        order[0] = 1;
+                    } else {
+                        order.push(1);
+                    }
+                    Ok(())
+                },
+            );
+            self.register_host_primitive("FORTH", false, func)?;
+        }
+
+        // SEARCH-WORDLIST ( c-addr u wid -- 0 | xt 1 | xt -1 )
+        let pending = Arc::clone(&self.pending_define);
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |_caller, _params, _results| {
+                pending.lock().unwrap().push(25); // SEARCH-WORDLIST action
+                Ok(())
+            },
+        );
+        self.register_host_primitive("SEARCH-WORDLIST", false, func)?;
+
+        Ok(())
+    }
+
+    /// Register N>R and NR> for the Programming-Tools word set.
+    fn register_n_to_r(&mut self) -> anyhow::Result<()> {
+        let memory = self.memory;
+        let dsp = self.dsp;
+        let rsp = self.rsp;
+
+        // N>R ( xn..x1 n -- ; R: -- x1..xn n )
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let data = memory.data(&caller);
+                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
+                let n = i32::from_le_bytes(b) as u32;
+
+                let mut rsp_val = rsp.get(&mut caller).unwrap_i32() as u32;
+
+                // Move n items from data stack to return stack, plus n itself
+                // Data stack: x1(deepest)..xn(just below n), n(top)
+                // Need to push x1 first (deepest on R), then x2, ..., xn, then n
+                let items_base = sp + 4; // past n
+                for i in (0..n).rev() {
+                    let addr = (items_base + i * 4) as usize;
+                    let data = memory.data(&caller);
+                    let val = i32::from_le_bytes(data[addr..addr + 4].try_into().unwrap());
+                    rsp_val -= 4;
+                    let data = memory.data_mut(&mut caller);
+                    data[rsp_val as usize..rsp_val as usize + 4]
+                        .copy_from_slice(&val.to_le_bytes());
+                }
+                // Push n to return stack
+                rsp_val -= 4;
+                let data = memory.data_mut(&mut caller);
+                data[rsp_val as usize..rsp_val as usize + 4]
+                    .copy_from_slice(&(n as i32).to_le_bytes());
+                rsp.set(&mut caller, Val::I32(rsp_val as i32))?;
+
+                // Pop n+1 items from data stack
+                let new_sp = sp + (n + 1) * 4;
+                dsp.set(&mut caller, Val::I32(new_sp as i32))?;
+                Ok(())
+            },
+        );
+        self.register_host_primitive("N>R", false, func)?;
+
+        // NR> ( -- xn..x1 n ; R: x1..xn n -- )
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                let mut rsp_val = rsp.get(&mut caller).unwrap_i32() as u32;
+                let data = memory.data(&caller);
+                // Pop n from return stack
+                let b: [u8; 4] = data[rsp_val as usize..rsp_val as usize + 4]
+                    .try_into()
+                    .unwrap();
+                let n = i32::from_le_bytes(b) as u32;
+                rsp_val += 4;
+
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                // Make space for n+1 items on data stack
+                let new_sp = sp - (n + 1) * 4;
+
+                // Pop n items from return stack to data stack
+                // R-stack has x1(deepest)..xn(top after n)
+                // Data stack needs xn..x1 n (with n on top)
+                for i in 0..n {
+                    let data = memory.data(&caller);
+                    let val = i32::from_le_bytes(
+                        data[rsp_val as usize..rsp_val as usize + 4]
+                            .try_into()
+                            .unwrap(),
+                    );
+                    rsp_val += 4;
+                    let addr = (new_sp + 4 + i * 4) as usize;
+                    let data = memory.data_mut(&mut caller);
+                    data[addr..addr + 4].copy_from_slice(&val.to_le_bytes());
+                }
+                rsp.set(&mut caller, Val::I32(rsp_val as i32))?;
+
+                // Push n on top of data stack
+                let data = memory.data_mut(&mut caller);
+                data[new_sp as usize..new_sp as usize + 4]
+                    .copy_from_slice(&(n as i32).to_le_bytes());
+                dsp.set(&mut caller, Val::I32(new_sp as i32))?;
+                Ok(())
+            },
+        );
+        self.register_host_primitive("NR>", false, func)?;
+
+        Ok(())
+    }
+
+    /// Register UNESCAPE, SUBSTITUTE, REPLACES for the String word set.
+    fn register_string_substitution(&mut self) -> anyhow::Result<()> {
+        let memory = self.memory;
+        let dsp = self.dsp;
+
+        // UNESCAPE ( c-addr1 u1 c-addr2 -- c-addr2 u2 )
+        // Copy string escaping each % as %%
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let data = memory.data(&caller);
+                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
+                let dest = u32::from_le_bytes(b);
+                let b: [u8; 4] = data[(sp + 4) as usize..(sp + 8) as usize]
+                    .try_into()
+                    .unwrap();
+                let u1 = u32::from_le_bytes(b);
+                let b: [u8; 4] = data[(sp + 8) as usize..(sp + 12) as usize]
+                    .try_into()
+                    .unwrap();
+                let src = u32::from_le_bytes(b);
+
+                // Read source
+                let src_bytes: Vec<u8> = data[src as usize..(src + u1) as usize].to_vec();
+
+                // Escape: each % becomes %%
+                let mut result = Vec::with_capacity(u1 as usize * 2);
+                for &ch in &src_bytes {
+                    if ch == b'%' {
+                        result.push(b'%');
+                        result.push(b'%');
+                    } else {
+                        result.push(ch);
+                    }
+                }
+
+                // Write to dest
+                let u2 = result.len() as u32;
+                let data = memory.data_mut(&mut caller);
+                data[dest as usize..(dest + u2) as usize].copy_from_slice(&result);
+
+                // Pop 3, push 2: net sp + 4
+                let new_sp = sp + 4;
+                let data = memory.data_mut(&mut caller);
+                data[(new_sp + 4) as usize..(new_sp + 8) as usize]
+                    .copy_from_slice(&(dest as i32).to_le_bytes());
+                data[new_sp as usize..(new_sp + 4) as usize]
+                    .copy_from_slice(&(u2 as i32).to_le_bytes());
+                dsp.set(&mut caller, Val::I32(new_sp as i32))?;
+                Ok(())
+            },
+        );
+        self.register_host_primitive("UNESCAPE", false, func)?;
+
+        // REPLACES ( c-addr1 u1 c-addr2 u2 -- )
+        // Define substitution: name (c-addr2 u2) → replacement (c-addr1 u1)
+        let subs = Arc::clone(&self.substitutions);
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let data = memory.data(&caller);
+                // Stack: u2(sp), c-addr2(sp+4), u1(sp+8), c-addr1(sp+12)
+                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
+                let u2 = u32::from_le_bytes(b);
+                let b: [u8; 4] = data[(sp + 4) as usize..(sp + 8) as usize]
+                    .try_into()
+                    .unwrap();
+                let name_addr = u32::from_le_bytes(b);
+                let b: [u8; 4] = data[(sp + 8) as usize..(sp + 12) as usize]
+                    .try_into()
+                    .unwrap();
+                let u1 = u32::from_le_bytes(b);
+                let b: [u8; 4] = data[(sp + 12) as usize..(sp + 16) as usize]
+                    .try_into()
+                    .unwrap();
+                let repl_addr = u32::from_le_bytes(b);
+
+                let name =
+                    String::from_utf8_lossy(&data[name_addr as usize..(name_addr + u2) as usize])
+                        .to_ascii_uppercase();
+
+                // Copy replacement string to Rust-side storage (WASM addresses are transient)
+                let repl_bytes = data[repl_addr as usize..(repl_addr + u1) as usize].to_vec();
+                subs.lock().unwrap().insert(name, repl_bytes);
+
+                // Pop 4 items
+                let new_sp = sp + 16;
+                dsp.set(&mut caller, Val::I32(new_sp as i32))?;
+                Ok(())
+            },
+        );
+        self.register_host_primitive("REPLACES", false, func)?;
+
+        // SUBSTITUTE ( c-addr1 u1 c-addr2 u2 -- c-addr2 u2 n )
+        // Replace %name% patterns, %% → %
+        let subs = Arc::clone(&self.substitutions);
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let data = memory.data(&caller);
+                // Stack: u2/capacity(sp), c-addr2/dest(sp+4), u1(sp+8), c-addr1(sp+12)
+                let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
+                let capacity = u32::from_le_bytes(b) as usize;
+                let b: [u8; 4] = data[(sp + 4) as usize..(sp + 8) as usize]
+                    .try_into()
+                    .unwrap();
+                let dest = u32::from_le_bytes(b);
+                let b: [u8; 4] = data[(sp + 8) as usize..(sp + 12) as usize]
+                    .try_into()
+                    .unwrap();
+                let u1 = u32::from_le_bytes(b);
+                let b: [u8; 4] = data[(sp + 12) as usize..(sp + 16) as usize]
+                    .try_into()
+                    .unwrap();
+                let src = u32::from_le_bytes(b);
+
+                let src_bytes: Vec<u8> = data[src as usize..(src + u1) as usize].to_vec();
+
+                let subs_map = subs.lock().unwrap();
+                let mut result = Vec::with_capacity(capacity);
+                let mut sub_count: i32 = 0;
+                let mut i = 0;
+                let mut overflow = false;
+
+                while i < src_bytes.len() {
+                    if src_bytes[i] == b'%' {
+                        if i + 1 < src_bytes.len() && src_bytes[i + 1] == b'%' {
+                            // %% → %
+                            result.push(b'%');
+                            i += 2;
+                        } else {
+                            // Look for closing %
+                            if let Some(end) = src_bytes[i + 1..].iter().position(|&c| c == b'%') {
+                                let name_bytes = &src_bytes[i + 1..i + 1 + end];
+                                let name = String::from_utf8_lossy(name_bytes).to_ascii_uppercase();
+                                if let Some(repl_bytes) = subs_map.get(&name) {
+                                    // Substitute
+                                    let avail = capacity - result.len();
+                                    let copy_len = repl_bytes.len().min(avail);
+                                    result.extend_from_slice(&repl_bytes[..copy_len]);
+                                    sub_count += 1;
+                                } else {
+                                    // Unknown name: keep %name% as-is
+                                    let avail = capacity - result.len();
+                                    let chunk = &src_bytes[i..i + 1 + end + 1];
+                                    let copy_len = chunk.len().min(avail);
+                                    result.extend_from_slice(&chunk[..copy_len]);
+                                }
+                                i += 1 + end + 1; // skip past closing %
+                            } else {
+                                // No closing % — copy rest as-is
+                                let avail = capacity - result.len();
+                                let chunk = &src_bytes[i..];
+                                let copy_len = chunk.len().min(avail);
+                                result.extend_from_slice(&chunk[..copy_len]);
+                                i = src_bytes.len();
+                            }
+                        }
+                    } else {
+                        result.push(src_bytes[i]);
+                        i += 1;
+                    }
+                }
+                drop(subs_map);
+
+                // Check overflow
+                if result.len() > capacity {
+                    overflow = true;
+                    result.truncate(capacity);
+                }
+                if overflow {
+                    sub_count = if sub_count > 0 { -sub_count } else { -1 };
+                }
+
+                // Write result to dest
+                let u2 = result.len() as u32;
+                let data = memory.data_mut(&mut caller);
+                data[dest as usize..(dest + u2) as usize].copy_from_slice(&result);
+
+                // Pop 4, push 3: net sp + 4
+                let new_sp = sp + 4;
+                let data = memory.data_mut(&mut caller);
+                data[(new_sp + 8) as usize..(new_sp + 12) as usize]
+                    .copy_from_slice(&(dest as i32).to_le_bytes());
+                data[(new_sp + 4) as usize..(new_sp + 8) as usize]
+                    .copy_from_slice(&(u2 as i32).to_le_bytes());
+                data[new_sp as usize..(new_sp + 4) as usize]
+                    .copy_from_slice(&sub_count.to_le_bytes());
+                dsp.set(&mut caller, Val::I32(new_sp as i32))?;
+                Ok(())
+            },
+        );
+        self.register_host_primitive("SUBSTITUTE", false, func)?;
+
+        Ok(())
+    }
+
     /// M*/ ( d n1 n2 -- d ) multiply d by n1, divide by n2.
     fn register_m_star_slash(&mut self) -> anyhow::Result<()> {
         let memory = self.memory;
@@ -5202,13 +6142,9 @@ impl ForthVM {
                     return Err(wasmtime::Error::msg("M*/: division by zero"));
                 }
 
-                // Floored division
+                // Symmetric (truncating) division to match WAFER's / behavior
                 let product = d * n1;
-                let mut quot = product / n2;
-                let rem = product % n2;
-                if rem != 0 && ((rem ^ n2) < 0) {
-                    quot -= 1;
-                }
+                let quot = product / n2;
 
                 let result = quot as i64;
                 let lo = result as i32;

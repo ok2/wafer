@@ -504,6 +504,7 @@ fn inline(ops: Vec<IrOp>, bodies: &HashMap<WordId, Vec<IrOp>>, max_size: usize) 
                 if let Some(body) = bodies.get(id)
                     && body.len() <= max_size
                     && !contains_call_to(body, *id)
+                    && !contains_exit(body)
                 {
                     // Inline the body, recursively converting TailCall back to Call
                     // (tail position in the callee is not tail position in the caller).
@@ -617,6 +618,42 @@ fn contains_call_to(ops: &[IrOp], target: WordId) -> bool {
                 if let Some(eb) = else_body
                     && contains_call_to(eb, target)
                 {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Check if an IR body contains ops that prevent safe inlining.
+/// - `Exit`: WASM `return` would exit the caller's function
+/// - `ForthLocalGet/Set`: would collide with the caller's WASM locals
+fn contains_exit(ops: &[IrOp]) -> bool {
+    for op in ops {
+        match op {
+            IrOp::Exit | IrOp::ForthLocalGet(_) | IrOp::ForthLocalSet(_) => return true,
+            IrOp::If {
+                then_body,
+                else_body,
+            } => {
+                if contains_exit(then_body) {
+                    return true;
+                }
+                if let Some(eb) = else_body
+                    && contains_exit(eb)
+                {
+                    return true;
+                }
+            }
+            IrOp::DoLoop { body, .. } | IrOp::BeginUntil { body } | IrOp::BeginAgain { body } => {
+                if contains_exit(body) {
+                    return true;
+                }
+            }
+            IrOp::BeginWhileRepeat { test, body } => {
+                if contains_exit(test) || contains_exit(body) {
                     return true;
                 }
             }
