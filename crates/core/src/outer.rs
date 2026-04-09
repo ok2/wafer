@@ -2403,6 +2403,9 @@ impl ForthVM {
         // UNUSED
         self.register_unused()?;
 
+        // UTIME ( -- ud ) microseconds since epoch as double-cell
+        self.register_utime()?;
+
         // HOLDS
         // HOLDS: defined in boot.fth
 
@@ -5122,6 +5125,39 @@ impl ForthVM {
         );
 
         self.register_host_primitive("UNUSED", false, func)?;
+        Ok(())
+    }
+
+    /// UTIME ( -- ud ) push microseconds since epoch as a double-cell value.
+    fn register_utime(&mut self) -> anyhow::Result<()> {
+        let memory = self.memory;
+        let dsp = self.dsp;
+
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                use std::time::{SystemTime, UNIX_EPOCH};
+                let us = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_micros() as u64;
+                let lo = us as i32;
+                let hi = (us >> 32) as i32;
+                // Push double: lo first (deeper), then hi on top
+                let sp = dsp.get(&mut caller).unwrap_i32() as u32;
+                let new_sp = sp - 2 * CELL_SIZE;
+                let data = memory.data_mut(&mut caller);
+                data[new_sp as usize..new_sp as usize + 4]
+                    .copy_from_slice(&hi.to_le_bytes());
+                data[new_sp as usize + 4..new_sp as usize + 8]
+                    .copy_from_slice(&lo.to_le_bytes());
+                dsp.set(&mut caller, Val::I32(new_sp as i32))?;
+                Ok(())
+            },
+        );
+
+        self.register_host_primitive("UTIME", false, func)?;
         Ok(())
     }
 

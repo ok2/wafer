@@ -2884,11 +2884,18 @@ fn compile_multi_word_module(
     // -- Code section: emit each function body --
     let mut code = CodeSection::new();
     for (_word_id, body) in words {
+        let promoted = is_promotable(body);
         let scratch_count = count_scratch_locals(body);
         let forth_local_count = count_forth_locals(body);
         let loop_depth = count_loop_depth(body);
         let loop_local_count = loop_depth * 2;
-        let num_locals = 1 + scratch_count + forth_local_count + loop_local_count;
+        let num_locals = if promoted {
+            let (preload, _) = compute_stack_needs(body);
+            let promoted_count = count_promoted_locals(body, preload);
+            1 + promoted_count + forth_local_count + loop_local_count
+        } else {
+            1 + scratch_count + forth_local_count + loop_local_count
+        };
         let has_floats = needs_f64_locals(body);
         let num_f64: u32 = if has_floats { 2 } else { 0 };
         let mut locals_decl = vec![(num_locals, ValType::I32)];
@@ -2896,7 +2903,13 @@ fn compile_multi_word_module(
             locals_decl.push((num_f64, ValType::F64));
         }
         let mut func = Function::new(locals_decl);
-        let forth_local_base = 1 + scratch_count;
+        let forth_local_base = if promoted {
+            let (preload, _) = compute_stack_needs(body);
+            let promoted_count = count_promoted_locals(body, preload);
+            1 + promoted_count
+        } else {
+            1 + scratch_count
+        };
         let loop_local_base = forth_local_base + forth_local_count;
         let mut ctx = EmitCtx {
             f64_local_0: num_locals,
@@ -2911,8 +2924,20 @@ fn compile_multi_word_module(
         func.instruction(&Instruction::GlobalGet(DSP))
             .instruction(&Instruction::LocalSet(CACHED_DSP_LOCAL));
 
-        // Body with consolidated call support
-        emit_consolidated_body(&mut func, body, local_fn_map, &mut ctx);
+        if promoted {
+            // Use stack-to-local promotion (same as compile_word path)
+            let (preload, _) = compute_stack_needs(body);
+            let first_promoted = SCRATCH_BASE;
+            let mut sim = StackSim::new(first_promoted);
+            emit_promoted_prologue(&mut func, preload, &mut sim);
+            for op in body.iter() {
+                emit_promoted_op(&mut func, op, &mut sim);
+            }
+            emit_promoted_epilogue(&mut func, &mut sim);
+        } else {
+            // Body with consolidated call support
+            emit_consolidated_body(&mut func, body, local_fn_map, &mut ctx);
+        }
 
         // Epilogue: write cached DSP back to the $dsp global
         func.instruction(&Instruction::LocalGet(CACHED_DSP_LOCAL))

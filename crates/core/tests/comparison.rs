@@ -9,7 +9,6 @@
 
 use std::process::Command;
 use std::sync::OnceLock;
-use std::time::Instant;
 
 use wafer_core::config::WaferConfig;
 use wafer_core::outer::ForthVM;
@@ -616,9 +615,10 @@ fn perf_benchmarks() -> Vec<PerfBenchmark> {
             samples: 5,
         },
         PerfBenchmark {
-            name: "NestedLoops(20)",
-            define: ": NESTED 0 SWAP 0 DO I 0 ?DO I J + DROP LOOP LOOP ;",
-            run_code: "20 NESTED DROP",
+            name: "NestedLoops(50)",
+            define: ": NESTED 0 SWAP 0 DO I 0 ?DO I J + DROP LOOP LOOP ; \
+                     : NESTED-BENCH 100 0 DO 50 NESTED DROP LOOP ;",
+            run_code: "NESTED-BENCH",
             verify: "5 NESTED",
             expected: 0,
             samples: 3,
@@ -637,31 +637,80 @@ fn perf_benchmarks() -> Vec<PerfBenchmark> {
     ]
 }
 
-/// Measure WAFER execution time (microseconds, median of N samples).
-fn measure_wafer(config: &WaferConfig, bench: &PerfBenchmark) -> u64 {
-    let mut vm = ForthVM::new_with_config(config.clone()).expect("VM creation failed");
-    for line in bench.define.lines() {
-        let trimmed = line.trim();
-        if !trimmed.is_empty() {
-            let _ = vm.evaluate(trimmed);
-        }
+/// Build the WAFER release binary and return its path.
+/// Returns None if the build fails.
+fn build_wafer_release() -> Option<String> {
+    // Find workspace root (two levels up from crates/core)
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let workspace_root = std::path::Path::new(manifest_dir)
+        .parent()?
+        .parent()?;
+    let output = Command::new("cargo")
+        .args(["build", "--release", "-p", "wafer"])
+        .current_dir(workspace_root)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        eprintln!(
+            "WARN: cargo build --release failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return None;
     }
-    vm.take_output();
-
-    // Warm up
-    let _ = vm.evaluate(bench.run_code);
-    vm.take_output();
-
-    // Measure
-    let mut times = Vec::new();
-    for _ in 0..bench.samples {
-        let start = Instant::now();
-        let _ = vm.evaluate(bench.run_code);
-        times.push(start.elapsed());
-        vm.take_output();
+    let target_dir = workspace_root.join(
+        std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".to_string()),
+    );
+    let binary = target_dir.join("release/wafer");
+    if binary.exists() {
+        Some(binary.to_string_lossy().into_owned())
+    } else {
+        None
     }
+}
+
+static WAFER_RELEASE: OnceLock<Option<String>> = OnceLock::new();
+
+fn find_wafer_release() -> Option<&'static str> {
+    WAFER_RELEASE
+        .get_or_init(|| build_wafer_release())
+        .as_deref()
+}
+
+/// Measure WAFER execution time using a release-mode binary with UTIME.
+/// Same approach as gforth: Forth-level timing excludes startup.
+fn measure_wafer_release(wafer: &str, bench: &PerfBenchmark) -> Option<u64> {
+    let code = format!(
+        "{define} {run} \
+         : TIMED-BENCH UTIME {run} UTIME 2SWAP D- DROP . CR ; \
+         TIMED-BENCH TIMED-BENCH TIMED-BENCH",
+        define = bench.define,
+        run = bench.run_code,
+    );
+    let output = Command::new(wafer)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child.stdin.take().unwrap().write_all(code.as_bytes())?;
+            child.wait_with_output()
+        })
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut times: Vec<u64> = stdout
+        .trim()
+        .lines()
+        .filter_map(|l| l.trim().parse::<u64>().ok())
+        .collect();
     times.sort();
-    times[times.len() / 2].as_micros() as u64
+    if times.is_empty() {
+        return None;
+    }
+    Some(times[times.len() / 2])
 }
 
 /// Measure gforth execution time using Forth-level `utime` (excludes startup).
@@ -700,13 +749,16 @@ fn measure_gforth(gforth: &str, bench: &PerfBenchmark) -> Option<u64> {
 fn performance_report() {
     let gforth = find_gforth();
     let gforth_fast = find_gforth_fast();
+    let wafer_release = find_wafer_release();
     if gforth.is_none() {
         eprintln!("SKIP: gforth not found");
         return;
     }
+    if wafer_release.is_none() {
+        eprintln!("WARN: could not build WAFER release binary, using in-process (debug) timing");
+    }
 
     let benchmarks = perf_benchmarks();
-    let config_all = WaferConfig::all();
 
     // Verify correctness first
     for bench in &benchmarks {
@@ -733,7 +785,7 @@ fn performance_report() {
     let sep = "=".repeat(80);
     let thin = "-".repeat(80);
     println!("\n{sep}");
-    println!("  WAFER vs Gforth Performance Comparison");
+    println!("  WAFER vs Gforth Performance Comparison (release mode)");
     println!("{sep}\n");
     println!(
         "{:<22} {:>12} {:>12} {:>12} {:>12}",
@@ -742,7 +794,7 @@ fn performance_report() {
     println!("{thin}");
 
     for bench in &benchmarks {
-        let wafer = measure_wafer(&config_all, bench);
+        let wafer = wafer_release.and_then(|w| measure_wafer_release(w, bench)).unwrap_or(0);
         let gf = gforth.and_then(|g| measure_gforth(g, bench));
         let gf_fast = gforth_fast.and_then(|g| measure_gforth(g, bench));
 
