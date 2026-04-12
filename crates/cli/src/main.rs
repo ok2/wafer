@@ -311,11 +311,15 @@ fn cmd_eval_or_repl(file: Option<&str>) -> anyhow::Result<()> {
                             match vm.evaluate(&line) {
                                 Ok(()) => {
                                     let output = vm.take_output();
-                                    if !output.is_empty() {
-                                        print!("{output}");
-                                    }
                                     if !vm.is_compiling() {
-                                        println!(" ok");
+                                        // Move cursor back up to end of input line so
+                                        // output appears inline, like traditional Forth:
+                                        //   > 2 2 + . 4  ok
+                                        let col = prompt.len() + line.len() + 1;
+                                        print!("\x1b[A\x1b[{col}G {output} ok");
+                                        println!();
+                                    } else if !output.is_empty() {
+                                        print!("{output}");
                                     }
                                 }
                                 Err(e) => {
