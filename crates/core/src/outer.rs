@@ -282,8 +282,6 @@ impl ForthVM {
     pub fn new_with_config(wafer_config: WaferConfig) -> anyhow::Result<Self> {
         let mut config = wasmtime::Config::new();
         config.cranelift_nan_canonicalization(false);
-        // Best-effort module caching
-        let _ = config.cache_config_load_default();
         let engine = Engine::new(&config)?;
         let output = Arc::new(Mutex::new(String::new()));
 

@@ -21,7 +21,7 @@ struct RunnerHost {}
 fn make_engine() -> anyhow::Result<Engine> {
     let mut config = wasmtime::Config::new();
     config.cranelift_nan_canonicalization(false);
-    Engine::new(&config)
+    Ok(Engine::new(&config)?)
 }
 
 /// Execute a pre-compiled `.wasm` module from a file path.
@@ -336,7 +336,7 @@ fn create_host_func(
                     ((hi << 32) | lo, divisor)
                 };
                 if divisor == 0 {
-                    anyhow::bail!("division by zero");
+                    wasmtime::bail!("division by zero");
                 }
                 let quot = (dividend / divisor) as u32;
                 let rem = (dividend % divisor) as u32;
@@ -368,7 +368,7 @@ fn create_host_func(
             // Unimplemented host function: trap with a clear message.
             let name_owned = name.to_string();
             Func::new(store, void_type, move |_caller, _params, _results| {
-                anyhow::bail!("host function '{name_owned}' is not available in standalone mode")
+                wasmtime::bail!("host function '{name_owned}' is not available in standalone mode")
             })
         }
     }

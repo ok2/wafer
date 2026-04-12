@@ -592,6 +592,9 @@ struct PerfBenchmark {
     verify: &'static str,
     expected: i32,
     samples: u32, // Number of runs for WAFER median
+    /// Maximum acceptable WAFER/gforth ratio (< 1.0 = WAFER faster).
+    /// Test fails if ratio exceeds this. Set ~40-50% above measured baseline.
+    max_ratio: f64,
 }
 
 fn perf_benchmarks() -> Vec<PerfBenchmark> {
@@ -603,6 +606,7 @@ fn perf_benchmarks() -> Vec<PerfBenchmark> {
             verify: "25 FIB",
             expected: 75025,
             samples: 5,
+            max_ratio: 0.65,
         },
         PerfBenchmark {
             name: "Factorial(12)x10K",
@@ -612,6 +616,7 @@ fn perf_benchmarks() -> Vec<PerfBenchmark> {
             verify: "12 FACT",
             expected: 479001600,
             samples: 5,
+            max_ratio: 0.75,
         },
         PerfBenchmark {
             name: "GCD-bench(500)",
@@ -621,6 +626,7 @@ fn perf_benchmarks() -> Vec<PerfBenchmark> {
             verify: "48 36 GCD",
             expected: 12,
             samples: 5,
+            max_ratio: 0.70,
         },
         PerfBenchmark {
             name: "NestedLoops(50)",
@@ -630,6 +636,7 @@ fn perf_benchmarks() -> Vec<PerfBenchmark> {
             verify: "5 NESTED",
             expected: 0,
             samples: 3,
+            max_ratio: 0.20,
         },
         PerfBenchmark {
             name: "Collatz(2K)",
@@ -641,6 +648,7 @@ fn perf_benchmarks() -> Vec<PerfBenchmark> {
             verify: "27 COLLATZ",
             expected: 111,
             samples: 3,
+            max_ratio: 0.45,
         },
     ]
 }
@@ -827,14 +835,16 @@ fn performance_report() {
     println!("  WAFER vs Gforth Performance Comparison (release mode)");
     println!("{sep}\n");
     println!(
-        "{:<22} {:>10} {:>10} {:>10} {:>10} {:>10}",
-        "Benchmark", "WAFER", "CONSOL", "gforth", "gf-fast", "WAFER/gf"
+        "{:<22} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "Benchmark", "WAFER", "CONSOL", "gforth", "gf-fast", "WAFER/gf", "limit"
     );
     println!(
-        "{:<22} {:>10} {:>10} {:>10} {:>10} {:>10}",
-        "", "(us)", "(us)", "(us)", "(us)", ""
+        "{:<22} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "", "(us)", "(us)", "(us)", "(us)", "", ""
     );
     println!("{thin}");
+
+    let mut regressions: Vec<String> = Vec::new();
 
     for bench in &benchmarks {
         let wafer = wafer_release
@@ -853,25 +863,45 @@ fn performance_report() {
         } else {
             wafer
         };
-        let ratio = gf.map_or_else(
-            || "-".to_string(),
-            |g| {
-                if g > 0 {
-                    format!("{:.2}x", best_wafer as f64 / g as f64)
-                } else {
-                    "-".to_string()
-                }
-            },
-        );
+        let ratio_val = gf.and_then(|g| {
+            if g > 0 {
+                Some(best_wafer as f64 / g as f64)
+            } else {
+                None
+            }
+        });
+        let ratio = ratio_val.map_or_else(|| "-".to_string(), |r| format!("{r:.2}x"));
+        let limit_str = format!("{:.2}x", bench.max_ratio);
 
         println!(
-            "{:<22} {:>10} {:>10} {:>10} {:>10} {:>10}",
-            bench.name, wafer, consol, gf_str, gf_fast_str, ratio
+            "{:<22} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
+            bench.name, wafer, consol, gf_str, gf_fast_str, ratio, limit_str
         );
+
+        // Check regression limits
+        if let Some(r) = ratio_val {
+            if r > bench.max_ratio {
+                regressions.push(format!(
+                    "  {} ratio {:.2}x exceeds limit {:.2}x (REGRESSION)",
+                    bench.name, r, bench.max_ratio
+                ));
+            }
+            if r < 0.02 {
+                regressions.push(format!(
+                    "  {} ratio {:.4}x suspiciously low (measurement error?)",
+                    bench.name, r
+                ));
+            }
+        }
     }
 
     println!("{thin}");
     println!("  WAFER = all optimizations, CONSOL = after CONSOLIDATE");
     println!("  WAFER/gf = best(WAFER,CONSOL) vs gforth, < 1.0 means WAFER faster");
     println!("{sep}\n");
+
+    if !regressions.is_empty() {
+        let msg = regressions.join("\n");
+        panic!("Performance regression detected:\n{msg}");
+    }
 }

@@ -41,9 +41,9 @@ needless_collect = "warn"
 or_fun_call = "warn"
 
 [workspace.dependencies]
-wasm-encoder = "0.228"
-wasmparser = "0.228"
-wasmtime = "31"
+wasm-encoder = "0.246"
+wasmparser = "0.246"
+wasmtime = "43"
 anyhow = "1"
 thiserror = "2"
 proptest = "1"

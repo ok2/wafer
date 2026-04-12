@@ -349,7 +349,7 @@ fn emit_op(f: &mut Function, op: &IrOp, ctx: &mut EmitCtx) {
         IrOp::PushF64(val) => {
             fsp_dec(f);
             f.instruction(&Instruction::GlobalGet(FSP))
-                .instruction(&Instruction::F64Const(*val))
+                .instruction(&Instruction::F64Const((*val).into()))
                 .instruction(&Instruction::F64Store(MEM8));
         }
 
@@ -855,14 +855,14 @@ fn emit_op(f: &mut Function, op: &IrOp, ctx: &mut EmitCtx) {
         // -- Float comparisons (cross-stack) --------------------------------
         IrOp::FZeroEq => {
             fpop(f);
-            f.instruction(&Instruction::F64Const(0.0))
+            f.instruction(&Instruction::F64Const(0.0.into()))
                 .instruction(&Instruction::F64Eq);
             bool_to_forth_flag(f, SCRATCH_BASE);
             push_via_local(f, SCRATCH_BASE + 1);
         }
         IrOp::FZeroLt => {
             fpop(f);
-            f.instruction(&Instruction::F64Const(0.0))
+            f.instruction(&Instruction::F64Const(0.0.into()))
                 .instruction(&Instruction::F64Lt);
             bool_to_forth_flag(f, SCRATCH_BASE);
             push_via_local(f, SCRATCH_BASE + 1);
