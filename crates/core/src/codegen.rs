@@ -244,6 +244,9 @@ struct EmitCtx {
     /// The word being compiled (for self-recursion detection).
     /// When `Call(id)` matches this, emit direct `call` instead of `call_indirect`.
     self_word_id: Option<WordId>,
+    /// Stack of open block labels for flat forward branches (CS-ROLL'd IF/THEN).
+    /// Used by `BranchIfFalse` to compute `br_if` depth.
+    open_blocks: Vec<u32>,
 }
 
 /// Decrement the FSP global by 8 (allocate space for one f64).
@@ -897,6 +900,37 @@ fn emit_op(f: &mut Function, op: &IrOp, ctx: &mut EmitCtx) {
             f.instruction(&Instruction::I32TruncF64S);
             push_via_local(f, SCRATCH_BASE);
         }
+
+        IrOp::LoopRestartIfFalse => {
+            panic!("LoopRestartIfFalse should be desugared before codegen");
+        }
+
+        // -- Flat forward blocks (CS-ROLL'd IF/THEN) -------------------------
+        IrOp::Block(label) => {
+            f.instruction(&Instruction::Block(BlockType::Empty));
+            ctx.open_blocks.push(*label);
+        }
+        IrOp::BranchIfFalse(label) => {
+            // Pop flag from data stack; if false (zero), branch to the matching EndBlock
+            pop_to(f, SCRATCH_BASE);
+            f.instruction(&Instruction::LocalGet(SCRATCH_BASE));
+            f.instruction(&Instruction::I32Eqz);
+            // Compute depth: find the label in open_blocks (innermost = last = depth 0)
+            let depth = ctx
+                .open_blocks
+                .iter()
+                .rev()
+                .position(|l| l == label)
+                .unwrap_or(0) as u32;
+            f.instruction(&Instruction::BrIf(depth));
+        }
+        IrOp::EndBlock(label) => {
+            f.instruction(&Instruction::End);
+            // Remove the label from open_blocks
+            if let Some(pos) = ctx.open_blocks.iter().rposition(|l| l == label) {
+                ctx.open_blocks.remove(pos);
+            }
+        }
     }
 }
 
@@ -1149,11 +1183,15 @@ fn is_promotable_body(ops: &[IrOp]) -> bool {
                     return false;
                 }
             }
-            // BEGIN loops and BeginDoubleWhileRepeat: not yet promoted
+            // BEGIN loops, BeginDoubleWhileRepeat, flat forward blocks: not promoted
             IrOp::BeginUntil { .. }
             | IrOp::BeginAgain { .. }
             | IrOp::BeginWhileRepeat { .. }
-            | IrOp::BeginDoubleWhileRepeat { .. } => return false,
+            | IrOp::BeginDoubleWhileRepeat { .. }
+            | IrOp::Block(_)
+            | IrOp::BranchIfFalse(_)
+            | IrOp::EndBlock(_)
+            | IrOp::LoopRestartIfFalse => return false,
             _ => {}
         }
     }
@@ -2452,6 +2490,7 @@ pub fn compile_word(
         loop_locals: Vec::new(),
         fast_loop_depth: 0,
         self_word_id: Some(WordId(config.base_fn_index)),
+        open_blocks: Vec::new(),
     };
 
     // Prologue: cache $dsp global into local 0
@@ -2953,6 +2992,7 @@ fn compile_multi_word_module(
             loop_locals: Vec::new(),
             fast_loop_depth: 0,
             self_word_id: None, // consolidated module uses direct calls via local_fn_map
+            open_blocks: Vec::new(),
         };
 
         // Prologue: cache $dsp global into local 0

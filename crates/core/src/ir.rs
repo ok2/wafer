@@ -111,6 +111,17 @@ pub enum IrOp {
     },
     /// Return from current word.
     Exit,
+    /// Conditional restart of enclosing loop (used by CS-PICK'd BEGIN + UNTIL).
+    /// Pops flag; if false, restart the loop. Desugared into nested `If` before codegen.
+    LoopRestartIfFalse,
+
+    // -- Flat forward branches (for CS-ROLL'd IF/THEN patterns) --
+    /// Open a WASM `block`. `BranchIfFalse` can target this to skip to `EndBlock`.
+    Block(u32),
+    /// Pop flag; if false, branch to matching `EndBlock` with this label.
+    BranchIfFalse(u32),
+    /// Close the `block` with this label.
+    EndBlock(u32),
 
     // -- Return stack --
     /// Move to return stack: ( x -- ) ( R: -- x )

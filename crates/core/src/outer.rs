@@ -91,7 +91,47 @@ enum ControlEntry {
         /// The prefix before the ?DO (including the OVER OVER = check)
         prefix: Vec<IrOp>,
     },
+    /// AHEAD: unconditional forward branch — code between AHEAD and THEN is skipped.
+    Ahead {
+        prefix: Vec<IrOp>,
+    },
+    /// CS-PICK'd reference to a Begin dest. UNTIL resolves this by emitting
+    /// `LoopRestartIfFalse` instead of creating a full `BeginUntil`.
+    BeginRef,
+    /// Flat forward block from CS-ROLL'd IF linearization.
+    /// THEN resolves this by emitting `EndBlock(label)`.
+    ForwardBlock {
+        label: u32,
+    },
 }
+
+/// Pending actions from host functions executed during immediate-word evaluation.
+/// Processed in order after the immediate word returns.
+#[derive(Debug)]
+enum PendingAction {
+    /// Compile a call to the given word (from COMPILE,).
+    CompileCall(u32),
+    /// CS-PICK with the given n.
+    CsPick(u32),
+    /// CS-ROLL with the given n.
+    CsRoll(u32),
+    /// Compile a control-flow operation (from POSTPONE of compile-time keywords).
+    CompileControl(i32),
+}
+
+// Control-flow action codes for PendingAction::CompileControl
+const CTRL_IF: i32 = 1;
+const CTRL_ELSE: i32 = 2;
+const CTRL_THEN: i32 = 3;
+const CTRL_BEGIN: i32 = 4;
+const CTRL_UNTIL: i32 = 5;
+const CTRL_WHILE: i32 = 6;
+const CTRL_REPEAT: i32 = 7;
+const CTRL_AGAIN: i32 = 8;
+const CTRL_DO: i32 = 9;
+const CTRL_LOOP: i32 = 10;
+const CTRL_PLUS_LOOP: i32 = 11;
+const CTRL_AHEAD: i32 = 12;
 
 // ---------------------------------------------------------------------------
 // VM state stored in the wasmtime Store
@@ -185,8 +225,8 @@ pub struct ForthVM {
     // Pending action from compiled defining/parsing words
     // 0 = none, 1 = CONSTANT, 2 = VARIABLE, 3 = CREATE, 4 = EVALUATE
     pending_define: Arc<Mutex<Vec<i32>>>,
-    // Pending word IDs to compile (used by COMPILE, / POSTPONE mechanism)
-    pending_compile: Arc<Mutex<Vec<u32>>>,
+    /// Pending actions from host functions (COMPILE,, CS-PICK, CS-ROLL, POSTPONE of control words).
+    pending_actions: Arc<Mutex<Vec<PendingAction>>>,
     // Pending DOES> patch: (does_action_id) to apply after word execution
     pending_does_patch: Arc<Mutex<Option<u32>>>,
     // Exception word set: throw code shared between CATCH and THROW host functions
@@ -219,6 +259,8 @@ pub struct ForthVM {
     pending_marker_restore: Arc<Mutex<Option<u32>>>,
     /// Conditional compilation skip depth: >0 means we're skipping tokens for [IF]/[ELSE]
     conditional_skip_depth: u32,
+    /// Next label ID for flat forward blocks (CS-ROLL'd IF/THEN patterns)
+    next_block_label: u32,
     /// Local variable names for the current definition ({: ... :} syntax)
     compiling_locals: Vec<String>,
     /// Substitution table for SUBSTITUTE/REPLACES (String word set)
@@ -326,7 +368,7 @@ impl ForthVM {
             word_pfa_map: HashMap::new(),
             word_pfa_map_shared: None,
             pending_define: Arc::new(Mutex::new(Vec::new())),
-            pending_compile: Arc::new(Mutex::new(Vec::new())),
+            pending_actions: Arc::new(Mutex::new(Vec::new())),
             pending_does_patch: Arc::new(Mutex::new(None)),
             throw_code: Arc::new(Mutex::new(None)),
             word_lookup: Arc::new(Mutex::new(HashMap::new())),
@@ -343,6 +385,7 @@ impl ForthVM {
             marker_states: HashMap::new(),
             pending_marker_restore: Arc::new(Mutex::new(None)),
             conditional_skip_depth: 0,
+            next_block_label: 0,
             compiling_locals: Vec::new(),
             substitutions: Arc::new(Mutex::new(HashMap::new())),
             search_order: Arc::new(Mutex::new(vec![1])),
@@ -901,6 +944,7 @@ impl ForthVM {
             "WHILE" => return self.compile_while(),
             "REPEAT" => return self.compile_repeat(),
             "?DO" => return self.compile_qdo(),
+            "AHEAD" => return self.compile_ahead(),
             "CASE" => return self.compile_case(),
             "OF" => return self.compile_of(),
             "ENDOF" => return self.compile_endof(),
@@ -982,7 +1026,33 @@ impl ForthVM {
                 //   appends Call(word_id) to the current compilation.
                 //   This uses COMPILE, to signal the outer interpreter.
                 if let Some(next) = self.next_token() {
-                    if let Some((_addr, word_id, is_imm)) = self.dictionary.find(&next) {
+                    let upper = next.to_uppercase();
+                    // Check for compile-time control-flow keywords first
+                    let ctrl_code = match upper.as_str() {
+                        "IF" => Some(CTRL_IF),
+                        "ELSE" => Some(CTRL_ELSE),
+                        "THEN" => Some(CTRL_THEN),
+                        "BEGIN" => Some(CTRL_BEGIN),
+                        "UNTIL" => Some(CTRL_UNTIL),
+                        "WHILE" => Some(CTRL_WHILE),
+                        "REPEAT" => Some(CTRL_REPEAT),
+                        "AGAIN" => Some(CTRL_AGAIN),
+                        "DO" => Some(CTRL_DO),
+                        "LOOP" => Some(CTRL_LOOP),
+                        "+LOOP" => Some(CTRL_PLUS_LOOP),
+                        "AHEAD" => Some(CTRL_AHEAD),
+                        _ => None,
+                    };
+                    if let Some(code) = ctrl_code {
+                        // Compile code that pushes the action code and calls __CTRL__
+                        let ctrl_id = self
+                            .dictionary
+                            .find("__CTRL__")
+                            .map(|(_, id, _)| id)
+                            .ok_or_else(|| anyhow::anyhow!("POSTPONE: __CTRL__ not found"))?;
+                        self.push_ir(IrOp::PushI32(code));
+                        self.push_ir(IrOp::Call(ctrl_id));
+                    } else if let Some((_addr, word_id, is_imm)) = self.dictionary.find(&next) {
                         if is_imm {
                             // Immediate: just compile a call to it
                             self.push_ir(IrOp::Call(word_id));
@@ -1091,7 +1161,7 @@ impl ForthVM {
                 // Execute immediately even in compile mode
                 self.execute_word(word_id)?;
                 // Handle any pending COMPILE, operations from POSTPONE
-                self.handle_pending_compile();
+                self.handle_pending_actions()?;
             } else {
                 self.push_ir(IrOp::Call(word_id));
             }
@@ -1280,6 +1350,56 @@ impl ForthVM {
                     else_body: Some(else_body),
                 });
             }
+            Some(ControlEntry::ForwardBlock { label }) => {
+                // CS-ROLL'd flat forward block: just emit EndBlock
+                self.compiling_ir.push(IrOp::EndBlock(label));
+            }
+            Some(ControlEntry::Ahead {
+                prefix: ahead_prefix,
+            }) => {
+                // AHEAD...THEN: code between is skipped (dead code).
+                let skipped = std::mem::take(&mut self.compiling_ir);
+
+                // Check if a Begin is on the stack (AHEAD + CS-ROLL into a loop).
+                // In that case, the skipped code becomes "skip on first iteration."
+                let begin_idx = self
+                    .control_stack
+                    .iter()
+                    .rposition(|e| matches!(e, ControlEntry::Begin { .. }));
+
+                if let Some(bi) = begin_idx {
+                    if !skipped.is_empty() {
+                        // Replace Begin's prefix (which is dead code between AHEAD and BEGIN)
+                        // with AHEAD's prefix (code before AHEAD that should execute).
+                        if let ControlEntry::Begin { body: ref mut bp } = self.control_stack[bi] {
+                            *bp = ahead_prefix;
+                        }
+                        // Emit a first-iteration guard: allocate a local flag.
+                        let flag_idx = self.compiling_locals.len() as u32;
+                        self.compiling_locals.push("__first_iter__".to_string());
+                        // Push flag init into the Begin's prefix (before the loop)
+                        if let ControlEntry::Begin { body: ref mut bp } = self.control_stack[bi] {
+                            bp.push(IrOp::PushI32(1));
+                            bp.push(IrOp::ForthLocalSet(flag_idx));
+                        }
+                        // In the loop body: if flag==0 execute skipped code, else clear flag
+                        self.compiling_ir.push(IrOp::ForthLocalGet(flag_idx));
+                        self.compiling_ir.push(IrOp::ZeroEq);
+                        self.compiling_ir.push(IrOp::If {
+                            then_body: skipped,
+                            else_body: Some(vec![IrOp::PushI32(0), IrOp::ForthLocalSet(flag_idx)]),
+                        });
+                    } else {
+                        // No code to skip — replace Begin's dead-code prefix
+                        if let ControlEntry::Begin { body: ref mut bp } = self.control_stack[bi] {
+                            *bp = ahead_prefix;
+                        }
+                    }
+                } else {
+                    // Simple case: no loop context, discard skipped code
+                    self.compiling_ir = ahead_prefix;
+                }
+            }
             _ => anyhow::bail!("THEN without matching IF"),
         }
         Ok(())
@@ -1330,9 +1450,15 @@ impl ForthVM {
     fn compile_until(&mut self) -> anyhow::Result<()> {
         match self.control_stack.pop() {
             Some(ControlEntry::Begin { body: prefix }) => {
-                let body = std::mem::take(&mut self.compiling_ir);
+                let mut body = std::mem::take(&mut self.compiling_ir);
+                // Desugar any LoopRestartIfFalse markers from CS-PICK'd UNTIL
+                body = Self::desugar_loop_restarts(body);
                 self.compiling_ir = prefix;
                 self.compiling_ir.push(IrOp::BeginUntil { body });
+            }
+            Some(ControlEntry::BeginRef) => {
+                // CS-PICK'd BEGIN: emit inline conditional restart instead of a full loop
+                self.compiling_ir.push(IrOp::LoopRestartIfFalse);
             }
             _ => anyhow::bail!("UNTIL without matching BEGIN"),
         }
@@ -1544,6 +1670,174 @@ impl ForthVM {
             then_body,
             else_body: Some(else_ir),
         });
+    }
+
+    // -----------------------------------------------------------------------
+    // AHEAD, CS-PICK, CS-ROLL (Programming-Tools)
+    // -----------------------------------------------------------------------
+
+    /// AHEAD — unconditional forward branch. Code between AHEAD and THEN is skipped.
+    fn compile_ahead(&mut self) -> anyhow::Result<()> {
+        let prefix = std::mem::take(&mut self.compiling_ir);
+        self.control_stack.push(ControlEntry::Ahead { prefix });
+        // compiling_ir is now empty — collects dead code between AHEAD and THEN
+        Ok(())
+    }
+
+    /// CS-PICK — ( n -- ) Copy the n-th control-flow stack entry to the top.
+    fn cs_pick(&mut self, n: u32) -> anyhow::Result<()> {
+        let len = self.control_stack.len();
+        if (n as usize) >= len {
+            anyhow::bail!("CS-PICK: index {n} out of range (control stack depth {len})");
+        }
+        let idx = len - 1 - n as usize;
+        let entry = &self.control_stack[idx];
+        match entry {
+            ControlEntry::Begin { .. } => {
+                // CS-PICK of a BEGIN dest: push a reference marker.
+                // When UNTIL resolves this, it emits LoopRestartIfFalse
+                // instead of creating a full BeginUntil.
+                self.control_stack.push(ControlEntry::BeginRef);
+            }
+            _ => {
+                // Clone the entry for all other types
+                let cloned = entry.clone();
+                self.control_stack.push(cloned);
+            }
+        }
+        Ok(())
+    }
+
+    /// CS-ROLL — ( n -- ) Rotate the top n+1 control-flow stack entries.
+    /// 1 CS-ROLL = swap top two entries.
+    /// 2 CS-ROLL = rotate top three (bring 3rd to top).
+    fn cs_roll(&mut self, n: u32) -> anyhow::Result<()> {
+        let len = self.control_stack.len();
+        if (n as usize) >= len {
+            anyhow::bail!("CS-ROLL: index {n} out of range (control stack depth {len})");
+        }
+        if n == 0 {
+            return Ok(());
+        }
+
+        // Check how many If entries are in the top n+1 entries
+        let start = len - 1 - n as usize;
+        let if_count = self.control_stack[start..]
+            .iter()
+            .filter(|e| matches!(e, ControlEntry::If { .. }))
+            .count();
+
+        if if_count >= 2 {
+            // Multiple If entries being reordered: linearize into Block/BranchIfFalse.
+            self.linearize_if_entries(n)?;
+        } else if n == 1 {
+            // 1 CS-ROLL = swap. Check for IF + BEGIN pattern (= WHILE equivalent).
+            let top = self.control_stack.pop();
+            let second = self.control_stack.pop();
+            match (second, top) {
+                (
+                    Some(ControlEntry::Begin { body: prefix }),
+                    Some(ControlEntry::If { then_body: test }),
+                ) => {
+                    // Begin below + If on top → 1 CS-ROLL = WHILE equivalent
+                    self.control_stack
+                        .push(ControlEntry::BeginWhile { test, body: prefix });
+                }
+                (Some(s), Some(t)) => {
+                    // Generic swap
+                    self.control_stack.push(t);
+                    self.control_stack.push(s);
+                }
+                _ => anyhow::bail!("CS-ROLL: control stack underflow"),
+            }
+        } else {
+            // General rotation
+            let idx = len - 1 - n as usize;
+            let entry = self.control_stack.remove(idx);
+            self.control_stack.push(entry);
+        }
+        Ok(())
+    }
+
+    /// Linearize If entries from the control stack into flat Block/BranchIfFalse code.
+    /// Called when CS-ROLL reorders multiple If entries.
+    ///
+    /// Converts nested If prefixes into a linear sequence:
+    /// `Block(label_n) ... Block(label_1) prefix1 BranchIfFalse(label_1) prefix2 BranchIfFalse(label_2) ...`
+    /// Then THENs emit `EndBlock(label)` to close each block.
+    fn linearize_if_entries(&mut self, n: u32) -> anyhow::Result<()> {
+        let len = self.control_stack.len();
+        let start = len - 1 - n as usize;
+
+        // Pop the top n+1 entries
+        let entries: Vec<ControlEntry> = self.control_stack.drain(start..).collect();
+
+        // Assign a label to each If entry, extract its prefix, build linear code
+        let mut labels = Vec::new(); // label per entry (0 for non-If)
+        let mut linear_code = Vec::new();
+        for entry in &entries {
+            if let ControlEntry::If { then_body: prefix } = entry {
+                let label = self.next_block_label;
+                self.next_block_label += 1;
+                labels.push(label);
+                linear_code.extend(prefix.iter().cloned());
+                linear_code.push(IrOp::BranchIfFalse(label));
+            } else {
+                labels.push(u32::MAX); // sentinel for non-If
+            }
+        }
+        // Append current compiling_ir (code compiled after the last IF)
+        linear_code.extend(std::mem::take(&mut self.compiling_ir));
+
+        // Rotate: bring entry at index 0 (= deepest of the n+1) to the top
+        let mut rotated_labels = labels.clone();
+        let first = rotated_labels.remove(0);
+        rotated_labels.push(first);
+
+        // Build Block openings in the order entries appear after rotation
+        // (first entry = outermost block = last to close)
+        let mut blocks = Vec::new();
+        for &label in &rotated_labels {
+            if label != u32::MAX {
+                blocks.push(IrOp::Block(label));
+            }
+        }
+
+        // Final compiling_ir: Block openings + linearized code
+        blocks.extend(linear_code);
+        self.compiling_ir = blocks;
+
+        // Push rotated ForwardBlock entries onto control stack
+        for &label in &rotated_labels {
+            if label != u32::MAX {
+                self.control_stack
+                    .push(ControlEntry::ForwardBlock { label });
+            }
+            // Non-If entries: not supported in the all-If case
+        }
+
+        Ok(())
+    }
+
+    /// Desugar `LoopRestartIfFalse` markers in a loop body into nested `If` nodes.
+    /// Each marker becomes: `If { then_body: [rest...], else_body: Some([PushI32(0)]) }`
+    /// so that a false condition produces 0 for the outer UNTIL to restart the loop.
+    fn desugar_loop_restarts(body: Vec<IrOp>) -> Vec<IrOp> {
+        if let Some(pos) = body
+            .iter()
+            .position(|op| matches!(op, IrOp::LoopRestartIfFalse))
+        {
+            let mut prefix: Vec<IrOp> = body[..pos].to_vec();
+            let rest: Vec<IrOp> = body[pos + 1..].to_vec();
+            let desugared_rest = Self::desugar_loop_restarts(rest);
+            prefix.push(IrOp::If {
+                then_body: desugared_rest,
+                else_body: Some(vec![IrOp::PushI32(0)]),
+            });
+            prefix
+        } else {
+            body
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1910,7 +2204,7 @@ impl ForthVM {
         // Handle pending DOES> patch (runtime DOES> from double-DOES> words)
         self.handle_pending_does_patch()?;
         // Handle pending COMPILE, operations (used by [ ... ] sequences)
-        self.handle_pending_compile();
+        self.handle_pending_actions()?;
         // Handle pending MARKER restore
         self.handle_pending_marker_restore()?;
         // Sync search order from shared state to dictionary
@@ -2347,6 +2641,9 @@ impl ForthVM {
 
         // COMPILE, (compile-comma) for POSTPONE mechanism
         self.register_compile_comma()?;
+
+        // CS-PICK, CS-ROLL, __CTRL__ for Programming-Tools / POSTPONE of control words
+        self.register_cs_pick_roll()?;
 
         // Runtime DOES> patch for double-DOES> support
         self.register_does_patch()?;
@@ -4506,7 +4803,7 @@ impl ForthVM {
     fn register_compile_comma(&mut self) -> anyhow::Result<()> {
         let memory = self.memory;
         let dsp = self.dsp;
-        let pending_compile = Arc::clone(&self.pending_compile);
+        let pending = Arc::clone(&self.pending_actions);
 
         let func = Func::new(
             &mut self.store,
@@ -4521,12 +4818,81 @@ impl ForthVM {
                 let new_sp = sp + 4;
                 dsp.set(&mut caller, Val::I32(new_sp as i32)).unwrap();
                 // Signal the outer interpreter to compile a call to this xt
-                pending_compile.lock().unwrap().push(xt);
+                pending.lock().unwrap().push(PendingAction::CompileCall(xt));
                 Ok(())
             },
         );
 
         self.register_host_primitive("COMPILE,", false, func)?;
+        Ok(())
+    }
+
+    /// Register CS-PICK, CS-ROLL, and __CTRL__ host functions.
+    /// CS-PICK ( n -- ) copies the n-th control-flow stack entry (compile-time).
+    /// CS-ROLL ( n -- ) rotates the top n+1 control-flow stack entries (compile-time).
+    /// __CTRL__ ( code -- ) triggers a compile-time control-flow operation (for POSTPONE).
+    fn register_cs_pick_roll(&mut self) -> anyhow::Result<()> {
+        let memory = self.memory;
+        let dsp = self.dsp;
+
+        // Helper: pop one cell from data stack
+        fn pop_cell(memory: Memory, dsp: Global, caller: &mut wasmtime::Caller<'_, VmHost>) -> i32 {
+            let sp = dsp.get(&mut *caller).unwrap_i32() as u32;
+            let data = memory.data(&*caller);
+            let b: [u8; 4] = data[sp as usize..sp as usize + 4].try_into().unwrap();
+            let val = i32::from_le_bytes(b);
+            dsp.set(&mut *caller, Val::I32((sp + 4) as i32)).unwrap();
+            val
+        }
+
+        // CS-PICK
+        let pending = Arc::clone(&self.pending_actions);
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                let n = pop_cell(memory, dsp, &mut caller);
+                pending
+                    .lock()
+                    .unwrap()
+                    .push(PendingAction::CsPick(n as u32));
+                Ok(())
+            },
+        );
+        self.register_host_primitive("CS-PICK", false, func)?;
+
+        // CS-ROLL
+        let pending = Arc::clone(&self.pending_actions);
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                let n = pop_cell(memory, dsp, &mut caller);
+                pending
+                    .lock()
+                    .unwrap()
+                    .push(PendingAction::CsRoll(n as u32));
+                Ok(())
+            },
+        );
+        self.register_host_primitive("CS-ROLL", false, func)?;
+
+        // __CTRL__ (used by POSTPONE of control-flow keywords)
+        let pending = Arc::clone(&self.pending_actions);
+        let func = Func::new(
+            &mut self.store,
+            FuncType::new(&self.engine, [], []),
+            move |mut caller, _params, _results| {
+                let code = pop_cell(memory, dsp, &mut caller);
+                pending
+                    .lock()
+                    .unwrap()
+                    .push(PendingAction::CompileControl(code));
+                Ok(())
+            },
+        );
+        self.register_host_primitive("__CTRL__", false, func)?;
+
         Ok(())
     }
 
@@ -4824,14 +5190,41 @@ impl ForthVM {
 
     /// Drain `pending_compile` and push `IrOp::Call` for each entry into `compiling_ir`.
     /// Called after executing an immediate word during compilation.
-    fn handle_pending_compile(&mut self) {
-        let pending: Vec<u32> = {
-            let mut v = self.pending_compile.lock().unwrap();
+    /// Process all pending actions from host functions (COMPILE,, CS-PICK, CS-ROLL, etc.).
+    fn handle_pending_actions(&mut self) -> anyhow::Result<()> {
+        let actions: Vec<PendingAction> = {
+            let mut v = self.pending_actions.lock().unwrap();
             std::mem::take(&mut *v)
         };
-        for xt in pending {
-            self.push_ir(IrOp::Call(WordId(xt)));
+        for action in actions {
+            match action {
+                PendingAction::CompileCall(xt) => {
+                    self.push_ir(IrOp::Call(WordId(xt)));
+                }
+                PendingAction::CsPick(n) => {
+                    self.cs_pick(n)?;
+                }
+                PendingAction::CsRoll(n) => {
+                    self.cs_roll(n)?;
+                }
+                PendingAction::CompileControl(code) => match code {
+                    CTRL_IF => self.compile_if()?,
+                    CTRL_ELSE => self.compile_else()?,
+                    CTRL_THEN => self.compile_then()?,
+                    CTRL_BEGIN => self.compile_begin()?,
+                    CTRL_UNTIL => self.compile_until()?,
+                    CTRL_WHILE => self.compile_while()?,
+                    CTRL_REPEAT => self.compile_repeat()?,
+                    CTRL_AGAIN => self.compile_again()?,
+                    CTRL_DO => self.compile_do()?,
+                    CTRL_LOOP => self.compile_loop(false)?,
+                    CTRL_PLUS_LOOP => self.compile_loop(true)?,
+                    CTRL_AHEAD => self.compile_ahead()?,
+                    _ => anyhow::bail!("unknown control code: {code}"),
+                },
+            }
         }
+        Ok(())
     }
 
     /// Handle a pending runtime DOES> patch.
@@ -8607,6 +9000,62 @@ mod tests {
         vm.evaluate(": GT7 POSTPONE GT6 ;").unwrap();
         vm.evaluate("GT7").unwrap();
         assert_eq!(vm.data_stack(), vec![345]);
+    }
+
+    // ===================================================================
+    // CS-PICK, CS-ROLL, AHEAD (Programming-Tools)
+    // ===================================================================
+
+    #[test]
+    fn test_ahead_simple() {
+        // : PT1 AHEAD 1111 2222 THEN 3333 ;
+        // PT1 -> 3333
+        assert_eq!(
+            eval_stack(": PT1 AHEAD 1111 2222 THEN 3333 ; PT1"),
+            vec![3333]
+        );
+    }
+
+    #[test]
+    fn test_cs_pick_repeat() {
+        // ?REPEAT = 0 CS-PICK POSTPONE UNTIL (immediate)
+        // 6 PT5 -> 111 111 222 111 222 333 111 222 333
+        assert_eq!(
+            eval_stack(
+                ": ?REPEAT 0 CS-PICK POSTPONE UNTIL ; IMMEDIATE \
+                 VARIABLE PT4 \
+                 : PT5 PT4 ! BEGIN -1 PT4 +! PT4 @ 4 > 0= ?REPEAT \
+                 111 PT4 @ 3 > 0= ?REPEAT 222 PT4 @ 2 > 0= ?REPEAT \
+                 333 PT4 @ 1 = UNTIL ; \
+                 6 PT5"
+            ),
+            vec![333, 222, 111, 333, 222, 111, 222, 111, 111]
+        );
+    }
+
+    #[test]
+    fn test_cs_roll_while_equiv() {
+        // ?DONE = POSTPONE IF 1 CS-ROLL (same as WHILE)
+        assert_eq!(
+            eval_stack(
+                ": ?DONE POSTPONE IF 1 CS-ROLL ; IMMEDIATE \
+                 : PT6 >R BEGIN R@ ?DONE R@ R> 1- >R REPEAT R> DROP ; \
+                 5 PT6"
+            ),
+            vec![1, 2, 3, 4, 5]
+        );
+    }
+
+    #[test]
+    fn test_cs_roll_mix_up() {
+        // MIX_UP = 2 CS-ROLL (CS-ROT)
+        let setup = ": MIX_UP 2 CS-ROLL ; IMMEDIATE \
+                      : PT7 IF 1111 ROT ROT IF 2222 SWAP IF \
+                      3333 MIX_UP THEN 4444 THEN 5555 THEN 6666 ;";
+        assert_eq!(
+            eval_stack(&format!("{setup} -1 -1 -1 PT7")),
+            vec![6666, 5555, 4444, 3333, 2222, 1111]
+        );
     }
 
     // ===================================================================
