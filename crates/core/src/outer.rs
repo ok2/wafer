@@ -2584,6 +2584,7 @@ impl<R: Runtime> ForthVM<R> {
 
         // -- Programming-Tools word set --
         self.register_n_to_r()?;
+        self.register_words()?;
 
         // -- Search-Order word set --
         self.register_search_order()?;
@@ -4704,6 +4705,7 @@ impl<R: Runtime> ForthVM<R> {
                         self.dictionary.set_current_wid(top);
                     }
                 }
+                40 => self.do_words(),
                 _ => {}
             }
         }
@@ -5328,6 +5330,16 @@ impl<R: Runtime> ForthVM<R> {
         Ok(())
     }
 
+    /// WORDS ( -- ) Print all visible dictionary words.
+    fn do_words(&mut self) {
+        let names = self.dictionary.visible_words();
+        let mut out = self.output.lock().unwrap();
+        for name in &names {
+            out.push_str(name);
+            out.push(' ');
+        }
+    }
+
     /// Register Search-Order word set words.
     fn register_search_order(&mut self) -> anyhow::Result<()> {
         // FORTH-WORDLIST ( -- wid )
@@ -5550,6 +5562,17 @@ impl<R: Runtime> ForthVM<R> {
         });
         self.register_host_primitive("NR>", false, func)?;
 
+        Ok(())
+    }
+
+    /// Register WORDS for the Programming-Tools word set.
+    fn register_words(&mut self) -> anyhow::Result<()> {
+        let pending = Arc::clone(&self.pending_define);
+        let func: HostFn = Box::new(move |_ctx: &mut dyn HostAccess| {
+            pending.lock().unwrap().push(40); // WORDS action
+            Ok(())
+        });
+        self.register_host_primitive("WORDS", false, func)?;
         Ok(())
     }
 
@@ -7940,6 +7963,27 @@ mod tests {
             eval_stack(&format!("{setup} -1 -1 -1 PT7")),
             vec![6666, 5555, 4444, 3333, 2222, 1111]
         );
+    }
+
+    // ===================================================================
+    // WORDS (Programming-Tools)
+    // ===================================================================
+
+    #[test]
+    fn test_words_lists_defined_words() {
+        let output = eval_output("WORDS");
+        // Should contain standard primitives
+        assert!(output.contains("DUP"));
+        assert!(output.contains("DROP"));
+        assert!(output.contains("SWAP"));
+        assert!(output.contains("+"));
+        assert!(output.contains("WORDS"));
+    }
+
+    #[test]
+    fn test_words_includes_user_defined() {
+        let output = eval_output(": MYTEST 42 ; WORDS");
+        assert!(output.contains("MYTEST"));
     }
 
     // ===================================================================

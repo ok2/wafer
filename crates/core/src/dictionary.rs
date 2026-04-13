@@ -409,6 +409,28 @@ impl Dictionary {
         Ok(())
     }
 
+    /// Return names of all visible (non-hidden) words, newest first.
+    pub fn visible_words(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut addr = self.latest;
+        while addr != 0 {
+            let flags_byte = self.memory[(addr + 4) as usize];
+            if flags_byte & flags::HIDDEN == 0 {
+                let name_len = (flags_byte & flags::LENGTH_MASK) as usize;
+                let name_start = (addr + 5) as usize;
+                let name = String::from_utf8_lossy(&self.memory[name_start..name_start + name_len])
+                    .to_string();
+                names.push(name);
+            }
+            let link = self.read_u32_unchecked(addr);
+            if link == addr {
+                break;
+            }
+            addr = link;
+        }
+        names
+    }
+
     /// Get a reference to the raw memory buffer.
     pub fn memory(&self) -> &[u8] {
         &self.memory
