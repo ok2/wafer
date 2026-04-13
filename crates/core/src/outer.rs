@@ -2364,6 +2364,7 @@ impl<R: Runtime> ForthVM<R> {
         // -- I/O --
         self.register_primitive("EMIT", false, vec![IrOp::Emit])?;
         self.register_primitive("CR", false, vec![IrOp::Cr])?;
+        self.register_primitive("PAGE", false, vec![IrOp::PushI32(0x0C), IrOp::Emit])?;
 
         // -- Constants --
         self.register_primitive("TRUE", false, vec![IrOp::PushI32(-1)])?;

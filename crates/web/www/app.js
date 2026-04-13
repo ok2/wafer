@@ -66,7 +66,12 @@ function evaluate(line) {
   historyIdx = history.length;
 
   try {
-    const result = repl.evaluate(trimmed);
+    let result = repl.evaluate(trimmed);
+    // PAGE (form feed) clears the screen
+    if (result.includes('\x0C')) {
+      output.innerHTML = '';
+      result = result.replaceAll('\x0C', '');
+    }
     // Show input + output on one line (traditional Forth style)
     const combined = result.length > 0 ? `${trimmed} ${result} ok` : `${trimmed}  ok`;
     appendLine(combined, 'line-ok');
@@ -230,11 +235,15 @@ async function boot() {
 
     // Restore and run init code
     const saved = localStorage.getItem('wafer-init-code');
-    if (saved) {
+    if (saved !== null) {
       document.getElementById('init-code').value = saved;
-      for (const line of saved.split('\n')) {
+    }
+    const initCode = document.getElementById('init-code').value;
+    if (initCode.trim()) {
+      for (const line of initCode.split('\n')) {
         if (line.trim()) evaluate(line);
       }
+      localStorage.setItem('wafer-init-code', initCode);
     }
 
     // Load from URL hash if present

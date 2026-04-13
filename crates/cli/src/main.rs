@@ -312,6 +312,11 @@ fn cmd_eval_or_repl(file: Option<&str>) -> anyhow::Result<()> {
                             match vm.evaluate(&line) {
                                 Ok(()) => {
                                     let output = vm.take_output();
+                                    // PAGE (form feed) clears the terminal
+                                    if output.contains('\x0C') {
+                                        print!("\x1b[2J\x1b[H");
+                                    }
+                                    let output = output.replace('\x0C', "");
                                     if !vm.is_compiling() {
                                         // Move cursor back up to end of input line so
                                         // output appears inline, like traditional Forth:
