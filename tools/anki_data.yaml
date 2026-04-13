@@ -1,0 +1,718 @@
+# WAFER Anki Card Data
+# Hand-crafted cards for architecture, design decisions, and "why" questions.
+# Auto-generated cards (IrOp variants, memory addresses, etc.) are created by anki_gen.py.
+
+# ============================================================================
+# CATEGORY A: Architecture
+# ============================================================================
+architecture:
+
+  - front: "What are the 5 stages of the WAFER compilation pipeline?"
+    back: "Forth Source → Outer Interpreter (tokenize + dispatch) → IR (Vec<IrOp>) → Optimizer (6 passes) → WASM Codegen (wasm-encoder) → wasmtime execution"
+    code: |
+      // lib.rs doc comment:
+      // Forth Source -> Outer Interpreter -> IR -> Optimize -> WASM Codegen
+    source: "crates/core/src/lib.rs:9"
+    tags: [architecture, basic]
+
+  - front: "What crate does WAFER use to generate WASM bytecode?"
+    back: "`wasm-encoder` — builds WASM modules programmatically (types, imports, functions, code sections). NOT a text-format assembler."
+    source: "crates/core/src/codegen.rs:12"
+    tags: [architecture, basic]
+
+  - front: "What crate does WAFER use to execute WASM modules?"
+    back: "`wasmtime` — Bytecode Alliance WASM runtime. Provides Engine, Store, Module, Instance, Memory, Global, Table, Func."
+    source: "crates/core/src/outer.rs:14"
+    tags: [architecture, basic]
+
+  - front: "How many source files are in wafer-core? Name them."
+    back: "12 files: outer.rs (9820), codegen.rs (4205), optimizer.rs (1013), dictionary.rs (906), export.rs (409), runner.rs (402), ir.rs (259), consolidate.rs (169), memory.rs (148), error.rs (84), config.rs (61), lib.rs (28), js_loader.rs (163)"
+    tags: [architecture, basic]
+
+  - front: "What is the relationship between a Forth word and a WASM module in WAFER?"
+    back: "Each compiled Forth word becomes its own WASM module with one function. Modules share memory, globals (dsp/rsp/fsp), and a function table via wasmtime imports. Words call each other via call_indirect through the shared table."
+    tags: [architecture, intermediate]
+
+  - front: "What are the 6 imports every WAFER WASM module expects?"
+    back: |
+      1. emit (func: i32 → void) — character output callback
+      2. memory (16 pages = 1 MiB) — shared linear memory
+      3. dsp (global mut i32) — data stack pointer
+      4. rsp (global mut i32) — return stack pointer
+      5. fsp (global mut i32) — float stack pointer
+      6. table (funcref) — shared function table for call_indirect
+    source: "crates/core/src/codegen.rs:25-41"
+    tags: [architecture, intermediate]
+
+  - front: "What are the 3 types of words in WAFER?"
+    back: |
+      1. IR primitives — compiled to WASM via Vec<IrOp>, inlineable (DUP, +, @)
+      2. Host functions — Rust closures in wasmtime, NOT inlineable (., .S, M*, ACCEPT)
+      3. Forth-defined words — compiled by outer interpreter (: SQUARE DUP * ;)
+    source: "crates/core/src/outer.rs:2422-2478"
+    tags: [architecture, basic]
+
+  - front: "What is the role of outer.rs in WAFER?"
+    back: "Contains ForthVM<R: Runtime> — the complete Forth virtual machine, generic over execution backend. Outer interpreter (tokenize → lookup → interpret/compile), all primitive registration, control-flow compilation, DOES> support. 8703 lines."
+    source: "crates/core/src/outer.rs:1"
+    tags: [architecture, basic]
+
+  - front: "What is the Runtime trait and why does it exist?"
+    back: |
+      Defined in runtime.rs. Abstracts over WASM execution backends:
+      - Memory r/w (mem_read_i32, mem_write_slice, etc.)
+      - Globals (get/set_dsp, rsp, fsp)
+      - Table (table_size, ensure_table_size)
+      - Module lifecycle (instantiate_and_install, call_func)
+      - Host functions (register_host_func)
+      Two implementations: NativeRuntime (wasmtime), WebRuntime (js-sys).
+      ForthVM<R: Runtime> is completely decoupled from any specific WASM engine.
+    source: "crates/core/src/runtime.rs:72"
+    tags: [architecture, intermediate]
+
+  - front: "What is HostAccess and how is it used?"
+    back: |
+      Trait for memory/global access from within host function callbacks.
+      Methods: mem_read_i32, mem_write_i32, mem_read_u8, mem_write_u8, mem_read_slice, mem_write_slice, mem_len, get/set_dsp, get/set_rsp, get/set_fsp, call_func.
+      NativeRuntime implements it via CallerHostAccess (wrapping wasmtime::Caller).
+      WebRuntime implements it via WebHostAccess (wrapping js_sys typed arrays).
+      HostFn = Box<dyn Fn(&mut dyn HostAccess) -> Result<()>> — same closure works on both runtimes.
+    source: "crates/core/src/runtime.rs:17"
+    tags: [architecture, intermediate]
+
+  - front: "What are the 3 crates in the WAFER workspace?"
+    back: |
+      1. wafer-core — compiler, optimizer, codegen, dictionary, Runtime trait, outer interpreter
+         Feature flags: default=["native"], "native" enables wasmtime
+      2. wafer (cli) — CLI REPL (rustyline), wafer build/run commands
+      3. wafer-web — browser REPL (wasm-bindgen + WebRuntime + HTML/CSS/JS frontend)
+    source: "Cargo.toml workspace"
+    tags: [architecture, basic]
+
+  - front: "What is NativeRuntime?"
+    back: |
+      Wasmtime-based implementation of Runtime trait (runtime_native.rs, 328 lines).
+      Owns: Engine, Store<NativeVmHost>, Memory, Table, Globals (dsp/rsp/fsp), emit_func.
+      instantiate_and_install: Module::new + Instance::new with 6 imports.
+      register_host_func: creates wasmtime Func that bridges HostFn → CallerHostAccess.
+      Behind "native" feature flag.
+    source: "crates/core/src/runtime_native.rs:107"
+    tags: [architecture, intermediate]
+
+  - front: "What is WebRuntime?"
+    back: |
+      Browser-based implementation of Runtime trait (crates/web/runtime_web.rs, 542 lines).
+      Uses js_sys::WebAssembly for module instantiation.
+      Memory: JsValue wrapping WebAssembly.Memory, accessed via Int32Array/Uint8Array views.
+      Globals: JsValue wrapping WebAssembly.Global objects.
+      Host functions: JS closures created via Closure::wrap, stored in _closures Vec to prevent GC.
+      Runs entirely in the browser — no wasmtime dependency.
+    source: "crates/web/src/runtime_web.rs:12"
+    tags: [architecture, intermediate]
+
+  - front: "What is WaferRepl?"
+    back: |
+      The wasm-bindgen entry point in crates/web/src/lib.rs.
+      Wraps ForthVM<WebRuntime>.
+      Methods: new() (create VM), evaluate(input) (returns output), data_stack(), is_compiling(), reset().
+      Built with: wasm-pack build --target web --out-dir www/pkg
+    source: "crates/web/src/lib.rs:13"
+    tags: [architecture, intermediate]
+
+  - front: "What feature flags does wafer-core have?"
+    back: |
+      default = ["native"]
+      native — enables dep:wasmtime and all native-only modules:
+        runtime_native.rs, runner.rs, export.rs, consolidate.rs, js_loader.rs
+      Without "native" — pure Rust only: dictionary, IR, optimizer, codegen, outer interpreter, runtime trait.
+      wafer-web uses wafer-core without "native" feature.
+    source: "crates/core/Cargo.toml:11-12"
+    tags: [architecture, intermediate]
+
+  - front: "What is the role of codegen.rs?"
+    back: "Translates optimized IR (Vec<IrOp>) to WASM bytecode using wasm-encoder. Handles DSP caching, scratch locals, stack-to-local promotion. Builds complete WASM modules including imports, types, function sections."
+    source: "crates/core/src/codegen.rs:1"
+    tags: [architecture, basic]
+
+  - front: "What is batch_mode in ForthVM and why does it exist?"
+    back: "During boot (register_primitives), batch_mode=true defers WASM compilation. All ~40 IR primitives are collected, then compiled into a single WASM module via compile_batch(). This amortizes runtime compilation overhead — one rt.instantiate_and_install() instead of 40."
+    code: |
+      self.batch_mode = true;
+      // ... register all primitives ...
+      // deferred_ir.push((word_id, ir_body));
+      self.compile_batch()?;
+    source: "crates/core/src/outer.rs"
+    tags: [architecture, advanced]
+
+# ============================================================================
+# CATEGORY B: Design Decisions ("Why" cards)
+# ============================================================================
+design_decisions:
+
+  - front: "Why does each Forth word compile to its own WASM module?"
+    back: |
+      1. Incremental compilation: defining a new word doesn't recompile anything
+      2. Isolation: each word is independently validated by wasmtime
+      3. wasmtime linking model: modules share imports (memory, globals, table)
+      4. REPL-friendly: immediate feedback, no whole-program recompile
+      Trade-off: call_indirect overhead between words (mitigated by CONSOLIDATE)
+    tags: [design, advanced]
+
+  - front: "Why use an IR instead of compiling Forth directly to WASM?"
+    back: |
+      1. Optimization: IR enables peephole, constant folding, inlining, DCE, tail calls
+      2. Separation of concerns: outer interpreter doesn't need to know WASM encoding
+      3. Portability: IR could target other backends
+      4. Testability: IR is easy to inspect and test
+      5. Consolidation: IR bodies are stored for later recompilation into single module
+    tags: [design, advanced]
+
+  - front: "Why does WAFER use wasm-encoder + wasmtime instead of Cranelift directly?"
+    back: |
+      1. Standard WASM: output is valid .wasm, can run in browsers AND natively
+      2. Runtime abstraction: same WASM bytes work on wasmtime (CLI) and browser (js-sys)
+      3. wasmtime handles Cranelift internally — best JIT performance for free
+      4. Portability: WASM is platform-independent
+      5. Validation: wasmtime validates modules, catching codegen bugs
+      6. wasm-encoder is simple: just build bytes, no complex IR
+    tags: [design, advanced]
+
+  - front: "Why was the Runtime trait introduced?"
+    back: |
+      To support the browser REPL without duplicating the entire ForthVM.
+      Before: ForthVM directly owned wasmtime types (Engine, Store, Memory, etc.)
+      After: ForthVM<R: Runtime> is generic — same compiler code works with:
+      - NativeRuntime (wasmtime) for CLI/tests/AOT
+      - WebRuntime (js-sys) for browser
+      Host functions use HostFn = Box<dyn Fn(&mut dyn HostAccess)> — one closure definition serves both runtimes.
+      The refactor extracted ~1100 lines of wasmtime-specific code from outer.rs into runtime_native.rs.
+    tags: [design, advanced]
+
+  - front: "Why are stacks in linear memory instead of WASM locals?"
+    back: |
+      Default: stacks live in linear memory (data stack at 0x0600, grows down).
+      Reason: Forth semantics require stack introspection (DEPTH, PICK, SP@), which WASM locals can't provide.
+      Optimization: stack-to-local promotion lifts values into WASM locals when the compiler can prove stack depth is statically known (no calls, no SP@). Best of both worlds.
+    tags: [design, advanced]
+
+  - front: "Why is the DSP cached in a WASM local?"
+    back: |
+      The data stack pointer (dsp) is a wasmtime global. Globals are slower than locals. So:
+      1. At function entry: local.get $dsp_global → local.set $cached_dsp
+      2. During function: all stack ops use local $cached_dsp
+      3. Before calls: write back local → global (callee needs correct dsp)
+      4. After calls: reload local from global (callee may have changed dsp)
+      5. At function exit: write back
+      Net effect: most operations avoid global access overhead.
+    code: |
+      const CACHED_DSP_LOCAL: u32 = 0;
+      fn dsp_writeback(f) { local.get 0; global.set $dsp }
+      fn dsp_reload(f) { global.get $dsp; local.set 0 }
+    source: "crates/core/src/codegen.rs:56-181"
+    tags: [design, advanced]
+
+  - front: "Why does boot.fth replace Rust host functions with Forth definitions?"
+    back: |
+      1. Self-hosting goal: maximize Forth, minimize Rust
+      2. Performance: compiled Forth with inlining + optimization beats host function dispatch (call_indirect → Rust closure has overhead)
+      3. Inlinability: Forth definitions have IR bodies that the optimizer can inline; host functions cannot be inlined
+      4. Consolidation: Forth words participate in single-module recompilation (direct calls); host functions always use call_indirect
+    source: "crates/core/boot.fth:1-3"
+    tags: [design, advanced]
+
+  - front: "Why does WAFER use -1 (all bits set) for TRUE instead of 1?"
+    back: |
+      Forth 2012 standard: TRUE = -1 (0xFFFFFFFF). All bits set.
+      Reason: allows bitwise AND as a conditional select: flag AND value.
+      If TRUE were 1, AND would only preserve the lowest bit.
+      With -1: TRUE AND x = x (identity). FALSE AND x = 0.
+    code: |
+      // In codegen, bool_to_forth_flag:
+      // 0 - result: if result=1 => -1, if result=0 => 0
+      f.instruction(&I32Const(0));
+      f.instruction(&LocalGet(tmp));
+      f.instruction(&I32Sub);
+    source: "crates/core/src/codegen.rs:214-222"
+    tags: [design, intermediate]
+
+  - front: "Why does the optimizer run peephole 5 times across the pipeline?"
+    back: |
+      Each optimization pass can create new peephole opportunities:
+      - After inline: inlined body may have adjacent ops that simplify
+      - After constant fold: folded constants may create identity patterns (PushI32(0), Add)
+      - After strength reduce: new patterns from reduced ops
+      - After DCE: dead code removal may leave adjacent simplifiable ops
+      The peephole pass itself runs to fixpoint (inner loop), but the outer pipeline runs it 5 times at different stages.
+    code: |
+      // Phase 1: peephole → fold → strength → peephole
+      // Phase 2: inline → peephole → fold → strength → peephole
+      // Phase 3: dce → peephole
+      // Phase 4: tail_call
+    source: "crates/core/src/optimizer.rs:37-85"
+    tags: [design, advanced]
+
+  - front: "Why is tail call detection the LAST optimizer pass?"
+    back: |
+      1. TailCall emits WASM `return` after the call — if inlining converts TailCall back to Call (detailcall), early tail-call detection is wasted
+      2. DCE might eliminate the tail position entirely
+      3. Need return-stack balance check on FINAL IR, not intermediate
+      4. Inlining must happen first so we know which calls remain
+    source: "crates/core/src/optimizer.rs:79-84"
+    tags: [design, advanced]
+
+  - front: "Why can't words with Exit be inlined?"
+    back: |
+      WASM `return` exits the CURRENT function. If an inlined word contains Exit (→ return), it would exit the CALLER's function, not just the inlined code. There's no 'return from inline' in WASM. The contains_exit() guard prevents this.
+    code: |
+      fn contains_exit(ops: &[IrOp]) -> bool {
+          // Also blocks ForthLocalGet/Set — would collide with caller's locals
+          matches!(op, IrOp::Exit | IrOp::ForthLocalGet(_) | IrOp::ForthLocalSet(_))
+      }
+    source: "crates/core/src/optimizer.rs:633-664"
+    tags: [design, advanced]
+
+  - front: "Why does CONSOLIDATE exist?"
+    back: |
+      Normal JIT: each word = separate module, calls via call_indirect (table lookup).
+      CONSOLIDATE: merges all JIT-compiled words into ONE module.
+      - call_indirect → direct `call` (for words in the module)
+      - wasmtime can optimize across call boundaries
+      - ~2-3x speedup for call-heavy code
+      External calls (host functions) remain call_indirect.
+    source: "crates/core/src/consolidate.rs:1-9"
+    tags: [design, advanced]
+
+  - front: "Why does WAFER use a linked list for the dictionary instead of a hash map?"
+    back: |
+      1. Forth standard specifies linked-list traversal semantics (TRAVERSE-WORDLIST)
+      2. Dictionary lives in linear memory (simulates WASM memory layout)
+      3. Standard requires specific entry format (link + flags + name + code field)
+      BUT: WAFER also has a HashMap index for O(1) fast-path lookup, falling back to linked-list walk for words not yet indexed. Best of both worlds.
+    source: "crates/core/src/dictionary.rs:10-48"
+    tags: [design, intermediate]
+
+  - front: "Why does WAFER store Forth flags as -1/0 instead of 1/0 in comparisons?"
+    back: |
+      Forth 2012 standard requires: TRUE = -1 (all bits set), FALSE = 0.
+      WASM comparisons produce 0/1, so codegen must convert:
+        bool_to_forth_flag: 0 - result → -1 if true, 0 if false
+      This is a single i32.sub instruction (cheap).
+    tags: [design, intermediate]
+
+# ============================================================================
+# CATEGORY C: ForthVM Struct
+# ============================================================================
+forthvm:
+
+  - front: "What is `user_here` in ForthVM?"
+    back: "Pointer to next free address in WASM linear memory for user data (variables, CREATE'd words). Separate from dictionary.here() which tracks dictionary-internal allocation. Synced to SYSVAR_HERE (memory offset 12) before each evaluate call."
+    source: "crates/core/src/outer.rs:212"
+    tags: [forthvm, intermediate]
+
+  - front: "What is `ir_bodies` in ForthVM?"
+    back: "HashMap<WordId, Vec<IrOp>> — stores the optimized IR body of every compiled word. Used by: (1) optimizer's inline pass to look up callee bodies, (2) CONSOLIDATE to recompile everything, (3) wafer build to export."
+    source: "crates/core/src/outer.rs:243"
+    tags: [forthvm, intermediate]
+
+  - front: "What is the `control_stack` in ForthVM?"
+    back: "Vec<ControlEntry> — compile-time stack for nested control flow. IF pushes ControlEntry::If, DO pushes ControlEntry::Do, etc. THEN/LOOP/REPEAT pop and emit the corresponding IrOp. Not the runtime return stack — this is purely compile-time."
+    source: "crates/core/src/outer.rs:197"
+    tags: [forthvm, intermediate]
+
+  - front: "What is `pending_actions` in ForthVM?"
+    back: "Arc<Mutex<Vec<PendingAction>>> — queue of actions from host functions that need compiler-side processing. Used by COMPILE, (CompileCall), CS-PICK, CS-ROLL, and POSTPONE of control-flow words. Processed after immediate word returns."
+    source: "crates/core/src/outer.rs:229"
+    tags: [forthvm, advanced]
+
+  - front: "What is `pending_define` in ForthVM?"
+    back: "Arc<Mutex<Vec<i32>>> — signals from host functions to the outer interpreter: 1=CONSTANT, 2=VARIABLE, 3=CREATE, 4=EVALUATE. Host function sets the code, outer interpreter reads it after execution and performs the action."
+    source: "crates/core/src/outer.rs:227"
+    tags: [forthvm, advanced]
+
+  - front: "What does `does_definitions` store?"
+    back: "HashMap<WordId, DoesDefinition> — for each DOES>-based defining word, stores: create_ir (code before DOES>), does_action_id (WordId of code after DOES>), has_create flag. Used when the defining word executes to set up new instances."
+    source: "crates/core/src/outer.rs:216"
+    tags: [forthvm, advanced]
+
+  - front: "What happened to the `emit_func` field in ForthVM?"
+    back: "It moved into the Runtime implementation. NativeRuntime owns emit_func as a wasmtime::Func. WebRuntime creates it as a JS closure. ForthVM no longer directly holds wasmtime types — it only interacts via the Runtime trait."
+    source: "crates/core/src/runtime_native.rs:116"
+    tags: [forthvm, intermediate]
+
+  - front: "What are `two_value_words` and `fvalue_words`?"
+    back: "HashSet<u32> tracking which word IDs are 2VALUEs or FVALUEs. TO needs to know: regular VALUE stores 1 cell, 2VALUE stores 2 cells, FVALUE stores 1 float (8 bytes). Without these sets, TO wouldn't know the storage semantics."
+    source: "crates/core/src/outer.rs:237-239"
+    tags: [forthvm, advanced]
+
+  - front: "How many fields does ForthVM have? Name the major groups."
+    back: |
+      ~35 fields in 7 groups:
+      1. Runtime: rt: R (generic — replaces old engine/store/memory/table/dsp/rsp/fsp/emit_func)
+      2. Compilation: state, compiling_name, compiling_ir, control_stack, compiling_word_id, compiling_locals
+      3. Output: output (Arc<Mutex<String>>)
+      4. Dictionary bridge: dictionary, user_here, here_cell, base_cell
+      5. Word metadata: ir_bodies, host_word_names, word_pfa_map, does_definitions
+      6. Host function shared state: pending_define, pending_actions, pending_does_patch, throw_code, word_lookup
+      7. Config + advanced: config, batch_mode, deferred_ir, marker_states, conditional_skip_depth, substitutions, search_order, next_wid, toplevel_ir
+    source: "crates/core/src/outer.rs:173-260"
+    tags: [forthvm, advanced]
+
+# ============================================================================
+# CATEGORY D: Codegen Details
+# ============================================================================
+codegen:
+
+  - front: "What WASM local index is the cached DSP?"
+    back: "Local 0 (CACHED_DSP_LOCAL). At function entry: global.get $dsp → local.set 0. All stack ops use local 0. Scratch locals start at SCRATCH_BASE = 1."
+    source: "crates/core/src/codegen.rs:58-61"
+    tags: [codegen, basic]
+
+  - front: "What does `dsp_writeback` do and when is it called?"
+    back: "Writes the cached DSP local back to the $dsp global: `local.get 0; global.set $dsp`. Called before: (1) call_indirect/call (callee needs correct dsp), (2) function exit (return)."
+    code: |
+      fn dsp_writeback(f: &mut Function) {
+          f.instruction(&LocalGet(CACHED_DSP_LOCAL))
+           .instruction(&GlobalSet(DSP));
+      }
+    source: "crates/core/src/codegen.rs:167-173"
+    tags: [codegen, intermediate]
+
+  - front: "How does codegen emit IrOp::Dup?"
+    back: |
+      Dup = peek top of stack, push copy:
+      1. peek(f): local.get $dsp; i32.load (value now on WASM operand stack)
+      2. push_via_local(f, SCRATCH_BASE): local.set $tmp; dsp_dec; local.get $dsp; local.get $tmp; i32.store
+    source: "crates/core/src/codegen.rs:359-362"
+    tags: [codegen, intermediate]
+
+  - front: "How does codegen emit IrOp::Call(id)?"
+    back: |
+      1. dsp_writeback (callee needs correct dsp)
+      2. If id == self_word_id (self-recursion): emit direct `call WORD_FUNC`
+      3. Else: i32.const fn_index; call_indirect (type_void, table 0)
+      4. dsp_reload (callee may have changed dsp)
+    source: "crates/core/src/codegen.rs (emit_op Call branch)"
+    tags: [codegen, intermediate]
+
+  - front: "What is EmitCtx and what fields does it have?"
+    back: |
+      Carries context for WASM code emission:
+      - f64_local_0, f64_local_1: scratch locals for float ops
+      - forth_local_base: base WASM local for Forth locals ({: ... :})
+      - loop_local_base: base local for DO/LOOP index/limit pairs
+      - loop_locals: Vec<(index_local, limit_local)> stack for nested loops
+      - fast_loop_depth: nesting depth of loops using local fast path
+      - self_word_id: Option<WordId> for self-recursion detection
+      - open_blocks: Vec<u32> for flat forward branches (CS-ROLL)
+    source: "crates/core/src/codegen.rs:229-250"
+    tags: [codegen, advanced]
+
+  - front: "What are TYPE_VOID and TYPE_I32 in codegen?"
+    back: "Type section indices: TYPE_VOID=0 is () → () (used by most word functions and call_indirect), TYPE_I32=1 is (i32) → () (used by the emit import function)."
+    source: "crates/core/src/codegen.rs:44-45"
+    tags: [codegen, basic]
+
+  - front: "How does the codegen handle DO/LOOP?"
+    back: |
+      Fast path: index and limit stored in WASM locals (no return stack).
+      - DO: pop limit and index from data stack into locals
+      - Loop body: I (RFetch) reads from index local
+      - LOOP: increment index local, compare with limit, br_if to loop start
+      - LEAVE: set SYSVAR_LEAVE_FLAG, break out of loop
+      Fallback: if loop is too complex, use return stack (rpush/rpop).
+    source: "crates/core/src/codegen.rs (DoLoop handling)"
+    tags: [codegen, advanced]
+
+# ============================================================================
+# CATEGORY E: Boot.fth
+# ============================================================================
+boot_fth:
+
+  - front: "What are the 7 phases of boot.fth?"
+    back: |
+      1. Stack/memory: DEPTH, PICK, 2OVER, 2ROT, WITHIN, 2@, 2!, FILL, CMOVE, MOVE, ERASE, /STRING, -TRAILING
+      2. Double-cell arithmetic: D+, DNEGATE, D-, DABS, D0=, D0<, D=, D<, D2*, D2/, DMAX, DMIN, M+, DU<
+      3. Mixed arithmetic: SM/REM, FM/MOD, */, */MOD
+      4. HERE and ALIGNED: HERE, ALLOT, comma, C-comma, ALIGN
+      5. I/O + pictured numeric output: TYPE, SPACES, <# HOLD HOLDS SIGN # #S #> . U. .R U.R D. D.R
+      6. DEFER support: DEFER!, DEFER@
+      7. String ops + misc: COMPARE, -TRAILING, SOURCE, FALIGNED, SFALIGNED, DFALIGNED
+    source: "crates/core/boot.fth"
+    tags: [boot, intermediate]
+
+  - front: "How is DEPTH defined in boot.fth and why?"
+    back: |
+      : DEPTH  SP@ 5632 SWAP - 2 RSHIFT ;
+      5632 = DATA_STACK_TOP (0x1600). Stack grows down, so depth = (top - sp) / 4.
+      SP@ must come first — it reads dsp BEFORE DEPTH's own literal pushes affect it.
+      2 RSHIFT = divide by 4 (arithmetic right shift, CELL_SIZE=4).
+    code: |
+      : DEPTH  SP@ 5632 SWAP - 2 RSHIFT ;
+    source: "crates/core/boot.fth:12"
+    tags: [boot, intermediate]
+
+  - front: "What magic numbers appear in boot.fth and what do they mean?"
+    back: |
+      5632 (0x1600) = DATA_STACK_TOP
+      1472 (0x05C0) = PICT_BUF_TOP (also WORD_BUF_BASE)
+      12 = SYSVAR_HERE offset
+      28 = SYSVAR_HLD offset
+      64 = INPUT_BUFFER_BASE
+      24 = SYSVAR_NUM_TIB offset
+    source: "crates/core/boot.fth"
+    tags: [boot, intermediate]
+
+  - front: "How does pictured numeric output work in boot.fth?"
+    back: |
+      <# initializes HLD to PICT_BUF_TOP (1472)
+      HOLD decrements HLD and stores a character (grows downward)
+      # extracts one digit: divides ud by BASE via two UM/MODs, converts digit to ASCII, HOLDs it
+      #S calls # repeatedly until ud is zero
+      #> returns (c-addr u) pointing to the formatted string in the pictured buffer
+      SIGN adds '-' if the original number was negative
+    code: |
+      : <#  1472 28 ! ;
+      : HOLD  28 @ 1- DUP 28 ! C! ;
+      : #  BASE @ >R 0 R@ UM/MOD R> SWAP >R UM/MOD
+           SWAP DUP 9 > IF 7 + THEN 48 + HOLD R> ;
+    source: "crates/core/boot.fth:193-224"
+    tags: [boot, advanced]
+
+  - front: "Why is . (dot) defined in Forth instead of as a Rust host function?"
+    back: |
+      : .  DUP ABS 0 <# #S ROT SIGN #> TYPE SPACE ;
+      1. Self-hosting goal: Forth definitions > Rust
+      2. Compiled Forth with inlining beats host function dispatch
+      3. . becomes inlineable (IR body available to optimizer)
+      4. Participates in CONSOLIDATE (direct calls in single module)
+      5. Respects BASE correctly via pictured numeric output
+    source: "crates/core/boot.fth:228"
+    tags: [boot, advanced]
+
+# ============================================================================
+# CATEGORY F: Testing & CLI
+# ============================================================================
+testing:
+
+  - front: "What are eval_output and eval_stack test helpers?"
+    back: |
+      eval_output("forth code") → creates ForthVM, evaluates code, returns output String
+      eval_stack("forth code") → creates ForthVM, evaluates code, returns data stack as Vec<i32>
+      Both create a fresh VM for each test (isolated).
+    source: "crates/core/src/outer.rs (test module)"
+    tags: [testing, basic]
+
+  - front: "How does the compliance test infrastructure work?"
+    back: |
+      1. boot_with_prerequisites(): create VM, load tester.fr, core.fr, utilities.fth, coreexttest.fth
+      2. run_suite(vm, file): reset #ERRORS to 0, load test file, read #ERRORS from data stack
+      3. Assert #ERRORS == 0 for pass
+      4. 11 word sets tested: Core, Core+, CoreExt, Double, Exception, Facility, File, Float, Locals, Memory, String
+    source: "crates/core/tests/compliance.rs"
+    tags: [testing, intermediate]
+
+  - front: "What are the 4 ways to run WAFER?"
+    back: |
+      1. `wafer` — interactive CLI REPL (rustyline, NativeRuntime)
+      2. `wafer file.fth` — evaluate file and exit (NativeRuntime)
+      3. `wafer build file.fth` — compile to .wasm or --native executable
+      4. Browser REPL — wasm-pack build crates/web, serve www/, WebRuntime
+      Also: `wafer run file.wasm` — execute pre-compiled module
+    source: "crates/cli/src/main.rs:58-83"
+    tags: [cli, basic]
+
+  - front: "How does the native executable trick work (wafer build --native)?"
+    back: |
+      1. AOT-compile WASM via wasmtime Engine::precompile_module()
+      2. Read current wafer binary
+      3. Append: [wafer binary] + [precompiled payload] + [metadata JSON] + [24-byte trailer]
+      4. Trailer: payload_len(8) + metadata_len(8) + "WAFEREXE"(8)
+      5. On startup, check_embedded_payload() reads trailer, extracts payload, runs it
+    code: |
+      const NATIVE_MAGIC: &[u8; 8] = b"WAFEREXE";
+      const TRAILER_SIZE: u64 = 24;
+    source: "crates/cli/src/main.rs:12-14"
+    tags: [cli, advanced]
+
+# ============================================================================
+# CATEGORY G: Control Flow Compilation
+# ============================================================================
+control_flow:
+
+  - front: "Name all 13 ControlEntry variants."
+    back: |
+      If, IfElse, Do, Begin, BeginWhile, BeginWhileWhile,
+      PostDoubleWhileRepeat, PostDoubleWhileRepeatElse,
+      Case, Of, QDo, Ahead, BeginRef, ForwardBlock
+    source: "crates/core/src/outer.rs:36-105"
+    tags: [control_flow, advanced]
+
+  - front: "How does IF...ELSE...THEN compile?"
+    back: |
+      1. IF: push ControlEntry::If { then_body: [] }; subsequent IR goes to then_body
+      2. ELSE: pop If, push ControlEntry::IfElse { then_body, else_body: [] }; subsequent IR goes to else_body
+      3. THEN: pop IfElse (or If), emit IrOp::If { then_body, else_body }
+      The IR is a tree — nested bodies, not flat branches.
+    tags: [control_flow, intermediate]
+
+  - front: "How does DO...LOOP compile?"
+    back: |
+      1. DO: push ControlEntry::Do { body: [] }; subsequent IR goes to body
+      2. LOOP: pop Do, emit IrOp::DoLoop { body, is_plus_loop: false }
+      3. +LOOP: same but is_plus_loop: true
+      The limit and index are expected on the data stack before the DoLoop executes.
+    tags: [control_flow, intermediate]
+
+  - front: "How does BEGIN...WHILE...REPEAT compile?"
+    back: |
+      1. BEGIN: push ControlEntry::Begin { body: [] }
+      2. WHILE: pop Begin, push ControlEntry::BeginWhile { test: body, body: [] }
+         (everything before WHILE becomes the test)
+      3. REPEAT: pop BeginWhile, emit IrOp::BeginWhileRepeat { test, body }
+    tags: [control_flow, intermediate]
+
+  - front: "What is CASE...OF...ENDOF...ENDCASE compilation?"
+    back: |
+      1. CASE: push ControlEntry::Case { prefix, endof_branches: [] }
+      2. OF: duplicate test value, compare, pop Case, push ControlEntry::Of
+      3. ENDOF: pop Of, save (test, body) pair, push back Case with new branch
+      4. ENDCASE: pop Case, emit nested If chain from endof_branches
+      Desugared into nested IrOp::If at compile time.
+    tags: [control_flow, advanced]
+
+  - front: "What are CS-PICK and CS-ROLL and why are they complex?"
+    back: |
+      Programming-Tools words that manipulate the compile-time control stack.
+      CS-PICK duplicates a control-flow entry N deep (e.g., reference a BEGIN from inside nested structures).
+      CS-ROLL rotates control-flow entries (e.g., move an IF dest across other structures).
+      Complex because they break the structured control-flow assumption — WAFER linearizes these into Block/BranchIfFalse/EndBlock IR ops for flat forward branches.
+    source: "crates/core/src/outer.rs:99-105"
+    tags: [control_flow, advanced]
+
+# ============================================================================
+# CATEGORY H: Consolidation & Export
+# ============================================================================
+consolidation:
+
+  - front: "What does compile_consolidated_module() produce?"
+    back: |
+      A single WASM module containing ALL compiled Forth words as separate functions.
+      - Each word gets a function index within the module
+      - Call(id) where id is in the module → direct `call N` (not call_indirect)
+      - Call(id) where id is NOT in the module → call_indirect (host functions)
+      - TailCall(id) in module → direct call + return
+    source: "crates/core/src/codegen.rs (compile_consolidated_module)"
+    tags: [consolidation, advanced]
+
+  - front: "What metadata does wafer build embed in the .wasm file?"
+    back: |
+      ExportMetadata in a "wafer" custom section (JSON):
+      - version: 1
+      - entry_table_index: Option<u32>
+      - host_functions: Vec<(table_index, name)>
+      - memory_size: u32
+      - dsp_init, rsp_init, fsp_init: initial stack pointers
+    source: "crates/core/src/export.rs:21-36"
+    tags: [export, intermediate]
+
+# ============================================================================
+# CATEGORY I: Dictionary Details
+# ============================================================================
+dictionary_details:
+
+  - front: "What is the align4 function?"
+    back: "(addr + 3) & !3 — rounds up to next 4-byte boundary. Used to align the code field after variable-length name in dictionary entries."
+    code: |
+      fn align4(addr: u32) -> u32 {
+          (addr + 3) & !3
+      }
+    source: "crates/core/src/dictionary.rs:51-53"
+    tags: [dictionary, basic]
+
+  - front: "What is the hash index in Dictionary?"
+    back: |
+      HashMap<String, Vec<(wid, word_addr, fn_index, is_immediate)>>
+      Maps uppercase name → list of entries across wordlists.
+      find() checks search_order against this index (O(1) average).
+      Fallback: linked-list walk for words not yet in index.
+      Updated by reveal() and set_immediate().
+    source: "crates/core/src/dictionary.rs:43"
+    tags: [dictionary, intermediate]
+
+  - front: "What is DictionaryState and when is it used?"
+    back: |
+      Snapshot of dictionary state: latest, here, next_fn_index, index (HashMap clone).
+      Used by MARKER: save_state() captures current state, restore_state() reverts.
+      Does NOT save the actual memory bytes — just pointers and metadata.
+    source: "crates/core/src/dictionary.rs:502-509"
+    tags: [dictionary, intermediate]
+
+  - front: "How does Dictionary::create() lay out an entry?"
+    back: |
+      Starting at self.here:
+      1. Write link field (4 bytes): points to previous LATEST
+      2. Write flags byte (1 byte): HIDDEN | length (optionally | IMMEDIATE)
+      3. Write name bytes (N bytes, uppercase)
+      4. Zero-pad to 4-byte alignment
+      5. Write code field (4 bytes): next_fn_index (auto-incremented)
+      6. Update latest = entry_start, here = after code field
+    code: |
+      // entry_start = self.here
+      // [link:4][flags:1][name:N][pad:0-3][code:4]
+    source: "crates/core/src/dictionary.rs:74-124"
+    tags: [dictionary, intermediate]
+
+# ============================================================================
+# CATEGORY J: Optimizer Patterns (hand-crafted supplements to auto-generated)
+# ============================================================================
+optimizer_extra:
+
+  - front: "What are the inline criteria?"
+    back: |
+      A Call(id) is inlined if ALL of:
+      1. Body exists in `bodies` HashMap
+      2. body.len() <= max_size (8)
+      3. No self-recursion (contains_call_to check)
+      4. No Exit (would return from caller)
+      5. No ForthLocalGet/Set (would collide with caller's locals)
+      When inlined, TailCall ops are converted back to Call via detailcall().
+    source: "crates/core/src/optimizer.rs:499-526"
+    tags: [optimizer, intermediate]
+
+  - front: "How does tail_call_detect decide if a tail call is safe?"
+    back: |
+      1. IR must be non-empty
+      2. Return stack must be balanced: count ToR and FromR, depth must be 0
+         (Unbalanced means >R without matching R>, which would corrupt return stack on tail call)
+      3. convert_tail_call on last op: Call → TailCall
+      4. Recurses into If branches: if last op is If, check both then/else branches
+    code: |
+      fn is_return_stack_balanced(ops: &[IrOp]) -> bool {
+          let mut depth: i32 = 0;
+          for op in ops {
+              match op {
+                  IrOp::ToR => depth += 1,
+                  IrOp::FromR => depth -= 1,
+                  _ => {}
+              }
+          }
+          depth == 0
+      }
+    source: "crates/core/src/optimizer.rs:671-693"
+    tags: [optimizer, advanced]
+
+  - front: "What is the optimizer pass ordering and why does it matter?"
+    back: |
+      Phase 1 (simplify): peephole → fold → strength_reduce → peephole
+      Phase 2 (inline + re-simplify): inline → peephole → fold → strength_reduce → peephole
+      Phase 3 (eliminate): dce → peephole
+      Phase 4 (finalize): tail_call_detect
+
+      Order matters because:
+      - Inline before fold: inlined body may have constant expressions
+      - Fold before strength: folding may produce power-of-2 constants
+      - DCE after fold: folded constants enable dead-branch elimination
+      - Tail call last: must operate on final IR
+      - Peephole between each: cleanup after every transformation
+    source: "crates/core/src/optimizer.rs:37-85"
+    tags: [optimizer, advanced]
