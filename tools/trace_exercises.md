@@ -1,6 +1,7 @@
 # WAFER Trace-the-Compilation Exercises
 
 For each exercise, manually trace the Forth code through the full pipeline:
+
 1. **Outer interpreter** — tokenization, dictionary lookup, compile/interpret dispatch
 2. **IR generation** — what Vec<IrOp> is produced
 3. **Optimization** — which passes fire, what changes
@@ -12,6 +13,7 @@ Answers are below each exercise (scroll down or cover with paper).
 ---
 
 ## Exercise 1: Simple Arithmetic
+
 ```forth
 : SQUARE  DUP * ;
 ```
@@ -39,6 +41,7 @@ Answers are below each exercise (scroll down or cover with paper).
 ---
 
 ## Exercise 2: Constant Folding
+
 ```forth
 : TEN  5 5 + ;
 ```
@@ -62,6 +65,7 @@ Answers are below each exercise (scroll down or cover with paper).
 ---
 
 ## Exercise 3: Peephole Elimination
+
 ```forth
 : NOOP  DUP DROP ;
 ```
@@ -80,6 +84,7 @@ Answers are below each exercise (scroll down or cover with paper).
 ---
 
 ## Exercise 4: Strength Reduction
+
 ```forth
 : DOUBLE  8 * ;
 ```
@@ -99,9 +104,11 @@ Answers are below each exercise (scroll down or cover with paper).
 ---
 
 ## Exercise 5: Tail Call Detection
+
 ```forth
 : FOO  1 + BAR ;
 ```
+
 (Assume BAR is a previously defined word)
 
 <details>
@@ -119,6 +126,7 @@ Answers are below each exercise (scroll down or cover with paper).
 ---
 
 ## Exercise 6: Control Flow — IF/THEN
+
 ```forth
 : ABS  DUP 0< IF NEGATE THEN ;
 ```
@@ -142,6 +150,7 @@ Answers are below each exercise (scroll down or cover with paper).
 ---
 
 ## Exercise 7: DO LOOP
+
 ```forth
 : STARS  0 DO 42 EMIT LOOP ;
 ```
@@ -165,6 +174,7 @@ Answers are below each exercise (scroll down or cover with paper).
 ---
 
 ## Exercise 8: BEGIN UNTIL
+
 ```forth
 : COUNTDOWN  BEGIN DUP . 1 - DUP 0= UNTIL DROP ;
 ```
@@ -185,6 +195,7 @@ Answers are below each exercise (scroll down or cover with paper).
 ---
 
 ## Exercise 9: Dead Code Elimination
+
 ```forth
 : ALWAYS-TRUE  TRUE IF 42 ELSE 99 THEN ;
 ```
@@ -203,6 +214,7 @@ Answers are below each exercise (scroll down or cover with paper).
 ---
 
 ## Exercise 10: Swap Peephole Patterns
+
 ```forth
 : TEST  SWAP SWAP DROP DROP ;
 ```
@@ -221,6 +233,7 @@ Answers are below each exercise (scroll down or cover with paper).
 ---
 
 ## Exercise 11: Nested Control Flow
+
 ```forth
 : CLASSIFY  DUP 0< IF DROP -1 ELSE 0> IF 1 ELSE 0 THEN THEN ;
 ```
@@ -229,6 +242,7 @@ Answers are below each exercise (scroll down or cover with paper).
 <summary>Answer</summary>
 
 1. IR structure (after inlining):
+
 ```
 [Dup, ZeroLt, If {
   then: [Drop, PushI32(-1)],
@@ -238,6 +252,7 @@ Answers are below each exercise (scroll down or cover with paper).
   }])
 }]
 ```
+
 2. Optimizer recurses into both If bodies. No constant conditions → no DCE.
 3. Codegen: nested WASM `if/else/end` blocks.
 
@@ -246,6 +261,7 @@ Answers are below each exercise (scroll down or cover with paper).
 ---
 
 ## Exercise 12: DOES> Defining Word
+
 ```forth
 : CONSTANT  CREATE , DOES> @ ;
 5 CONSTANT FIVE
@@ -277,6 +293,7 @@ FIVE .
 ---
 
 ## Exercise 13: Consolidation
+
 ```forth
 : A 1 ;
 : B 2 ;
@@ -301,6 +318,7 @@ CONSOLIDATE
 ---
 
 ## Exercise 14: Host Function Execution
+
 ```forth
 5 3 M*
 ```
@@ -326,6 +344,7 @@ CONSOLIDATE
 ---
 
 ## Exercise 15: Float Operations
+
 ```forth
 : HYPOTENUSE  FDUP F* FSWAP FDUP F* F+ FSQRT ;
 ```
@@ -346,6 +365,7 @@ CONSOLIDATE
 ---
 
 ## Exercise 16: BEGIN WHILE REPEAT
+
 ```forth
 : COUNTDOWN  BEGIN DUP WHILE DUP . 1 - REPEAT DROP ;
 ```
@@ -365,6 +385,7 @@ CONSOLIDATE
 ---
 
 ## Exercise 17: Batch Mode Compilation
+
 ```forth
 ( During ForthVM::new() )
 ```
@@ -389,10 +410,12 @@ CONSOLIDATE
 ---
 
 ## Exercise 18: wafer build Pipeline
+
 ```forth
 ( file: hello.fth )
 : MAIN  ." Hello, World!" CR ;
 ```
+
 ```bash
 wafer build hello.fth -o hello.wasm
 ```
@@ -417,6 +440,7 @@ wafer build hello.fth -o hello.wasm
 ---
 
 ## Exercise 19: Stack-to-Local Promotion
+
 ```forth
 : ADD3  + + ;
 ```
@@ -437,6 +461,7 @@ wafer build hello.fth -o hello.wasm
 ---
 
 ## Exercise 20: MARKER and State Restore
+
 ```forth
 MARKER CLEAN
 : FOO 1 ;
