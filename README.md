@@ -2,7 +2,7 @@
 
 **WebAssembly Forth Engine in Rust**
 
-An optimizing Forth 2012 compiler targeting WebAssembly. WAFER JIT-compiles each word definition to a separate WASM module and executes it via [wasmtime](https://wasmtime.dev/).
+An optimizing Forth 2012 compiler targeting WebAssembly. WAFER JIT-compiles each word definition to a separate WASM module and executes it via [wasmtime](https://wasmtime.dev/) (CLI) or the browser's WebAssembly API (web REPL).
 
 ## Highlights
 
@@ -13,6 +13,8 @@ An optimizing Forth 2012 compiler targeting WebAssembly. WAFER JIT-compiles each
 - **Self-recursive direct calls** — RECURSE compiles to native `call` instead of `call_indirect`
 - **Consolidation mode** — recompile all words into a single optimized WASM module
 - **Interactive REPL** with line editing (rustyline)
+- **Browser REPL** — runs entirely in the browser via wasm-pack + js-sys
+- **Runtime abstraction** — `ForthVM<R: Runtime>` is generic over execution backend (wasmtime or browser)
 
 ## Installation
 
@@ -114,10 +116,16 @@ cargo clippy --workspace
 ```
 Forth Source -> Outer Interpreter -> IR -> [Optimize] -> WASM Codegen (wasm-encoder)
                                                               |
-                                                    wasmtime instantiation
+                                                    Runtime trait instantiation
                                                     (shared memory + table)
+                                                         /           \
+                                              NativeRuntime      WebRuntime
+                                              (wasmtime)         (js-sys)
 ```
 
+- **Runtime abstraction**: `ForthVM<R: Runtime>` separates the compiler from the execution engine
+  - `NativeRuntime` — wasmtime-based, for CLI, tests, and AOT compilation
+  - `WebRuntime` — browser WebAssembly API via js-sys, for the browser REPL
 - **Subroutine threading** via WASM function tables (`call_indirect` for cross-word, direct `call` for self-recursion)
 - **JIT mode**: each new word compiles to a separate WASM module linked to shared memory/globals/table
 - **IR-based pipeline** with 6 optimization passes (peephole, constant folding, strength reduction, DCE, tail call detection, inlining) plus stack-to-local promotion (with loop and IF/ELSE support), DO/LOOP index locals, and consolidation
@@ -127,10 +135,9 @@ Forth Source -> Outer Interpreter -> IR -> [Optimize] -> WASM Codegen (wasm-enco
 
 ```
 crates/
-  core/       wafer-core: dictionary, IR, codegen, optimizer, outer interpreter
+  core/       wafer-core: dictionary, IR, codegen, optimizer, outer interpreter, Runtime trait
   cli/        wafer: CLI REPL, file execution, consolidation
-  web/        wafer-web: browser bindings (planned)
-forth/        Bootstrap definitions loaded at startup
+  web/        wafer-web: browser REPL (wasm-bindgen + WebRuntime + HTML/CSS/JS frontend)
 tests/        Forth 2012 compliance suite (git submodule)
 ```
 
@@ -141,6 +148,7 @@ Tested against [Gerry Jackson's Forth 2012 test suite](https://github.com/gerryj
 | Word Set           | Status                                  |
 | ------------------ | --------------------------------------- |
 | Core               | **100%** (0 errors)                     |
+| Core Plus          | **100%** (0 errors)                     |
 | Core Extensions    | **100%** (0 errors)                     |
 | Double-Number      | **100%** (0 errors)                     |
 | Exception          | **100%** (0 errors)                     |
@@ -178,11 +186,21 @@ Over 200 words are implemented across the following categories:
 | Floating-Pt  | `F+ F- F* F/ FABS FNEGATE FSQRT FSIN FCOS FTAN FEXP FLOG FMIN FMAX` and 55+ more                                |
 | Case         | `CASE OF ENDOF ENDCASE`                                                                                         |
 
+## Web REPL
+
+Build and run the browser-based REPL:
+
+```bash
+cd crates/web
+wasm-pack build --target web --out-dir www/pkg
+python3 -m http.server -d www 8080
+# Open http://localhost:8080/
+```
+
 ## Roadmap
 
 - **File-Access word set** — requires WASI integration for file I/O
 - **Extended-Character word set** — Unicode support
-- **Browser target** — `wafer-web` crate with wasm-bindgen for a web REPL
 - **Self-hosting** — minimal Rust kernel (~35 primitives), everything else in Forth
 
 ## License
