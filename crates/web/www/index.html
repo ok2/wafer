@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WAFER — WebAssembly Forth REPL</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app">
+    <header>
+      <h1>WAFER <span class="subtitle">WebAssembly Forth Engine in Rust</span></h1>
+      <div class="header-actions">
+        <button id="btn-reset" title="Reset VM">Reset</button>
+        <button id="btn-help" title="Quick reference">?</button>
+      </div>
+    </header>
+
+    <div class="main-layout">
+      <!-- Word panel (collapsible sidebar) -->
+      <aside id="word-panel" class="collapsed">
+        <button id="btn-toggle-words" title="Toggle word list">Words</button>
+        <div class="word-content">
+          <input type="text" id="word-filter" placeholder="Filter words...">
+          <div id="word-categories"></div>
+        </div>
+      </aside>
+
+      <!-- Terminal -->
+      <main id="terminal-area">
+        <div id="output" tabindex="-1"></div>
+        <div id="input-line">
+          <span id="prompt">&gt; </span>
+          <input type="text" id="input" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" autofocus>
+        </div>
+        <div id="stack-bar"></div>
+      </main>
+    </div>
+
+    <!-- Init code panel -->
+    <div id="init-panel">
+      <div class="init-header">
+        <span>Init Code</span>
+        <div class="init-actions">
+          <button id="btn-run-init" title="Run init code">Run</button>
+          <button id="btn-toggle-init" title="Expand/collapse">&#x25B2;</button>
+        </div>
+      </div>
+      <div class="init-body collapsed">
+        <textarea id="init-code" placeholder="\ Forth code to run on startup&#10;: greet cr .&quot; Hello WAFER!&quot; ;&#10;greet" spellcheck="false"></textarea>
+      </div>
+    </div>
+  </div>
+
+  <div id="help-overlay" class="hidden">
+    <div class="help-content">
+      <h2>Quick Reference</h2>
+      <button class="close-help">&times;</button>
+      <div class="help-columns">
+        <div>
+          <h3>Stack</h3>
+          <code>DUP DROP SWAP OVER ROT NIP TUCK 2DUP 2DROP 2SWAP 2OVER PICK ROLL DEPTH .S</code>
+          <h3>Arithmetic</h3>
+          <code>+ - * / MOD /MOD NEGATE ABS MIN MAX</code>
+          <h3>Comparison</h3>
+          <code>= &lt;&gt; &lt; &gt; 0= 0&lt; U&lt;</code>
+          <h3>Logic</h3>
+          <code>AND OR XOR INVERT LSHIFT RSHIFT</code>
+        </div>
+        <div>
+          <h3>Memory</h3>
+          <code>@ ! C@ C! +! HERE ALLOT , C, CELLS CELL+ MOVE FILL</code>
+          <h3>I/O</h3>
+          <code>. U. .R U.R EMIT CR SPACE SPACES TYPE ." .S</code>
+          <h3>Defining</h3>
+          <code>: ; VARIABLE CONSTANT VALUE CREATE DOES&gt; DEFER IS</code>
+          <h3>Control</h3>
+          <code>IF ELSE THEN DO LOOP +LOOP I J LEAVE BEGIN UNTIL WHILE REPEAT AGAIN</code>
+        </div>
+      </div>
+      <p class="help-footer">Type Forth at the <code>&gt;</code> prompt. Press Enter to evaluate. Up/Down for history.</p>
+    </div>
+  </div>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>

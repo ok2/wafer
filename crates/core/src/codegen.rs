@@ -3059,7 +3059,7 @@ fn compile_multi_word_module(
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(all(test, feature = "native"))]
 mod tests {
     use super::*;
     use crate::dictionary::WordId;

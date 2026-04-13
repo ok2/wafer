@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 use wafer_core::export::{ExportConfig, export_module, serialize_metadata};
 use wafer_core::outer::ForthVM;
 use wafer_core::runner::{run_precompiled_bytes, run_wasm_file};
+use wafer_core::runtime_native::NativeRuntime;
 
 /// 8-byte magic trailer identifying a native WAFER executable.
 const NATIVE_MAGIC: &[u8; 8] = b"WAFEREXE";
@@ -136,7 +137,7 @@ fn cmd_build(
 ) -> anyhow::Result<()> {
     let source = std::fs::read_to_string(file)?;
 
-    let mut vm = ForthVM::new()?;
+    let mut vm = ForthVM::<NativeRuntime>::new()?;
     vm.set_recording(true);
     vm.evaluate(&source)?;
 
@@ -261,7 +262,7 @@ fn cmd_run(file: &str) -> anyhow::Result<()> {
 
 /// `wafer` (REPL) or `wafer program.fth` (evaluate and exit)
 fn cmd_eval_or_repl(file: Option<&str>) -> anyhow::Result<()> {
-    let mut vm = ForthVM::new()?;
+    let mut vm = ForthVM::<NativeRuntime>::new()?;
 
     match file {
         Some(file) => {

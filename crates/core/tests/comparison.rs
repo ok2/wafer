@@ -12,6 +12,7 @@ use std::sync::OnceLock;
 
 use wafer_core::config::WaferConfig;
 use wafer_core::outer::ForthVM;
+use wafer_core::runtime_native::NativeRuntime;
 
 // -----------------------------------------------------------------------
 // Gforth discovery (cached)
@@ -74,7 +75,7 @@ struct EngineResult {
 
 /// Run Forth code through WAFER (in-process via `ForthVM`).
 fn run_wafer(code: &str) -> EngineResult {
-    let mut vm = ForthVM::new().expect("Failed to create ForthVM");
+    let mut vm = ForthVM::<NativeRuntime>::new().expect("Failed to create ForthVM");
     let mut output = String::new();
     for line in code.lines() {
         let trimmed = line.trim();
@@ -99,7 +100,8 @@ fn run_wafer(code: &str) -> EngineResult {
 
 /// Run Forth code through WAFER with all optimizations enabled.
 fn run_wafer_optimized(code: &str) -> EngineResult {
-    let mut vm = ForthVM::new_with_config(WaferConfig::all()).expect("Failed to create ForthVM");
+    let mut vm = ForthVM::<NativeRuntime>::new_with_config(WaferConfig::all())
+        .expect("Failed to create ForthVM");
     let mut output = String::new();
     for line in code.lines() {
         let trimmed = line.trim();
@@ -809,7 +811,7 @@ fn performance_report() {
 
     // Verify correctness first
     for bench in &benchmarks {
-        let mut vm = ForthVM::new().expect("VM creation failed");
+        let mut vm = ForthVM::<NativeRuntime>::new().expect("VM creation failed");
         for line in bench.define.lines() {
             let trimmed = line.trim();
             if !trimmed.is_empty() {

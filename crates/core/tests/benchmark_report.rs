@@ -6,6 +6,7 @@
 use std::time::Instant;
 use wafer_core::config::WaferConfig;
 use wafer_core::outer::ForthVM;
+use wafer_core::runtime_native::NativeRuntime;
 
 // -----------------------------------------------------------------------
 // Benchmark definitions
@@ -203,7 +204,8 @@ struct BenchResult {
 fn run_benchmark(config: &WaferConfig, bench: &Benchmark) -> BenchResult {
     // Compile
     let compile_start = Instant::now();
-    let mut vm = ForthVM::new_with_config(config.clone()).expect("VM creation failed");
+    let mut vm =
+        ForthVM::<NativeRuntime>::new_with_config(config.clone()).expect("VM creation failed");
     for line in bench.define.lines() {
         let trimmed = line.trim();
         if !trimmed.is_empty() {
@@ -246,7 +248,8 @@ fn correctness_all_configs() {
 
     for (cfg_name, config) in &configs {
         for bench in &benches {
-            let mut vm = ForthVM::new_with_config(config.clone()).expect("VM creation failed");
+            let mut vm = ForthVM::<NativeRuntime>::new_with_config(config.clone())
+                .expect("VM creation failed");
             let mut define_ok = true;
             for line in bench.define.lines() {
                 let trimmed = line.trim();
@@ -427,8 +430,8 @@ fn optimization_report() {
         let result_all = run_benchmark(&all_config, bench);
 
         // With CONSOLIDATE
-        let mut vm_consol =
-            ForthVM::new_with_config(all_config.clone()).expect("VM creation failed");
+        let mut vm_consol = ForthVM::<NativeRuntime>::new_with_config(all_config.clone())
+            .expect("VM creation failed");
         for line in bench.define.lines() {
             let trimmed = line.trim();
             if !trimmed.is_empty() {

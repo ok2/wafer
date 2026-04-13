@@ -10,6 +10,7 @@ use crate::codegen::{ExportSections, compile_exportable_module};
 use crate::dictionary::WordId;
 use crate::ir::IrOp;
 use crate::outer::ForthVM;
+use crate::runtime::Runtime;
 
 /// Configuration for `wafer build`.
 pub struct ExportConfig {
@@ -39,14 +40,14 @@ pub struct ExportMetadata {
 ///
 /// Returns the raw `.wasm` bytes ready to write to a file, plus the metadata.
 pub fn export_module(
-    vm: &mut ForthVM,
+    vm: &mut ForthVM<impl Runtime>,
     config: &ExportConfig,
 ) -> anyhow::Result<(Vec<u8>, ExportMetadata)> {
     let mut words = vm.ir_words();
 
     // Determine the entry point.
     // Priority: --entry flag > MAIN word > recorded top-level execution.
-    let toplevel = vm.toplevel_ir();
+    let toplevel = vm.toplevel_ir().to_vec();
     let entry_word_id = if let Some(ref name) = config.entry_word {
         Some(
             vm.resolve_word(name)
@@ -58,7 +59,7 @@ pub fn export_module(
         // Synthesize a _start word from recorded top-level execution.
         // Pick a WordId that won't collide (one past the current table size).
         let start_id = WordId(vm.current_table_size());
-        words.push((start_id, toplevel.to_vec()));
+        words.push((start_id, toplevel.clone()));
         Some(start_id)
     } else {
         None
@@ -361,8 +362,9 @@ mod tests {
     fn roundtrip(source: &str) -> String {
         use crate::outer::ForthVM;
         use crate::runner::run_wasm_bytes;
+        use crate::runtime_native::NativeRuntime;
 
-        let mut vm = ForthVM::new().unwrap();
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
         vm.set_recording(true);
         vm.evaluate(source).unwrap();
 

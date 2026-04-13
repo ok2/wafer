@@ -5,6 +5,7 @@
 //! asserting 0 test failures.
 
 use wafer_core::outer::ForthVM;
+use wafer_core::runtime_native::NativeRuntime;
 
 /// Path to the test suite source directory.
 const SUITE_DIR: &str = concat!(
@@ -13,7 +14,7 @@ const SUITE_DIR: &str = concat!(
 );
 
 /// Load a file and evaluate it line by line, ignoring errors on individual lines.
-fn load_file(vm: &mut ForthVM, path: &str) {
+fn load_file(vm: &mut ForthVM<NativeRuntime>, path: &str) {
     let source = std::fs::read_to_string(path).unwrap_or_else(|_| panic!("Failed to read {path}"));
     for line in source.lines() {
         let _ = vm.evaluate(line);
@@ -22,8 +23,8 @@ fn load_file(vm: &mut ForthVM, path: &str) {
 }
 
 /// Boot a WAFER VM with full prerequisites loaded.
-fn boot_with_prerequisites() -> ForthVM {
-    let mut vm = ForthVM::new().expect("Failed to create ForthVM");
+fn boot_with_prerequisites() -> ForthVM<NativeRuntime> {
+    let mut vm = ForthVM::<NativeRuntime>::new().expect("Failed to create ForthVM");
 
     // Load test framework
     load_file(&mut vm, &format!("{SUITE_DIR}/tester.fr"));
@@ -40,7 +41,7 @@ fn boot_with_prerequisites() -> ForthVM {
 }
 
 /// Run a test suite file and return the #ERRORS count.
-fn run_suite(vm: &mut ForthVM, test_file: &str) -> u32 {
+fn run_suite(vm: &mut ForthVM<NativeRuntime>, test_file: &str) -> u32 {
     // Reset error counter
     let _ = vm.evaluate("DECIMAL 0 #ERRORS !");
     vm.take_output();
@@ -74,7 +75,7 @@ fn run_suite(vm: &mut ForthVM, test_file: &str) -> u32 {
 
 #[test]
 fn compliance_core() {
-    let mut vm = ForthVM::new().expect("Failed to create ForthVM");
+    let mut vm = ForthVM::<NativeRuntime>::new().expect("Failed to create ForthVM");
     load_file(&mut vm, &format!("{SUITE_DIR}/tester.fr"));
     load_file(&mut vm, &format!("{SUITE_DIR}/core.fr"));
 
@@ -94,7 +95,7 @@ fn compliance_core_plus() {
 fn compliance_core_ext() {
     // Core Extensions are loaded as part of prerequisites.
     // Run from scratch to get a clean error count.
-    let mut vm = ForthVM::new().expect("Failed to create ForthVM");
+    let mut vm = ForthVM::<NativeRuntime>::new().expect("Failed to create ForthVM");
     load_file(&mut vm, &format!("{SUITE_DIR}/tester.fr"));
     load_file(&mut vm, &format!("{SUITE_DIR}/core.fr"));
     let _ = vm.evaluate("DECIMAL");
@@ -162,7 +163,7 @@ fn compliance_search_order() {
 fn compliance_string() {
     // Run from scratch -- the stringtest includes CoreExt tests that
     // cascade failures when run on top of an already-loaded CoreExt suite.
-    let mut vm = ForthVM::new().expect("Failed to create ForthVM");
+    let mut vm = ForthVM::<NativeRuntime>::new().expect("Failed to create ForthVM");
     load_file(&mut vm, &format!("{SUITE_DIR}/tester.fr"));
     load_file(&mut vm, &format!("{SUITE_DIR}/core.fr"));
     let _ = vm.evaluate("DECIMAL");

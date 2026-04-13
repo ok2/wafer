@@ -16,13 +16,25 @@
 
 pub mod codegen;
 pub mod config;
-pub mod consolidate;
 pub mod dictionary;
 pub mod error;
-pub mod export;
 pub mod ir;
-pub mod js_loader;
 pub mod memory;
 pub mod optimizer;
+pub mod runtime;
+
+// Outer interpreter: runtime-agnostic, works with any Runtime impl
+#[allow(trivial_numeric_casts, clippy::unnecessary_cast)]
 pub mod outer;
+
+// Modules requiring the native wasmtime runtime
+#[cfg(feature = "native")]
+pub mod consolidate;
+#[cfg(feature = "native")]
+pub mod export;
+#[cfg(feature = "native")]
+pub mod js_loader;
+#[cfg(feature = "native")]
 pub mod runner;
+#[cfg(feature = "native")]
+pub mod runtime_native;

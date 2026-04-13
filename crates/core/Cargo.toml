@@ -8,10 +8,14 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = ["native"]
+native = ["dep:wasmtime"]
+
 [dependencies]
 wasm-encoder = { workspace = true }
 wasmparser = { workspace = true }
-wasmtime = { workspace = true }
+wasmtime = { workspace = true, optional = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 
