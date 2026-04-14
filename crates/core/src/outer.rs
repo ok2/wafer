@@ -20,6 +20,8 @@ use crate::codegen::{CodegenConfig, CompiledModule, compile_consolidated_module,
 use crate::config::WaferConfig;
 use crate::dictionary::{Dictionary, DictionaryState, WordId};
 use crate::ir::IrOp;
+#[cfg(feature = "crypto")]
+use crate::memory::HASH_SCRATCH_BASE;
 use crate::memory::{
     CELL_SIZE, DATA_STACK_TOP, FLOAT_SIZE, FLOAT_STACK_BASE, FLOAT_STACK_TOP, INPUT_BUFFER_BASE,
     INPUT_BUFFER_SIZE, RETURN_STACK_TOP, SYSVAR_BASE_VAR, SYSVAR_HERE, SYSVAR_LEAVE_FLAG,
@@ -381,6 +383,12 @@ impl<R: Runtime> ForthVM<R> {
         let s = out.clone();
         out.clear();
         s
+    }
+
+    /// Mutable access to the underlying runtime — useful for tests and for
+    /// host shims that need to read or write WAFER linear memory directly.
+    pub fn runtime_mut(&mut self) -> &mut R {
+        &mut self.rt
     }
 
     /// Read the current data stack contents (top-first).
@@ -2286,7 +2294,10 @@ impl<R: Runtime> ForthVM<R> {
     }
 
     /// Register a primitive whose implementation is a host function (not IR-compiled).
-    fn register_host_primitive(
+    ///
+    /// Public so downstream crates (like `kelvar-cli`) can extend the VM with
+    /// their own I/O host words without forking WAFER.
+    pub fn register_host_primitive(
         &mut self,
         name: &str,
         immediate: bool,
@@ -2592,6 +2603,10 @@ impl<R: Runtime> ForthVM<R> {
         // -- Floating-Point word set --
         self.register_float_words()?;
 
+        // -- Crypto: SHA1, SHA256, SHA512 (gated) --
+        #[cfg(feature = "crypto")]
+        self.register_crypto_words()?;
+
         // Batch-compile all deferred IR primitives into a single WASM module
         self.batch_mode = false;
         self.batch_compile_deferred()?;
@@ -2633,6 +2648,45 @@ impl<R: Runtime> ForthVM<R> {
         });
 
         self.register_host_primitive(".S", false, func)?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Crypto: SHA1 / SHA256 / SHA512 (and any algos in `crypto::ALGOS`)
+    // -----------------------------------------------------------------------
+
+    /// Register one Forth word per entry in [`crate::crypto::ALGOS`].
+    ///
+    /// Each word has stack effect `( c-addr u -- c-addr2 u2 )`: it hashes
+    /// the `u` bytes at `c-addr` and writes the digest into the shared
+    /// scratch region at [`crate::memory::HASH_SCRATCH_BASE`]. The output
+    /// is overwritten by every subsequent hash call.
+    #[cfg(feature = "crypto")]
+    fn register_crypto_words(&mut self) -> anyhow::Result<()> {
+        for algo in crate::crypto::ALGOS {
+            let hash_fn = algo.hash;
+            let digest_len = algo.digest_len as i32;
+            let func: HostFn = Box::new(move |ctx: &mut dyn HostAccess| {
+                // Pop ( c-addr u )
+                let dsp = ctx.get_dsp();
+                let u = ctx.mem_read_i32(dsp) as u32;
+                let c_addr = ctx.mem_read_i32(dsp + CELL_SIZE) as u32;
+
+                // Read input bytes and hash.
+                let bytes = ctx.mem_read_slice(c_addr, u as usize);
+                let digest = hash_fn(&bytes);
+
+                // Write digest to scratch.
+                ctx.mem_write_slice(HASH_SCRATCH_BASE, &digest);
+
+                // Push ( scratch-addr digest-len ) — same dsp position, two
+                // cells overwritten in place.
+                ctx.mem_write_i32(dsp + CELL_SIZE, HASH_SCRATCH_BASE as i32);
+                ctx.mem_write_i32(dsp, digest_len);
+                Ok(())
+            });
+            self.register_host_primitive(algo.name, false, func)?;
+        }
         Ok(())
     }
 

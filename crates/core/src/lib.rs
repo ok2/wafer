@@ -16,6 +16,8 @@
 
 pub mod codegen;
 pub mod config;
+#[cfg(feature = "crypto")]
+pub mod crypto;
 pub mod dictionary;
 pub mod error;
 pub mod ir;

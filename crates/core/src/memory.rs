@@ -59,8 +59,14 @@ pub const FLOAT_STACK_BASE: u32 = RETURN_STACK_BASE + RETURN_STACK_SIZE; // 0x25
 /// Size of float stack region.
 pub const FLOAT_STACK_SIZE: u32 = 2048; // 256 doubles
 
+/// Hash scratch region — output buffer for `SHA1`/`SHA256`/`SHA512` and
+/// other hash host words. Sized for the largest supported digest (SHA512 = 64 B).
+pub const HASH_SCRATCH_BASE: u32 = FLOAT_STACK_BASE + FLOAT_STACK_SIZE; // 0x2D40
+/// Size of hash scratch region.
+pub const HASH_SCRATCH_SIZE: u32 = 128;
+
 /// Dictionary region start. Grows upward.
-pub const DICTIONARY_BASE: u32 = FLOAT_STACK_BASE + FLOAT_STACK_SIZE; // 0x2D40
+pub const DICTIONARY_BASE: u32 = HASH_SCRATCH_BASE + HASH_SCRATCH_SIZE; // 0x2DC0
 
 /// Initial top of data stack (grows down from here).
 pub const DATA_STACK_TOP: u32 = DATA_STACK_BASE + DATA_STACK_SIZE;
@@ -113,7 +119,8 @@ mod tests {
         const { assert!(DATA_STACK_BASE >= PAD_BASE + PAD_SIZE) };
         const { assert!(RETURN_STACK_BASE >= DATA_STACK_BASE + DATA_STACK_SIZE) };
         const { assert!(FLOAT_STACK_BASE >= RETURN_STACK_BASE + RETURN_STACK_SIZE) };
-        const { assert!(DICTIONARY_BASE >= FLOAT_STACK_BASE + FLOAT_STACK_SIZE) };
+        const { assert!(HASH_SCRATCH_BASE >= FLOAT_STACK_BASE + FLOAT_STACK_SIZE) };
+        const { assert!(DICTIONARY_BASE >= HASH_SCRATCH_BASE + HASH_SCRATCH_SIZE) };
     }
 
     #[test]
