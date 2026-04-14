@@ -18,7 +18,7 @@ pub(crate) struct WebRuntime {
     emit_func: JsValue,
     #[allow(dead_code)]
     output: Arc<Mutex<String>>,
-    /// Keep closures alive to prevent GC.
+    /// Keep closures and wrapper-module Instances alive to prevent GC.
     _closures: Vec<JsValue>,
 }
 
@@ -209,9 +209,12 @@ impl Runtime for WebRuntime {
             out_ref.lock().unwrap().push(ch);
         }) as Box<dyn FnMut(i32)>);
 
-        // Use WebAssembly.Function if available, else wrap in a tiny module
-        let emit_func = make_wasm_function_i32(&emit_closure.as_ref().into());
-        let mut closures = vec![emit_closure.into_js_value()];
+        // Use WebAssembly.Function if available, else wrap in a tiny module.
+        // The wrapper-module path also returns the Instance so we can keep it
+        // alive for the lifetime of the runtime (browsers can otherwise GC
+        // the instance and orphan the funcref's body).
+        let (emit_func, emit_keep) = make_wasm_function_i32(&emit_closure.as_ref().into());
+        let mut closures = vec![emit_closure.into_js_value(), emit_keep];
         let _ = &mut closures; // keep alive
 
         Ok(WebRuntime {
@@ -432,7 +435,7 @@ impl Runtime for WebRuntime {
             }
         }) as Box<dyn FnMut()>);
 
-        let wasm_func = make_wasm_function_void(&closure.as_ref().into());
+        let (wasm_func, keep_alive) = make_wasm_function_void(&closure.as_ref().into());
 
         let set_fn: Function = Reflect::get(&self.table, &"set".into())
             .unwrap()
@@ -441,14 +444,24 @@ impl Runtime for WebRuntime {
             .call2(&self.table, &JsValue::from(fn_index), &wasm_func)
             .map_err(|e| anyhow::anyhow!("table.set({fn_index}) failed: {e:?}"))?;
 
+        // Stash both the closure AND the wrapper-module instance so neither
+        // is garbage-collected while the funcref is still in WAFER's table.
+        // Without keeping the Instance alive, browsers can orphan the funcref's
+        // body and cross-module `call_indirect` silently fails to dispatch.
         self._closures.push(closure.into_js_value());
+        self._closures.push(keep_alive);
         Ok(())
     }
 }
 
-/// Create a `WebAssembly.Function({parameters:['i32'],results:[]}, jsFn)`.
-/// Falls back to a wrapper module if `WebAssembly.Function` is unavailable.
-fn make_wasm_function_i32(js_fn: &JsValue) -> JsValue {
+/// Create a wasm-callable funcref of type `(i32) -> ()` from a JS callback.
+///
+/// Returns `(funcref, keep_alive)`. Callers MUST stash `keep_alive` somewhere
+/// the GC can see — for the wrapper-module path it's the underlying
+/// `WebAssembly.Instance`, and the funcref is only valid as long as the
+/// instance lives. The `WebAssembly.Function` constructor path returns
+/// `JsValue::NULL` for `keep_alive`.
+fn make_wasm_function_i32(js_fn: &JsValue) -> (JsValue, JsValue) {
     if let Ok(wasm_func_ctor) = get_wasm_function_ctor() {
         let desc = Object::new();
         let params = js_sys::Array::new();
@@ -458,15 +471,15 @@ fn make_wasm_function_i32(js_fn: &JsValue) -> JsValue {
         let args = js_sys::Array::new();
         args.push(&desc);
         args.push(js_fn);
-        Reflect::construct(&wasm_func_ctor.unchecked_into::<Function>(), &args).unwrap()
+        let f = Reflect::construct(&wasm_func_ctor.unchecked_into::<Function>(), &args).unwrap();
+        (f, JsValue::NULL)
     } else {
-        // Fallback: create a tiny WASM module that wraps the JS function
         make_wrapper_module_i32(js_fn)
     }
 }
 
-/// Create a `WebAssembly.Function({parameters:[],results:[]}, jsFn)`.
-fn make_wasm_function_void(js_fn: &JsValue) -> JsValue {
+/// Create a wasm-callable funcref of type `() -> ()`. See [`make_wasm_function_i32`].
+fn make_wasm_function_void(js_fn: &JsValue) -> (JsValue, JsValue) {
     if let Ok(wasm_func_ctor) = get_wasm_function_ctor() {
         let desc = Object::new();
         Reflect::set(&desc, &"parameters".into(), &js_sys::Array::new()).unwrap();
@@ -474,7 +487,8 @@ fn make_wasm_function_void(js_fn: &JsValue) -> JsValue {
         let args = js_sys::Array::new();
         args.push(&desc);
         args.push(js_fn);
-        Reflect::construct(&wasm_func_ctor.unchecked_into::<Function>(), &args).unwrap()
+        let f = Reflect::construct(&wasm_func_ctor.unchecked_into::<Function>(), &args).unwrap();
+        (f, JsValue::NULL)
     } else {
         make_wrapper_module_void(js_fn)
     }
@@ -491,45 +505,66 @@ fn get_wasm_function_ctor() -> Result<Function, ()> {
     }
 }
 
-/// Fallback: create a minimal WASM module that imports and re-exports a void→void function.
-fn make_wrapper_module_void(js_fn: &JsValue) -> JsValue {
-    // (module (import "e" "f" (func)) (export "f" (func 0)))
+/// Fallback: create a minimal WASM module that imports a JS function and
+/// exports a **local** trampoline which calls it.
+///
+/// Exporting the imported funcref directly (the previous approach) produces a
+/// funcref that works when invoked via JS `.call()`, but v8 and other engines
+/// do not always dispatch to the underlying JS body when that funcref is
+/// stored in a different module's table and invoked via `call_indirect`. A
+/// local trampoline (a real WASM function that `call`s the import) gives a
+/// stable, spec-correct funcref usable from any caller.
+fn make_wrapper_module_void(js_fn: &JsValue) -> (JsValue, JsValue) {
+    // (module
+    //   (import "e" "f" (func $imp))     ;; func 0
+    //   (func (export "f") (call $imp))  ;; func 1
+    // )
     #[rustfmt::skip]
     let bytes: &[u8] = &[
-        0x00, 0x61, 0x73, 0x6d, // magic
-        0x01, 0x00, 0x00, 0x00, // version
-        // type section: 1 type, () -> ()
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,       // magic + version
+        // type: 1 type, () -> ()
         0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
-        // import section: import "e" "f" func type 0
+        // import: "e"."f" func type 0  -> imported func index 0
         0x02, 0x07, 0x01, 0x01, 0x65, 0x01, 0x66, 0x00, 0x00,
-        // export section: export "f" func 0
-        0x07, 0x05, 0x01, 0x01, 0x66, 0x00, 0x00,
+        // function: 1 local func of type 0 -> local func index 1
+        0x03, 0x02, 0x01, 0x00,
+        // export: "f" -> func index 1 (the local trampoline)
+        0x07, 0x05, 0x01, 0x01, 0x66, 0x00, 0x01,
+        // code: 1 body, 4 bytes, 0 locals, `call 0`, `end`
+        0x0a, 0x06, 0x01, 0x04, 0x00, 0x10, 0x00, 0x0b,
     ];
-    let u8arr = Uint8Array::from(bytes);
-    let module = WebAssembly::Module::new(&u8arr.into()).unwrap();
-    let env = Object::new();
-    Reflect::set(&env, &"f".into(), js_fn).unwrap();
-    let imports = Object::new();
-    Reflect::set(&imports, &"e".into(), &env).unwrap();
-    let instance = WebAssembly::Instance::new(&module, &imports).unwrap();
-    let exports = Reflect::get(&instance, &"exports".into()).unwrap();
-    Reflect::get(&exports, &"f".into()).unwrap()
+    instantiate_wrapper(bytes, js_fn)
 }
 
-/// Fallback: create a minimal WASM module that imports and re-exports an (i32)→() function.
-fn make_wrapper_module_i32(js_fn: &JsValue) -> JsValue {
-    // (module (import "e" "f" (func (param i32))) (export "f" (func 0)))
+/// Fallback: same idea as [`make_wrapper_module_void`] but for `(i32) -> ()`.
+/// The trampoline forwards its one parameter to the import.
+fn make_wrapper_module_i32(js_fn: &JsValue) -> (JsValue, JsValue) {
+    // (module
+    //   (import "e" "f" (func $imp (param i32)))
+    //   (func (export "f") (param i32) (local.get 0) (call $imp))
+    // )
     #[rustfmt::skip]
     let bytes: &[u8] = &[
-        0x00, 0x61, 0x73, 0x6d,
-        0x01, 0x00, 0x00, 0x00,
-        // type section: 1 type, (i32) -> ()
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        // type: 1 type, (i32) -> ()
         0x01, 0x05, 0x01, 0x60, 0x01, 0x7f, 0x00,
-        // import section: import "e" "f" func type 0
+        // import: "e"."f" func type 0
         0x02, 0x07, 0x01, 0x01, 0x65, 0x01, 0x66, 0x00, 0x00,
-        // export section: export "f" func 0
-        0x07, 0x05, 0x01, 0x01, 0x66, 0x00, 0x00,
+        // function: 1 local func of type 0
+        0x03, 0x02, 0x01, 0x00,
+        // export: "f" -> func index 1
+        0x07, 0x05, 0x01, 0x01, 0x66, 0x00, 0x01,
+        // code: 1 body, 6 bytes, 0 locals, `local.get 0`, `call 0`, `end`
+        0x0a, 0x08, 0x01, 0x06, 0x00, 0x20, 0x00, 0x10, 0x00, 0x0b,
     ];
+    instantiate_wrapper(bytes, js_fn)
+}
+
+/// Shared: compile the wrapper module, instantiate with `js_fn` bound to
+/// import `"e"."f"`, and return both the exported local trampoline and
+/// the underlying `Instance` so callers can keep it alive (browsers can
+/// otherwise GC the instance and orphan the funcref's body).
+fn instantiate_wrapper(bytes: &[u8], js_fn: &JsValue) -> (JsValue, JsValue) {
     let u8arr = Uint8Array::from(bytes);
     let module = WebAssembly::Module::new(&u8arr.into()).unwrap();
     let env = Object::new();
@@ -537,6 +572,8 @@ fn make_wrapper_module_i32(js_fn: &JsValue) -> JsValue {
     let imports = Object::new();
     Reflect::set(&imports, &"e".into(), &env).unwrap();
     let instance = WebAssembly::Instance::new(&module, &imports).unwrap();
+    let instance_jv: JsValue = instance.clone().into();
     let exports = Reflect::get(&instance, &"exports".into()).unwrap();
-    Reflect::get(&exports, &"f".into()).unwrap()
+    let func = Reflect::get(&exports, &"f".into()).unwrap();
+    (func, instance_jv)
 }
