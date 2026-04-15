@@ -306,18 +306,7 @@
 
 \ .S keeps its Rust host function (complex stack introspection).
 
-\ ---------------------------------------------------------------
-\ Phase 8: Parse-ahead sugar
-\ ---------------------------------------------------------------
-
-\ S ( "<spaces>name<space>" -- )  ( -- c-addr u  at run time )
-\
-\ State-smart "quote the next whitespace-delimited token as a string".
-\ Interpret-mode: leave ( c-addr u ) pointing into the input buffer.
-\ Compile-mode:   append run-time semantics that push the copied string
-\                 (identical to writing S" name" inline).
-\
-\ This is the string analogue of [CHAR] (for chars) and ['] (for xts).
-\ Comparable to Lisp's quote: S foo is to a string what ' foo is to an xt.
-\ Inside a : definition the compiled code is bit-identical to S" foo".
-: S  PARSE-NAME  STATE @ IF SLITERAL THEN ; IMMEDIATE
+\ S ( "<spaces>name<space>" -- c-addr u )
+\   State-smart string literal for the next whitespace-delimited token.
+\   Handled in Rust (outer.rs interpret_token_immediate / compile_token)
+\   so the string survives REFILL in interpret mode.

@@ -671,6 +671,23 @@ impl<R: Runtime> ForthVM<R> {
             }
             return Ok(());
         }
+        if token_upper == "S" {
+            // State-smart string literal for the next whitespace-delimited token.
+            // Interpret mode: copy token bytes to HERE-space (stable across REFILL),
+            // push ( c-addr u ). Compile-mode branch lives in compile_token.
+            if let Some(name) = self.next_token() {
+                self.refresh_user_here();
+                let addr = self.user_here;
+                let bytes = name.as_bytes();
+                let len = bytes.len() as u32;
+                self.rt.mem_write_slice(addr, bytes);
+                self.user_here += len;
+                self.sync_here_cell();
+                self.push_data_stack(addr as i32)?;
+                self.push_data_stack(len as i32)?;
+            }
+            return Ok(());
+        }
         if token_upper == "(" {
             // Comment -- skip until )
             self.parse_until(')');
@@ -817,6 +834,23 @@ impl<R: Runtime> ForthVM<R> {
                 self.user_here += 1 + len as u32;
                 self.sync_here_cell();
                 self.push_ir(IrOp::PushI32(addr as i32));
+            }
+            return Ok(());
+        }
+        if token_upper == "S" {
+            // Compile-mode twin of the interpret-mode S handler: parse next
+            // whitespace-delimited token, copy into HERE, compile ( c-addr u )
+            // literals. Bit-identical to writing S" name" inline.
+            if let Some(name) = self.next_token() {
+                self.refresh_user_here();
+                let addr = self.user_here;
+                let bytes = name.as_bytes();
+                let len = bytes.len() as u32;
+                self.rt.mem_write_slice(addr, bytes);
+                self.user_here += len;
+                self.sync_here_cell();
+                self.push_ir(IrOp::PushI32(addr as i32));
+                self.push_ir(IrOp::PushI32(len as i32));
             }
             return Ok(());
         }
@@ -7578,6 +7612,18 @@ mod tests {
         vm.evaluate(": NAME S kelvar ;").unwrap();
         vm.evaluate("NAME TYPE").unwrap();
         assert_eq!(vm.take_output(), "kelvar");
+    }
+
+    #[test]
+    fn test_s_interpret_survives_refill() {
+        // Regression: `S name` in interpret mode used to return an address
+        // pointing into TIB, so the next REFILL clobbered the string.
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        vm.evaluate("S test").unwrap();
+        vm.evaluate(".S").unwrap();
+        vm.take_output();
+        vm.evaluate("TYPE").unwrap();
+        assert_eq!(vm.take_output(), "test");
     }
 
     // ===================================================================
