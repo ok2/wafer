@@ -261,6 +261,26 @@ pub struct ForthVM<R: Runtime> {
     next_wid: Arc<Mutex<u32>>,
     /// xorshift64 PRNG state for RANDOM / RND-SEED.
     rng_state: Arc<Mutex<u64>>,
+    /// Stacked compile state for nested definitions (quotations `[: ;]`).
+    compile_frames: Vec<CompileFrame>,
+    /// Dictionary address of the word currently being compiled. Set by
+    /// `start_colon_def` / `start_noname_def` / `start_quotation` so that
+    /// `finish_colon_def` can use `reveal_at` instead of `reveal()` — the
+    /// latter breaks when intermediate dictionary entries (quotations,
+    /// `DOES>` actions) have moved `latest`.
+    compiling_word_addr: u32,
+}
+
+/// Snapshot of one compilation context. Pushed by `[:`, popped by `;]`.
+struct CompileFrame {
+    compiling_name: Option<String>,
+    compiling_word_id: Option<WordId>,
+    compiling_word_addr: u32,
+    compiling_ir: Vec<IrOp>,
+    control_stack: Vec<ControlEntry>,
+    saw_create_in_def: bool,
+    compiling_locals: Vec<String>,
+    state: i32,
 }
 
 impl<R: Runtime> ForthVM<R> {
@@ -336,6 +356,8 @@ impl<R: Runtime> ForthVM<R> {
                     .unwrap_or(0xDEAD_BEEF_CAFE_BABE);
                 Arc::new(Mutex::new(if seed == 0 { 0xDEAD_BEEF_CAFE_BABE } else { seed }))
             },
+            compile_frames: Vec::new(),
+            compiling_word_addr: 0,
         };
 
         vm.register_primitives()?;
@@ -563,6 +585,15 @@ impl<R: Runtime> ForthVM<R> {
                 anyhow::bail!("unexpected ;");
             }
             return self.finish_colon_def();
+        }
+
+        // Quotations `[: ... ;]` — state-smart anonymous xt, nestable inside
+        // colon definitions via the compile-frame stack.
+        if token_upper == "[:" {
+            return self.start_quotation();
+        }
+        if token_upper == ";]" {
+            return self.finish_quotation();
         }
 
         // Words that must be handled in the outer interpreter because they
@@ -1824,6 +1855,7 @@ impl<R: Runtime> ForthVM<R> {
             .dictionary
             .create(&name, false)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
+        self.compiling_word_addr = self.dictionary.latest();
         // Reveal immediately so it gets an xt but isn't findable by name
         // (since the name is internal)
         self.dictionary.reveal();
@@ -1858,12 +1890,79 @@ impl<R: Runtime> ForthVM<R> {
 
         self.compiling_name = Some(name);
         self.compiling_word_id = Some(word_id);
+        self.compiling_word_addr = self.dictionary.latest();
         self.compiling_ir.clear();
         self.control_stack.clear();
         self.state = -1;
         self.saw_create_in_def = false;
         self.next_table_index = self.next_table_index.max(word_id.0 + 1);
 
+        Ok(())
+    }
+
+    /// `[:` — start a quotation. Saves the current compile frame (if any)
+    /// and begins compiling an anonymous inner definition. The inner xt is
+    /// produced by `;]`.
+    fn start_quotation(&mut self) -> anyhow::Result<()> {
+        let frame = CompileFrame {
+            compiling_name: self.compiling_name.take(),
+            compiling_word_id: self.compiling_word_id.take(),
+            compiling_word_addr: self.compiling_word_addr,
+            compiling_ir: std::mem::take(&mut self.compiling_ir),
+            control_stack: std::mem::take(&mut self.control_stack),
+            saw_create_in_def: self.saw_create_in_def,
+            compiling_locals: std::mem::take(&mut self.compiling_locals),
+            state: self.state,
+        };
+        self.compile_frames.push(frame);
+
+        let name = format!("_quot_{}_", self.next_table_index);
+        let word_id = self
+            .dictionary
+            .create(&name, false)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        self.compiling_word_addr = self.dictionary.latest();
+        self.dictionary.reveal();
+
+        self.compiling_name = Some(name);
+        self.compiling_word_id = Some(word_id);
+        self.compiling_ir.clear();
+        self.control_stack.clear();
+        self.state = -1;
+        self.saw_create_in_def = false;
+        self.next_table_index = self.next_table_index.max(word_id.0 + 1);
+        Ok(())
+    }
+
+    /// `;]` — finish the current quotation. Compiles its body as an anonymous
+    /// word, pops the saved outer frame, and either pushes the new xt on the
+    /// data stack (interpret mode) or emits a literal push into the outer IR
+    /// (compile mode).
+    fn finish_quotation(&mut self) -> anyhow::Result<()> {
+        if self.compile_frames.is_empty() {
+            anyhow::bail!(";]: no matching [:");
+        }
+        let inner_xt = self
+            .compiling_word_id
+            .ok_or_else(|| anyhow::anyhow!(";]: no active quotation"))?
+            .0;
+        self.finish_colon_def()?;
+
+        let frame = self.compile_frames.pop().unwrap();
+        self.compiling_name = frame.compiling_name;
+        self.compiling_word_id = frame.compiling_word_id;
+        self.compiling_word_addr = frame.compiling_word_addr;
+        self.compiling_ir = frame.compiling_ir;
+        self.control_stack = frame.control_stack;
+        self.saw_create_in_def = frame.saw_create_in_def;
+        self.compiling_locals = frame.compiling_locals;
+        self.state = frame.state;
+
+        if self.state != 0 {
+            self.push_ir(IrOp::PushI32(inner_xt as i32));
+        } else {
+            self.push_data_stack(inner_xt as i32)?;
+        }
         Ok(())
     }
 
@@ -1972,8 +2071,13 @@ impl<R: Runtime> ForthVM<R> {
         // Instantiate and install in the table
         self.instantiate_and_install(&compiled, word_id)?;
 
-        // Reveal the word
-        self.dictionary.reveal();
+        // Reveal the word by its saved address (not LATEST, which may have
+        // moved due to intermediate dict entries — quotations, DOES> helpers).
+        if self.compiling_word_addr != 0 {
+            self.dictionary.reveal_at(self.compiling_word_addr);
+        } else {
+            self.dictionary.reveal();
+        }
         // Check if IMMEDIATE was toggled (the word might be immediate)
         let is_immediate = self.dictionary.find(&name).is_some_and(|(_, _, imm)| imm);
         self.sync_word_lookup(&name, word_id, is_immediate);
@@ -7673,6 +7777,47 @@ mod tests {
         vm.take_output();
         vm.evaluate("TYPE").unwrap();
         assert_eq!(vm.take_output(), "test");
+    }
+
+    // ===================================================================
+    // Quotations: [: ... ;]
+    // ===================================================================
+
+    #[test]
+    fn test_quotation_interpret() {
+        assert_eq!(eval_stack("[: 42 ;] EXECUTE"), vec![42]);
+    }
+
+    #[test]
+    fn test_quotation_compile_mode() {
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        vm.evaluate(": APPLY EXECUTE ;").unwrap();
+        vm.evaluate("[: 1 2 + ;] APPLY .").unwrap();
+        assert_eq!(vm.take_output(), "3 ");
+    }
+
+    #[test]
+    fn test_quotation_inside_colon_def() {
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        vm.evaluate(": MYDUP [: DUP ;] EXECUTE ;").unwrap();
+        vm.evaluate("5 MYDUP").unwrap();
+        assert_eq!(vm.data_stack(), vec![5, 5]);
+    }
+
+    #[test]
+    fn test_quotation_nested() {
+        assert_eq!(eval_stack("[: [: 1 ;] EXECUTE ;] EXECUTE"), vec![1]);
+    }
+
+    #[test]
+    fn test_quotation_inside_if() {
+        // Control stack must travel with the saved frame so the outer IF/ELSE
+        // still finds its matching THEN after an inner [: ... ;].
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        vm.evaluate(": CHOOSE IF [: 1 ;] ELSE [: 2 ;] THEN EXECUTE ;")
+            .unwrap();
+        vm.evaluate("-1 CHOOSE  0 CHOOSE").unwrap();
+        assert_eq!(vm.data_stack(), vec![2, 1]);
     }
 
     // ===================================================================
