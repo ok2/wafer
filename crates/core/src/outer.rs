@@ -259,6 +259,8 @@ pub struct ForthVM<R: Runtime> {
     search_order: Arc<Mutex<Vec<u32>>>,
     /// Next wordlist ID to allocate (shared).
     next_wid: Arc<Mutex<u32>>,
+    /// xorshift64 PRNG state for RANDOM / RND-SEED.
+    rng_state: Arc<Mutex<u64>>,
 }
 
 impl<R: Runtime> ForthVM<R> {
@@ -326,6 +328,14 @@ impl<R: Runtime> ForthVM<R> {
             substitutions: Arc::new(Mutex::new(HashMap::new())),
             search_order: Arc::new(Mutex::new(vec![1])),
             next_wid: Arc::new(Mutex::new(2)),
+            rng_state: {
+                use std::time::{SystemTime, UNIX_EPOCH};
+                let seed = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0xDEAD_BEEF_CAFE_BABE);
+                Arc::new(Mutex::new(if seed == 0 { 0xDEAD_BEEF_CAFE_BABE } else { seed }))
+            },
         };
 
         vm.register_primitives()?;
@@ -2579,6 +2589,9 @@ impl<R: Runtime> ForthVM<R> {
 
         // UTIME ( -- ud ) microseconds since epoch as double-cell
         self.register_utime()?;
+
+        // RANDOM ( -- u ), RND-SEED ( u -- )
+        self.register_random()?;
 
         // HOLDS
         // HOLDS: defined in boot.fth
@@ -5091,6 +5104,42 @@ impl<R: Runtime> ForthVM<R> {
         });
 
         self.register_host_primitive("UTIME", false, func)?;
+        Ok(())
+    }
+
+    /// RANDOM ( -- u ) return a 32-bit pseudo-random cell (xorshift64).
+    /// RND-SEED ( u -- ) reseed the PRNG; seed=0 is forced to a nonzero constant.
+    fn register_random(&mut self) -> anyhow::Result<()> {
+        let state = Arc::clone(&self.rng_state);
+        let func: HostFn = Box::new(move |ctx: &mut dyn HostAccess| {
+            let mut s = state.lock().unwrap();
+            let mut x = *s;
+            if x == 0 {
+                x = 0xDEAD_BEEF_CAFE_BABE;
+            }
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *s = x;
+            drop(s);
+            let sp = ctx.get_dsp();
+            let new_sp = sp - CELL_SIZE;
+            ctx.mem_write_i32(new_sp as u32, x as i32);
+            ctx.set_dsp(new_sp);
+            Ok(())
+        });
+        self.register_host_primitive("RANDOM", false, func)?;
+
+        let state = Arc::clone(&self.rng_state);
+        let func: HostFn = Box::new(move |ctx: &mut dyn HostAccess| {
+            let sp = ctx.get_dsp();
+            let seed = ctx.mem_read_i32(sp as u32) as u32 as u64;
+            ctx.set_dsp(sp + CELL_SIZE);
+            let mut s = state.lock().unwrap();
+            *s = if seed == 0 { 0xDEAD_BEEF_CAFE_BABE } else { seed };
+            Ok(())
+        });
+        self.register_host_primitive("RND-SEED", false, func)?;
         Ok(())
     }
 
@@ -7624,6 +7673,48 @@ mod tests {
         vm.take_output();
         vm.evaluate("TYPE").unwrap();
         assert_eq!(vm.take_output(), "test");
+    }
+
+    // ===================================================================
+    // New words: RANDOM / RND-SEED
+    // ===================================================================
+
+    #[test]
+    fn test_random_deterministic_after_seed() {
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        vm.evaluate("42 RND-SEED RANDOM RANDOM RANDOM").unwrap();
+        let first = vm.data_stack().to_vec();
+
+        let mut vm2 = ForthVM::<NativeRuntime>::new().unwrap();
+        vm2.evaluate("42 RND-SEED RANDOM RANDOM RANDOM").unwrap();
+        let second = vm2.data_stack().to_vec();
+
+        assert_eq!(first, second, "same seed must produce same sequence");
+        assert_eq!(first.len(), 3);
+    }
+
+    #[test]
+    fn test_random_distinct_values() {
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        vm.evaluate("1 RND-SEED").unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            vm.evaluate("RANDOM").unwrap();
+            let v = vm.pop_data_stack().unwrap();
+            seen.insert(v);
+        }
+        // xorshift64's low-32 sequence repeats after a long period; 1000 pulls
+        // should hit at least 900 unique cells.
+        assert!(seen.len() >= 900, "only {} distinct out of 1000", seen.len());
+    }
+
+    #[test]
+    fn test_rnd_seed_zero_forced_nonzero() {
+        // xorshift with state 0 is a fixed point; seeding with 0 must avoid that.
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        vm.evaluate("0 RND-SEED RANDOM RANDOM").unwrap();
+        let stack = vm.data_stack();
+        assert!(stack[0] != 0 || stack[1] != 0, "seed-0 must not freeze the stream");
     }
 
     // ===================================================================
