@@ -7551,6 +7551,36 @@ mod tests {
     }
 
     // ===================================================================
+    // New words: S  (state-smart parse-next-token-as-string)
+    // ===================================================================
+
+    #[test]
+    fn test_s_interpret_type() {
+        assert_eq!(eval_output("S hello TYPE"), "hello");
+    }
+
+    #[test]
+    fn test_s_interpret_length() {
+        // S pushes ( c-addr u ); NIP leaves the length on top.
+        assert_eq!(eval_stack("S foo NIP"), vec![3]);
+    }
+
+    #[test]
+    fn test_s_compile_mode() {
+        assert_eq!(eval_output(": GREET S world TYPE ; GREET"), "world");
+    }
+
+    #[test]
+    fn test_s_compile_stored_literal() {
+        // The string compiled into a colon def must still be readable after
+        // the enclosing input line is gone.
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        vm.evaluate(": NAME S kelvar ;").unwrap();
+        vm.evaluate("NAME TYPE").unwrap();
+        assert_eq!(vm.take_output(), "kelvar");
+    }
+
+    // ===================================================================
     // New words: COUNT
     // ===================================================================
 
