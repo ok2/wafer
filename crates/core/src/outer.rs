@@ -7676,6 +7676,42 @@ mod tests {
     }
 
     // ===================================================================
+    // Structures (BEGIN-STRUCTURE / +FIELD / FIELD: / CFIELD: / END-STRUCTURE)
+    // ===================================================================
+
+    #[test]
+    fn test_struct_basic_point() {
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        vm.evaluate("BEGIN-STRUCTURE POINT FIELD: P.X FIELD: P.Y END-STRUCTURE")
+            .unwrap();
+        vm.evaluate("POINT").unwrap();
+        assert_eq!(vm.pop_data_stack().unwrap(), 8);
+
+        vm.evaluate("CREATE ORIGIN POINT ALLOT").unwrap();
+        vm.evaluate("1 ORIGIN P.X !  2 ORIGIN P.Y !").unwrap();
+        vm.evaluate("ORIGIN P.X @  ORIGIN P.Y @").unwrap();
+        assert_eq!(vm.data_stack(), vec![2, 1]);
+    }
+
+    #[test]
+    fn test_struct_field_offsets() {
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        vm.evaluate("BEGIN-STRUCTURE REC FIELD: A FIELD: B FIELD: C END-STRUCTURE")
+            .unwrap();
+        vm.evaluate("REC 0 A 0 B 0 C").unwrap();
+        assert_eq!(vm.data_stack(), vec![8, 4, 0, 12]);
+    }
+
+    #[test]
+    fn test_struct_mixed_cfield() {
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        vm.evaluate("BEGIN-STRUCTURE MIX CFIELD: TAG FIELD: VAL END-STRUCTURE")
+            .unwrap();
+        vm.evaluate("MIX 0 TAG 0 VAL").unwrap();
+        assert_eq!(vm.data_stack(), vec![4, 0, 8]);
+    }
+
+    // ===================================================================
     // New words: RANDOM / RND-SEED
     // ===================================================================
 

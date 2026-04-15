@@ -310,3 +310,39 @@
 \   State-smart string literal for the next whitespace-delimited token.
 \   Handled in Rust (outer.rs interpret_token_immediate / compile_token)
 \   so the string survives REFILL in interpret mode.
+
+\ ---------------------------------------------------------------
+\ Structures (Forth 2012 Facility-ext 10.6.2.0935 family)
+\ ---------------------------------------------------------------
+\ Usage:
+\   BEGIN-STRUCTURE POINT  FIELD: P.X  FIELD: P.Y  END-STRUCTURE
+\   CREATE ORIGIN POINT ALLOT
+\   1 ORIGIN P.X !   2 ORIGIN P.Y !
+
+\ Each defining word factored inline (CREATE .. DOES>). WAFER dispatches
+\ DOES>-defining words only at the outer interpreter, so they can't be
+\ factored through other compiled words (FIELD: -> +FIELD would no-op).
+
+: BEGIN-STRUCTURE  ( "name" -- struct-sys 0 )
+  CREATE HERE 0 0 , DOES> @ ;
+
+: END-STRUCTURE  ( struct-sys +n -- )
+  SWAP ! ;
+
+: +FIELD   ( n1 "name" n2 -- n3 )
+  CREATE OVER , + DOES> @ + ;
+
+: FIELD:   ( n1 "name" -- n2 )
+  CREATE ALIGNED DUP , 1 CELLS + DOES> @ + ;
+
+: CFIELD:  ( n1 "name" -- n2 )
+  CREATE DUP , 1 CHARS + DOES> @ + ;
+
+: FFIELD:  ( n1 "name" -- n2 )
+  CREATE FALIGNED DUP , 1 FLOATS + DOES> @ + ;
+
+: SFFIELD: ( n1 "name" -- n2 )
+  CREATE SFALIGNED DUP , 1 SFLOATS + DOES> @ + ;
+
+: DFFIELD: ( n1 "name" -- n2 )
+  CREATE DFALIGNED DUP , 1 DFLOATS + DOES> @ + ;
