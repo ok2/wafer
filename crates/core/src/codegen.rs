@@ -229,6 +229,9 @@ fn bool_to_forth_flag(f: &mut Function, tmp: u32) {
 struct EmitCtx {
     f64_local_0: u32,
     f64_local_1: u32,
+    /// Base WASM local index for float-typed Forth locals (`F:` in `{: ... :}`).
+    /// Float local N maps to WASM local `forth_f_local_base + N` (f64 type).
+    forth_f_local_base: u32,
     /// Base WASM local index for Forth locals ({: ... :}).
     /// Forth local N maps to WASM local `forth_local_base + N`.
     forth_local_base: u32,
@@ -691,6 +694,14 @@ fn emit_op(f: &mut Function, op: &IrOp, ctx: &mut EmitCtx) {
         IrOp::ForthLocalSet(n) => {
             pop_to(f, ctx.forth_local_base + n);
         }
+        IrOp::ForthFLocalGet(n) => {
+            f.instruction(&Instruction::LocalGet(ctx.forth_f_local_base + n));
+            fpush_via_local(f, ctx.f64_local_0);
+        }
+        IrOp::ForthFLocalSet(n) => {
+            fpop(f);
+            f.instruction(&Instruction::LocalSet(ctx.forth_f_local_base + n));
+        }
 
         // -- Return stack ---------------------------------------------------
         IrOp::ToR => {
@@ -1125,6 +1136,7 @@ fn is_promotable_body(ops: &[IrOp]) -> bool {
             IrOp::Call(_) | IrOp::TailCall(_) | IrOp::Execute | IrOp::SpFetch => return false,
             IrOp::ToR | IrOp::FromR | IrOp::Exit => return false,
             IrOp::ForthLocalGet(_) | IrOp::ForthLocalSet(_) => return false,
+            IrOp::ForthFLocalGet(_) | IrOp::ForthFLocalSet(_) => return false,
             IrOp::Emit | IrOp::Dot | IrOp::Cr | IrOp::Type => return false,
             IrOp::PushI64(_) | IrOp::PushF64(_) => return false,
             IrOp::FDup
@@ -2360,6 +2372,34 @@ fn count_forth_locals(ops: &[IrOp]) -> u32 {
     max
 }
 
+fn count_forth_f_locals(ops: &[IrOp]) -> u32 {
+    let mut max: u32 = 0;
+    for op in ops {
+        match op {
+            IrOp::ForthFLocalGet(n) | IrOp::ForthFLocalSet(n) => max = max.max(*n + 1),
+            IrOp::If {
+                then_body,
+                else_body,
+            } => {
+                max = max.max(count_forth_f_locals(then_body));
+                if let Some(eb) = else_body {
+                    max = max.max(count_forth_f_locals(eb));
+                }
+            }
+            IrOp::DoLoop { body, .. } | IrOp::BeginUntil { body } | IrOp::BeginAgain { body } => {
+                max = max.max(count_forth_f_locals(body));
+            }
+            IrOp::BeginWhileRepeat { test, body } => {
+                max = max
+                    .max(count_forth_f_locals(test))
+                    .max(count_forth_f_locals(body));
+            }
+            _ => {}
+        }
+    }
+    max
+}
+
 /// Generate a complete WASM module for a single compiled word.
 ///
 /// This is the JIT path: each word gets its own module that imports
@@ -2467,8 +2507,14 @@ pub fn compile_word(
     } else {
         1 + scratch_count + forth_local_count + loop_local_count
     };
-    let has_floats = needs_f64_locals(body);
-    let num_f64: u32 = if has_floats { 2 } else { 0 };
+    let forth_f_local_count = count_forth_f_locals(body);
+    // F: locals need f64 storage, which also implies the f64 scratch pair.
+    let has_floats = needs_f64_locals(body) || forth_f_local_count > 0;
+    let num_f64: u32 = if has_floats {
+        2 + forth_f_local_count
+    } else {
+        0
+    };
     let mut locals_decl = vec![(num_locals, ValType::I32)];
     if num_f64 > 0 {
         locals_decl.push((num_f64, ValType::F64));
@@ -2482,9 +2528,12 @@ pub fn compile_word(
         1 + scratch_count
     };
     let loop_local_base = forth_local_base + forth_local_count;
+    // f64 scratch pair first (indices num_locals, num_locals+1), then F: locals.
+    let forth_f_local_base = num_locals + 2;
     let mut ctx = EmitCtx {
         f64_local_0: num_locals,
         f64_local_1: num_locals + 1,
+        forth_f_local_base,
         forth_local_base,
         loop_local_base,
         loop_locals: Vec::new(),
@@ -2969,8 +3018,13 @@ fn compile_multi_word_module(
         } else {
             1 + scratch_count + forth_local_count + loop_local_count
         };
-        let has_floats = needs_f64_locals(body);
-        let num_f64: u32 = if has_floats { 2 } else { 0 };
+        let forth_f_local_count = count_forth_f_locals(body);
+        let has_floats = needs_f64_locals(body) || forth_f_local_count > 0;
+        let num_f64: u32 = if has_floats {
+            2 + forth_f_local_count
+        } else {
+            0
+        };
         let mut locals_decl = vec![(num_locals, ValType::I32)];
         if num_f64 > 0 {
             locals_decl.push((num_f64, ValType::F64));
@@ -2984,9 +3038,11 @@ fn compile_multi_word_module(
             1 + scratch_count
         };
         let loop_local_base = forth_local_base + forth_local_count;
+        let forth_f_local_base = num_locals + 2;
         let mut ctx = EmitCtx {
             f64_local_0: num_locals,
             f64_local_1: num_locals + 1,
+            forth_f_local_base,
             forth_local_base,
             loop_local_base,
             loop_locals: Vec::new(),

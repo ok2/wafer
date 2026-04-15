@@ -252,6 +252,8 @@ pub struct ForthVM<R: Runtime> {
     next_block_label: u32,
     /// Local variable names for the current definition ({: ... :} syntax)
     compiling_locals: Vec<String>,
+    /// Parallel to `compiling_locals`: kind of each local (Int or Float).
+    compiling_local_kinds: Vec<LocalKind>,
     /// Substitution table for SUBSTITUTE/REPLACES (String word set)
     substitutions: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     /// Search order: list of wordlist IDs (first = top of search order).
@@ -280,7 +282,17 @@ struct CompileFrame {
     control_stack: Vec<ControlEntry>,
     saw_create_in_def: bool,
     compiling_locals: Vec<String>,
+    compiling_local_kinds: Vec<LocalKind>,
     state: i32,
+}
+
+/// Type of a Forth local. Int locals live on the data stack and use
+/// `ForthLocalGet/Set`. Float locals live on the float stack and use
+/// `ForthFLocalGet/Set`. Their WASM local index spaces are independent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalKind {
+    Int,
+    Float,
 }
 
 impl<R: Runtime> ForthVM<R> {
@@ -345,6 +357,7 @@ impl<R: Runtime> ForthVM<R> {
             conditional_skip_depth: 0,
             next_block_label: 0,
             compiling_locals: Vec::new(),
+            compiling_local_kinds: Vec::new(),
             substitutions: Arc::new(Mutex::new(HashMap::new())),
             search_order: Arc::new(Mutex::new(vec![1])),
             next_wid: Arc::new(Mutex::new(2)),
@@ -385,6 +398,8 @@ impl<R: Runtime> ForthVM<R> {
                     self.control_stack.clear();
                     self.compiling_word_id = None;
                     self.compiling_locals.clear();
+                    self.compiling_local_kinds.clear();
+                    self.compile_frames.clear();
                     return Err(e);
                 }
             }
@@ -1151,7 +1166,15 @@ impl<R: Runtime> ForthVM<R> {
             .iter()
             .position(|n| n.eq_ignore_ascii_case(token))
         {
-            self.push_ir(IrOp::ForthLocalGet(idx as u32));
+            let kind = self.compiling_local_kinds[idx];
+            let kind_idx = self.compiling_local_kinds[0..idx]
+                .iter()
+                .filter(|k| **k == kind)
+                .count() as u32;
+            match kind {
+                LocalKind::Int => self.push_ir(IrOp::ForthLocalGet(kind_idx)),
+                LocalKind::Float => self.push_ir(IrOp::ForthFLocalGet(kind_idx)),
+            }
             return Ok(());
         }
 
@@ -1375,8 +1398,15 @@ impl<R: Runtime> ForthVM<R> {
                             *bp = ahead_prefix;
                         }
                         // Emit a first-iteration guard: allocate a local flag.
-                        let flag_idx = self.compiling_locals.len() as u32;
+                        // This is an Int local; its kind-local-index is the count of
+                        // existing Int entries.
+                        let flag_idx = self
+                            .compiling_local_kinds
+                            .iter()
+                            .filter(|k| **k == LocalKind::Int)
+                            .count() as u32;
                         self.compiling_locals.push("__first_iter__".to_string());
+                        self.compiling_local_kinds.push(LocalKind::Int);
                         // Push flag init into the Begin's prefix (before the loop)
                         if let ControlEntry::Begin { body: ref mut bp } = self.control_stack[bi] {
                             bp.push(IrOp::PushI32(1));
@@ -1912,6 +1942,7 @@ impl<R: Runtime> ForthVM<R> {
             control_stack: std::mem::take(&mut self.control_stack),
             saw_create_in_def: self.saw_create_in_def,
             compiling_locals: std::mem::take(&mut self.compiling_locals),
+            compiling_local_kinds: std::mem::take(&mut self.compiling_local_kinds),
             state: self.state,
         };
         self.compile_frames.push(frame);
@@ -1956,6 +1987,7 @@ impl<R: Runtime> ForthVM<R> {
         self.control_stack = frame.control_stack;
         self.saw_create_in_def = frame.saw_create_in_def;
         self.compiling_locals = frame.compiling_locals;
+        self.compiling_local_kinds = frame.compiling_local_kinds;
         self.state = frame.state;
 
         if self.state != 0 {
@@ -1971,11 +2003,17 @@ impl<R: Runtime> ForthVM<R> {
         optimize(ir, &self.config.opt, bodies)
     }
 
-    /// Parse a `{: args | locals -- comment :}` block and compile local initializations.
+    /// Parse a `{: args | locals -- comment :}` block and compile local
+    /// initializations. Supports `F:` prefix (gforth/SwiftForth-style) to
+    /// mark the next local as float-typed. Int locals pop from the data
+    /// stack via `ForthLocalSet`; float locals pop from the float stack
+    /// via `ForthFLocalSet`.
     fn compile_locals_block(&mut self) -> anyhow::Result<()> {
-        let mut args: Vec<String> = Vec::new();
+        let mut args: Vec<(String, LocalKind)> = Vec::new();
+        let mut uninits: Vec<(String, LocalKind)> = Vec::new();
         let mut in_comment = false;
         let mut in_uninit = false;
+        let mut next_is_float = false;
 
         loop {
             let tok = self
@@ -1984,44 +2022,50 @@ impl<R: Runtime> ForthVM<R> {
             let tok_upper = tok.to_ascii_uppercase();
             match tok_upper.as_str() {
                 ":}" => break,
-                "--" => {
-                    in_comment = true;
-                }
-                "|" => {
-                    in_uninit = true;
-                }
+                "--" => in_comment = true,
+                "|" => in_uninit = true,
+                "F:" => next_is_float = true,
                 _ => {
                     if in_comment {
-                        continue; // Skip comment tokens
+                        continue;
                     }
-                    if in_uninit {
-                        // Uninitialized local — just add to the map, no stack pop
-                        self.compiling_locals.push(tok_upper);
+                    let kind = if next_is_float {
+                        LocalKind::Float
                     } else {
-                        // Stack-initialized arg
-                        args.push(tok_upper);
+                        LocalKind::Int
+                    };
+                    next_is_float = false;
+                    if in_uninit {
+                        uninits.push((tok_upper, kind));
+                    } else {
+                        args.push((tok_upper, kind));
                     }
                 }
             }
         }
 
-        // Add args to locals map (they go first)
         let base = self.compiling_locals.len();
-        for arg in &args {
-            self.compiling_locals.insert(base, arg.clone());
-        }
-        // Actually, args should be at the start of the locals list
-        // with the first arg having the lowest index
         let n_args = args.len();
-        let mut new_locals = args;
-        // Append any already-added uninit locals
-        new_locals.extend(self.compiling_locals.drain(base..));
-        self.compiling_locals.splice(base..base, new_locals);
 
-        // Compile: pop args from data stack into locals (in reverse order)
-        // The first arg is deepest on the stack, last arg is on top
+        // Args first (assigned stack→local), then uninits (no init pop).
+        for (name, kind) in args.iter().chain(uninits.iter()) {
+            self.compiling_locals.push(name.clone());
+            self.compiling_local_kinds.push(*kind);
+        }
+
+        // Emit init: pop in reverse declaration order. Rightmost arg is on
+        // the top of its stack, so it's assigned first.
         for i in (0..n_args).rev() {
-            self.push_ir(IrOp::ForthLocalSet((base + i) as u32));
+            let slot = base + i;
+            let kind = self.compiling_local_kinds[slot];
+            let kind_idx = self.compiling_local_kinds[0..slot]
+                .iter()
+                .filter(|k| **k == kind)
+                .count() as u32;
+            match kind {
+                LocalKind::Int => self.push_ir(IrOp::ForthLocalSet(kind_idx)),
+                LocalKind::Float => self.push_ir(IrOp::ForthFLocalSet(kind_idx)),
+            }
         }
 
         Ok(())
@@ -2045,6 +2089,7 @@ impl<R: Runtime> ForthVM<R> {
         }
 
         self.compiling_locals.clear();
+        self.compiling_local_kinds.clear();
 
         let name = self
             .compiling_name
@@ -3306,7 +3351,15 @@ impl<R: Runtime> ForthVM<R> {
             .iter()
             .position(|n| n.eq_ignore_ascii_case(&name))
         {
-            self.push_ir(IrOp::ForthLocalSet(idx as u32));
+            let kind = self.compiling_local_kinds[idx];
+            let kind_idx = self.compiling_local_kinds[0..idx]
+                .iter()
+                .filter(|k| **k == kind)
+                .count() as u32;
+            match kind {
+                LocalKind::Int => self.push_ir(IrOp::ForthLocalSet(kind_idx)),
+                LocalKind::Float => self.push_ir(IrOp::ForthFLocalSet(kind_idx)),
+            }
             return Ok(());
         }
 
@@ -4170,6 +4223,7 @@ impl<R: Runtime> ForthVM<R> {
         let saved_word_id = self.compiling_word_id.take();
         let saved_control = std::mem::take(&mut self.control_stack);
         let saved_locals = std::mem::take(&mut self.compiling_locals);
+        let saved_local_kinds = std::mem::take(&mut self.compiling_local_kinds);
 
         self.compiling_ir.clear();
         self.compiling_name = Some("_does_action_".to_string());
@@ -4213,6 +4267,7 @@ impl<R: Runtime> ForthVM<R> {
         self.compiling_word_id = saved_word_id;
         self.control_stack = saved_control;
         self.compiling_locals = saved_locals;
+        self.compiling_local_kinds = saved_local_kinds;
 
         // Register the defining word as a "does-defining" word.
         let has_create = self.saw_create_in_def;
@@ -7777,6 +7832,48 @@ mod tests {
         vm.take_output();
         vm.evaluate("TYPE").unwrap();
         assert_eq!(vm.take_output(), "test");
+    }
+
+    // ===================================================================
+    // Float locals: F: prefix in {: ... :}
+    // ===================================================================
+
+    #[test]
+    fn test_flocal_hypot() {
+        // Classic Pythagorean: sqrt(x*x + y*y).
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        vm.evaluate(": HYPOT {: F: x F: y :} x x F* y y F* F+ FSQRT ;")
+            .unwrap();
+        vm.evaluate("3E 4E HYPOT F>S").unwrap();
+        assert_eq!(vm.data_stack(), vec![5]);
+    }
+
+    #[test]
+    fn test_flocal_to() {
+        // TO on a float local reads from the float stack, not the data stack.
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        vm.evaluate(": SETF {: F: a :} 10E TO a a ;").unwrap();
+        vm.evaluate("1E SETF F>S").unwrap();
+        assert_eq!(vm.data_stack(), vec![10]);
+    }
+
+    #[test]
+    fn test_flocal_mixed_int_and_float_args() {
+        // Declaration order matters for init: rightmost arg is popped first
+        // from its stack. Here `n` is int (from dstack) and `f` is float (from fstack).
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        vm.evaluate(": MIX {: n F: f :} f n S>F F+ ;").unwrap();
+        vm.evaluate("3 4E MIX F>S").unwrap();
+        assert_eq!(vm.data_stack(), vec![7]);
+    }
+
+    #[test]
+    fn test_flocal_uninit() {
+        // Uninitialized float local (after `|`) starts at 0.0 until assigned.
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        vm.evaluate(": U {: | F: tmp :} 9E TO tmp tmp ;").unwrap();
+        vm.evaluate("U F>S").unwrap();
+        assert_eq!(vm.data_stack(), vec![9]);
     }
 
     // ===================================================================

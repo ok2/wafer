@@ -139,6 +139,10 @@ pub enum IrOp {
     ForthLocalGet(u32),
     /// Set Forth local variable N: ( x -- )
     ForthLocalSet(u32),
+    /// Push float-typed Forth local N: ( F: -- r )
+    ForthFLocalGet(u32),
+    /// Set float-typed Forth local N: ( F: r -- )
+    ForthFLocalSet(u32),
 
     // -- I/O --
     /// Output character: ( char -- )

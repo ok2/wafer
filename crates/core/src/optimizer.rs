@@ -633,7 +633,11 @@ fn contains_call_to(ops: &[IrOp], target: WordId) -> bool {
 fn contains_exit(ops: &[IrOp]) -> bool {
     for op in ops {
         match op {
-            IrOp::Exit | IrOp::ForthLocalGet(_) | IrOp::ForthLocalSet(_) => return true,
+            IrOp::Exit
+            | IrOp::ForthLocalGet(_)
+            | IrOp::ForthLocalSet(_)
+            | IrOp::ForthFLocalGet(_)
+            | IrOp::ForthFLocalSet(_) => return true,
             IrOp::If {
                 then_body,
                 else_body,
