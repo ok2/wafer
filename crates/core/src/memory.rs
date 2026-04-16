@@ -50,23 +50,23 @@ pub const DATA_STACK_BASE: u32 = WORD_BUF_BASE + WORD_BUF_SIZE; // 0x0600
 pub const DATA_STACK_SIZE: u32 = 4096; // 1024 cells
 
 /// Return stack region. Grows downward.
-pub const RETURN_STACK_BASE: u32 = DATA_STACK_BASE + DATA_STACK_SIZE; // 0x1540
+pub const RETURN_STACK_BASE: u32 = DATA_STACK_BASE + DATA_STACK_SIZE; // 0x1600
 /// Size of return stack region.
 pub const RETURN_STACK_SIZE: u32 = 4096;
 
 /// Floating-point stack region (fallback). Grows downward.
-pub const FLOAT_STACK_BASE: u32 = RETURN_STACK_BASE + RETURN_STACK_SIZE; // 0x2540
+pub const FLOAT_STACK_BASE: u32 = RETURN_STACK_BASE + RETURN_STACK_SIZE; // 0x2600
 /// Size of float stack region.
 pub const FLOAT_STACK_SIZE: u32 = 2048; // 256 doubles
 
 /// Hash scratch region — output buffer for `SHA1`/`SHA256`/`SHA512` and
 /// other hash host words. Sized for the largest supported digest (SHA512 = 64 B).
-pub const HASH_SCRATCH_BASE: u32 = FLOAT_STACK_BASE + FLOAT_STACK_SIZE; // 0x2D40
+pub const HASH_SCRATCH_BASE: u32 = FLOAT_STACK_BASE + FLOAT_STACK_SIZE; // 0x2E00
 /// Size of hash scratch region.
 pub const HASH_SCRATCH_SIZE: u32 = 128;
 
 /// Dictionary region start. Grows upward.
-pub const DICTIONARY_BASE: u32 = HASH_SCRATCH_BASE + HASH_SCRATCH_SIZE; // 0x2DC0
+pub const DICTIONARY_BASE: u32 = HASH_SCRATCH_BASE + HASH_SCRATCH_SIZE; // 0x2E80
 
 /// Initial top of data stack (grows down from here).
 pub const DATA_STACK_TOP: u32 = DATA_STACK_BASE + DATA_STACK_SIZE;

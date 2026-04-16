@@ -1,5 +1,10 @@
-WAFER Architecture Reference (updated 2026-04-13)
+WAFER Architecture Reference (updated 2026-04-16)
 ===================================================
+
+WAFER = WebAssembly Forth Engine in Rust. Optimizing Forth-2012 compiler that
+emits WASM at run time. Each colon definition becomes its own WASM module that
+shares memory, globals, and a function table with every other word.
+
 
 1. COMPILATION PIPELINE
 -----------------------
@@ -11,96 +16,134 @@ WAFER Architecture Reference (updated 2026-04-13)
   +--------------------------------------------+
   | Tokenizer: whitespace-delimited words      |
   | For each token:                            |
-  |   1. Dictionary lookup (find)              |
-  |   2. If found + interpret mode: EXECUTE    |
-  |   3. If found + compile mode:              |
-  |      - Immediate? Execute now              |
+  |   1. Dictionary lookup (HashMap + wordlist |
+  |      search order)                         |
+  |   2. Found + interpret mode: EXECUTE       |
+  |   3. Found + compile mode:                 |
+  |      - IMMEDIATE? Execute now              |
   |      - Normal? Append Call(WordId) to IR   |
   |   4. Not found: try parse as number        |
   |      - Interpret: push to data stack       |
-  |      - Compile: append PushI32(n) to IR    |
+  |      - Compile: append PushI32/64/F64      |
   |   5. Neither: error "unknown word"         |
+  | Special cases handled here, not via IR:    |
+  |   defining words (CREATE, VARIABLE, :),    |
+  |   DOES> dispatch, S" / ." string parsing,  |
+  |   {: ... :} locals, [: ... ;] quotations.  |
   +--------------------------------------------+
        |  On `;` (end of colon definition):
        v
-  Optimizer (optimizer.rs)
+  Optimizer (optimizer.rs) — IR -> IR
   +--------------------------------------------+
-  | Phase 1: Simplify                          |
-  |   Peephole -> Constant Fold ->             |
-  |   Strength Reduce -> Peephole              |
-  | Phase 2: Inline then re-simplify           |
-  |   Inline(max=8) -> Peephole ->             |
-  |   Constant Fold -> Strength Reduce ->      |
-  |   Peephole                                 |
-  | Phase 3: Eliminate dead code               |
-  |   DCE -> Peephole                          |
-  | Phase 4: Tail calls (must be last)         |
-  |   Tail Call Detect                         |
+  | Phase 1 simplify:                          |
+  |   peephole -> fold -> strength -> peephole |
+  | Phase 2 inline (max 8 ops) then re-simpl.: |
+  |   inline -> peephole -> fold -> strength   |
+  |          -> peephole                       |
+  | Phase 3 dead code: dce -> peephole         |
+  | Phase 4 tail calls (must be last)          |
+  | Total peephole passes: 5                   |
   +--------------------------------------------+
        |
        v
-  Codegen (codegen.rs)
+  Codegen (codegen.rs) — IR -> WASM bytes
   +--------------------------------------------+
-  | IR -> WASM bytecode via wasm-encoder       |
-  | Each word = one WASM module with:          |
-  |   Imports: emit, memory, dsp, rsp, fsp,    |
-  |            table                           |
-  |   Types: void () -> (), i32 (i32) -> ()    |
-  |   One defined function (the word body)     |
-  | DSP cached in local 0, writeback before    |
-  |   calls, reload after calls                |
-  | Scratch locals start at index 1            |
+  | wasm-encoder builds one module per word.   |
+  | Function locals (laid out in order):       |
+  |   0           cached DSP (i32)             |
+  |   1..s        scratch i32 (or promoted     |
+  |               stack-to-local slots)        |
+  |   s..f        Forth locals from {: ... :}  |
+  |               (i32 then f64)               |
+  |   f..l        loop locals: 2 per nested    |
+  |               DO/?DO (index, limit)        |
+  | DSP write-back before every Call,          |
+  |   reload after — keeps host functions and  |
+  |   call_indirect targets coherent.          |
+  | Stack-to-local promotion (codegen flag):   |
+  |   straight-line + simple control flow      |
+  |   words skip the linear-memory data stack  |
+  |   entirely; values stay in WASM locals.    |
   +--------------------------------------------+
        |
        v
-  Runtime trait (runtime.rs)
+  Runtime trait (runtime.rs) — execution backend
   +--------------------------------------------+
-  | ForthVM<R: Runtime> — generic over backend |
-  | Runtime provides:                          |
-  |   - Memory r/w (mem_read_i32, etc.)        |
-  |   - Globals (get/set_dsp, rsp, fsp)        |
-  |   - Table (ensure_table_size)              |
-  |   - instantiate_and_install(wasm_bytes)    |
-  |   - call_func(fn_index)                    |
-  |   - register_host_func(fn_index, HostFn)   |
+  | ForthVM<R: Runtime> generic over backend.  |
+  | Runtime owns:                              |
+  |   - shared linear memory (16 pages init)   |
+  |   - shared funcref table (grows on demand) |
+  |   - 3 mutable i32 globals (dsp/rsp/fsp)    |
+  |   - emit() import bound to output buffer   |
+  | Runtime methods:                           |
+  |   mem_read/write_{i32,u8,slice}            |
+  |   get/set_{dsp,rsp,fsp}                    |
+  |   ensure_table_size(n)                     |
+  |   instantiate_and_install(wasm, fn_index)  |
+  |   call_func(fn_index)                      |
+  |   register_host_func(fn_index, HostFn)     |
   |                                            |
-  | HostAccess trait — memory/global ops for   |
-  |   host function callbacks                  |
-  | HostFn = Box<dyn Fn(&mut dyn HostAccess)>  |
+  | HostAccess trait — same memory/global ops  |
+  |   exposed to host-fn callbacks; lets one   |
+  |   HostFn closure run on either runtime.    |
+  | HostFn = Box<dyn Fn(&mut dyn HostAccess)   |
+  |               -> Result<()> + Send + Sync> |
   +--------------------------------------------+
        |                     |
        v                     v
   NativeRuntime          WebRuntime
-  (runtime_native.rs)    (crates/web/runtime_web.rs)
+  (runtime_native.rs,    (crates/web/src/
+   feature = "native")    runtime_web.rs)
   +------------------+   +------------------+
-  | wasmtime Engine  |   | js_sys::WebAsm   |
-  | Store, Memory    |   | Memory, Table    |
-  | Table, Globals   |   | Global objects   |
-  | Func closures    |   | JS Closures      |
+  | wasmtime Engine, |   | js_sys WebAsm    |
+  | Store, Memory,   |   | Memory, Table,   |
+  | Table, Globals,  |   | Global, JS       |
+  | Func closures    |   | Closures         |
   +------------------+   +------------------+
 
 
-2. MEMORY LAYOUT (Linear Memory)
---------------------------------
+2. MEMORY LAYOUT (linear memory, single shared instance)
+--------------------------------------------------------
 
   Address   Region              Size     Notes
-  --------  ------------------  -------  -------------------------
+  --------  ------------------  -------  --------------------------
   0x0000    System Variables    64 B     STATE, BASE, >IN, HERE,
                                          LATEST, SOURCE-ID, #TIB,
                                          HLD, LEAVE-FLAG
-  0x0040    Input Buffer        1024 B   Source parsing
-  0x0440    PAD                 256 B    Scratch area
-  0x0540    Pictured Output     128 B    <# ... #> (grows down)
+  0x0040    Input Buffer (TIB)  1024 B   Source line being parsed
+  0x0440    PAD                 256 B    Scratch for string ops
+  0x0540    Pictured Output     128 B    <# ... #> (HLD grows down)
   0x05C0    WORD Buffer         64 B     Transient counted string
   0x0600    Data Stack          4096 B   1024 cells, grows DOWN
-  0x1600    (Data Stack Top)             DSP starts here
-  0x1540    Return Stack        4096 B   Grows DOWN
-  0x2540    Float Stack         2048 B   256 doubles, grows DOWN
-  0x2D40    Dictionary          grows UP Linked list of word entries
+            ^ DSP starts at top = 0x1600
+  0x1600    Return Stack        4096 B   Grows DOWN
+            ^ RSP starts at top = 0x2600
+  0x2600    Float Stack         2048 B   256 doubles, grows DOWN
+            ^ FSP starts at top = 0x2E00
+  0x2E00    Hash Scratch        128 B    SHA1/256/512 output
+  0x2E80    Dictionary          grows UP Linked list of entries
 
-  Total initial memory: 16 pages = 1 MiB (max 256 pages = 16 MiB)
-  Cell size: 4 bytes (i32)
-  Float size: 8 bytes (f64)
+  Constants from crates/core/src/memory.rs (authoritative):
+    SYSVAR_BASE         0x0000   size  64
+    INPUT_BUFFER_BASE   0x0040   size 1024
+    PAD_BASE            0x0440   size  256
+    PICT_BUF_BASE       0x0540   size  128
+    WORD_BUF_BASE       0x05C0   size   64
+    DATA_STACK_BASE     0x0600   size 4096   (DATA_STACK_TOP   = 0x1600)
+    RETURN_STACK_BASE   0x1600   size 4096   (RETURN_STACK_TOP = 0x2600)
+    FLOAT_STACK_BASE    0x2600   size 2048   (FLOAT_STACK_TOP  = 0x2E00)
+    HASH_SCRATCH_BASE   0x2E00   size  128
+    DICTIONARY_BASE     0x2E80   grows up to memory.len()
+  (Some inline `// 0x...` comments in memory.rs are stale — the
+   computed values above are correct; the consts are derived.)
+
+  Total initial memory: 16 pages = 1 MiB (max 256 pages = 16 MiB).
+  Cell size: 4 bytes (i32).  Float size: 8 bytes (f64).
+
+  Stack layout note: linear-memory data and float stacks are the
+  fallback used whenever the optimizer can't keep values in WASM
+  locals. After stack-to-local promotion, many words touch DSP
+  only on entry/exit.
 
 
 3. SYSTEM VARIABLES (offsets from 0x0000)
@@ -113,60 +156,86 @@ WAFER Architecture Reference (updated 2026-04-13)
   8       >IN         Parse offset into input buffer
   12      HERE        Next free dictionary address
   16      LATEST      Most recent dictionary entry addr
-  20      SOURCE-ID   0=user input, -1=string
+  20      SOURCE-ID   0=user input, -1=string, fileid>0
   24      #TIB        Length of current input
   28      HLD         Pictured numeric output pointer
   32      LEAVE-FLAG  Nonzero when LEAVE called in loop
 
 
-4. DICTIONARY ENTRY FORMAT
---------------------------
+4. DICTIONARY (dictionary.rs)
+-----------------------------
 
-  +--------+-------+----------+---------+-----------+
-  | Link   | Flags | Name     | Padding | Code      |
-  | 4 bytes| 1 byte| N bytes  | 0-3 B   | 4 bytes   |
-  +--------+-------+----------+---------+-----------+
+  Entry layout in linear memory:
+
+  +--------+-------+----------+---------+-----------+----------+
+  | Link   | Flags | Name     | Padding | Code      | Param    |
+  | 4 B    | 1 B   | N B      | 0-3 B   | 4 B       | optional |
+  +--------+-------+----------+---------+-----------+----------+
   ^                                      ^
-  entry_addr                             code field (fn table index)
+  entry_addr                             code field (fn-table idx)
 
   Flags byte:
     Bit 7 (0x80): IMMEDIATE
     Bit 6 (0x40): HIDDEN (during compilation)
-    Bits 0-4 (0x1F): name length (max 31)
+    Bits 0-4    : name length (max 31)
 
   Link points to previous entry (0 = end of list).
   Name stored uppercase, padded to 4-byte alignment.
-  Code field: index into WASM function table.
-  Parameter field (if any) follows immediately after code field.
+  Code field: index into shared WASM function table.
+  Parameter field follows the code field for CREATE'd /
+    DOES> / VARIABLE / CONSTANT bodies.
+
+  Lookup is NOT linear: dictionary.rs maintains a HashMap
+  index from name -> Vec<(wid, addr, fn_index, immediate)>.
+  Each entry is tagged with its wordlist id; resolution
+  walks the current search order.
+
+  Wordlists / Search-Order:
+    wordlist ids are u32; the FORTH wordlist is id 1.
+    `current_wid` selects where new definitions land;
+    `search_order` is the lookup chain (top first).
+    Implements the Forth-2012 Search-Order word set.
 
 
-5. THREE TYPES OF WORDS
------------------------
+5. WORD CATEGORIES
+------------------
 
-  a) IR Primitives (compiled to WASM)
-     register_primitive("DUP", false, vec![IrOp::Dup])
+  a) IR Primitives — register_primitive("DUP", false, vec![IrOp::Dup])
      - Body stored as Vec<IrOp>
-     - Optimized, then compiled to WASM module
+     - Optimized, then compiled to WASM
      - Inlineable by optimizer
-     - FAST: no function call overhead when inlined
+     - Batched at boot: ~110 primitive registrations compiled
+       into a single WASM module to amortize instantiation cost
 
-  b) Host Functions (HostFn closures)
-     register_host_primitive(".", false, func)
-     - HostFn = Box<dyn Fn(&mut dyn HostAccess) -> Result<()>>
-     - Access memory/globals via HostAccess trait (runtime-agnostic)
+  b) Host Functions — register_host_primitive(".", false, func)
+     - HostFn = Box<dyn Fn(&mut dyn HostAccess)
+                       -> Result<()> + Send + Sync>
+     - Access memory/globals via HostAccess trait
      - NOT inlineable
-     - Used for: I/O, dictionary manipulation, complex logic
-     - Same closure works on NativeRuntime and WebRuntime
+     - Used for I/O, dictionary manipulation, complex stack ops
+     - Same closure runs on NativeRuntime and WebRuntime
 
-  c) Forth-defined words
-     : SQUARE DUP * ;
-     - Compiled by outer interpreter
-     - Goes through full optimize -> codegen pipeline
-     - Stored in ir_bodies for future inlining
+  c) Forth-defined words — `: SQUARE DUP * ;`
+     - Compiled by the outer interpreter
+     - Goes through the full optimize -> codegen pipeline
+     - Stored in `ir_bodies` for future inlining
+
+  d) Special interpreter tokens (immediate, with custom parsing)
+     - Defining words: CREATE, VARIABLE, CONSTANT, :, ;, DOES>
+     - String literals: S", ."
+     - Control structures: IF/ELSE/THEN, BEGIN/UNTIL/WHILE/REPEAT,
+       DO/?DO/LOOP/+LOOP, [: ... ;] quotations, {: ... :} locals
+     - CONSOLIDATE
+     Their body-collection / dictionary-side-effect logic lives
+     directly in compile_token / interpret_token_immediate.
+     They still emit IR ops (e.g. IrOp::If, IrOp::DoLoop,
+     IrOp::ForthLocalGet) — the difference is that they are NOT
+     registered via register_primitive; the outer interpreter
+     handles them as special syntax.
 
 
-6. WASM MODULE STRUCTURE (per word)
------------------------------------
+6. WASM MODULE STRUCTURE (per JIT-compiled word)
+------------------------------------------------
 
   Imports (6) — provided by Runtime impl:
     0. emit       (func: i32 -> void)  Character output callback
@@ -176,25 +245,59 @@ WAFER Architecture Reference (updated 2026-04-13)
     4. fsp        (global: mut i32)    Float stack pointer
     5. table      (table: funcref)     Shared function table
 
-  Types (2):
-    0. void: () -> ()
-    1. i32:  (i32) -> ()
+  Types: () -> () for word bodies; (i32) -> () for emit.
 
   Functions (1):
-    The compiled word body
+    The compiled word body, typed () -> ().
 
   Element section:
     table[base_fn_index] = function 1
 
   Runtime::instantiate_and_install(wasm_bytes, fn_index):
-    - NativeRuntime: Module::new + Instance::new with 6 wasmtime imports
-    - WebRuntime: WebAssembly.instantiate with JS import objects
+    - NativeRuntime: wasmtime Module::new + Instance::new
+      with the 6 imports above
+    - WebRuntime: WebAssembly.instantiate with JS import
+      objects pulled from the shared WaferRepl state
 
 
-7. OPTIMIZATION PASSES (detail)
+7. IR OPS (ir.rs — IrOp enum)
+-----------------------------
+
+  Stack:        Drop, Dup, Swap, Over, Rot, Nip, Tuck,
+                TwoDup, TwoDrop
+  Literals:     PushI32, PushI64, PushF64
+  Arithmetic:   Add, Sub, Mul, DivMod, Negate, Abs
+  Compare:      Eq, NotEq, Lt, Gt, LtUnsigned,
+                ZeroEq, ZeroLt
+  Logic:        And, Or, Xor, Invert,
+                Lshift, Rshift, ArithRshift
+  Memory:       Fetch, Store, CFetch, CStore, PlusStore
+  Control:      Call, TailCall, Exit,
+                If{then, else?},
+                DoLoop{body, is_plus_loop},
+                BeginUntil, BeginAgain,
+                BeginWhileRepeat,
+                BeginDoubleWhileRepeat,
+                LoopRestartIfFalse,
+                Block(label), BranchIfFalse(label),
+                EndBlock(label)   -- for CS-ROLL'd patterns
+  Return stack: ToR, FromR, RFetch, LoopJ
+  Forth locals: ForthLocalGet/Set,
+                ForthFLocalGet/Set
+  I/O:          Emit, Dot, Cr, Type
+  System:       Execute, SpFetch
+  Float stack:  FDup, FDrop, FSwap, FOver
+  Float math:   FAdd, FSub, FMul, FDiv, FNegate, FAbs,
+                FSqrt, FMin, FMax, FFloor, FRound
+  Float compare:FZeroEq, FZeroLt, FEq, FLt
+  Float memory: FetchFloat, StoreFloat
+  Conversion:   StoF, FtoS
+
+
+8. OPTIMIZATION PASSES (detail)
 -------------------------------
 
-  PEEPHOLE (runs 5x across full pipeline):
+  PEEPHOLE (5x across pipeline):
     PushI32(n), Drop    -> (removed)      Unused literal
     Dup, Drop           -> (removed)      Redundant copy
     Swap, Swap          -> (removed)      Self-inverse
@@ -205,16 +308,17 @@ WAFER Architecture Reference (updated 2026-04-13)
     PushI32(1), Mul     -> (removed)      Identity
     Over, Over          -> TwoDup         Combine
     Drop, Drop          -> TwoDrop        Combine
-    (+ float variants: PushF64/FDrop, FDup/FDrop, FSwap/FSwap, FNegate/FNegate)
+    Float variants:
+      PushF64(_), FDrop / FDup, FDrop /
+      FSwap, FSwap / FNegate, FNegate
 
   CONSTANT FOLD:
-    Binary: PushI32(a), PushI32(b), <op> -> PushI32(result)
-      Supports: Add, Sub, Mul, And, Or, Xor, Lshift, Rshift, ArithRshift,
-                Eq, NotEq, Lt, Gt, LtUnsigned
-    Unary: PushI32(n), <op> -> PushI32(result)
-      Supports: Negate, Abs, Invert, ZeroEq, ZeroLt
-    Float binary: PushF64(a), PushF64(b), <op> -> PushF64(result)
-    Float unary: PushF64(n), <op> -> PushF64(result)
+    Binary i32: PushI32(a), PushI32(b), <op> -> PushI32(r)
+      Add, Sub, Mul, And, Or, Xor,
+      Lshift, Rshift, ArithRshift,
+      Eq, NotEq, Lt, Gt, LtUnsigned
+    Unary  i32: Negate, Abs, Invert, ZeroEq, ZeroLt
+    Float binary/unary equivalents on PushF64.
 
   STRENGTH REDUCE:
     PushI32(2^n), Mul   -> PushI32(n), Lshift
@@ -222,85 +326,153 @@ WAFER Architecture Reference (updated 2026-04-13)
     PushI32(0), Lt      -> ZeroLt
 
   DCE:
-    PushI32(nonzero), If{then,else} -> then_body only
-    PushI32(0), If{then,else}       -> else_body only
+    PushI32(nonzero), If{then,else}  -> then_body only
+    PushI32(0),       If{then,else}  -> else_body only
     Everything after Exit            -> removed
 
-  INLINE (max_size=8, single pass):
-    Call(id) -> inline body if:
-      - Body length <= 8 ops
-      - No self-recursion
-      - No Exit (would return from caller)
-      - No ForthLocalGet/Set (would collide with caller's locals)
+  INLINE (max 8 ops, single pass):
+    Call(id) -> body if all of:
+      - body length <= 8 ops
+      - no self-recursion
+      - no Exit (would return from caller)
+      - no ForthLocalGet/Set (would collide with caller locals)
     TailCall -> Call when inlined (no longer tail position)
 
-  TAIL CALL (last pass):
-    Last Call(id) -> TailCall(id) if:
-      - Return stack balanced (equal ToR and FromR)
-    Recurses into If branches for conditional tail calls
+  TAIL CALL (last pass, must be last):
+    trailing Call(id) -> TailCall(id) if return stack balanced
+    (equal ToR / FromR pairs).
+    Recurses into If branches for conditional tail calls.
+
+  STACK-TO-LOCAL PROMOTION (codegen pass, not optimizer):
+    Words whose effects on the data stack can be statically
+    tracked are compiled to use WASM locals 1..s instead of
+    DSP loads/stores. Triggered by `is_promotable(body)`.
+    DSP is still written back before any Call so callees and
+    host functions see a consistent stack.
 
 
-8. CONSOLIDATION
-----------------
+9. CONSOLIDATION (consolidate.rs + codegen.rs)
+----------------------------------------------
 
-  CONSOLIDATE word recompiles all JIT-compiled words into a
-  single WASM module:
-    - All call_indirect -> direct call (for words in module)
-    - External calls (host functions) remain call_indirect
-    - Maximum performance for final program
+  CONSOLIDATE recompiles every JIT-compiled word into ONE WASM
+  module:
+    - All call_indirect to consolidated words become direct
+      `call` (single-module direct calls)
+    - External calls (host functions) stay call_indirect
+    - Removes per-word instantiation overhead and lets the
+      WASM engine inline / specialize across word boundaries
 
-  Two-part implementation:
-    codegen::compile_consolidated_module() - builds multi-function module
-    outer::ForthVM::consolidate() - orchestrates collection + table update
-
-
-9. EXPORT PIPELINE (wafer build)
---------------------------------
-
-  1. Evaluate source file with recording_toplevel=true
-  2. Collect all IR words + top-level IR
-  3. Determine entry: --entry flag > MAIN word > top-level execution
-  4. Build consolidated module with data section (memory snapshot)
-  5. Embed metadata in "wafer" custom section (JSON)
-  6. Optional: --js generates JS loader + HTML page
-  7. Optional: --native AOT-compiles and appends to wafer binary
-     Format: [wafer binary][precompiled WASM][metadata][trailer]
-     Trailer: payload_len(8) + metadata_len(8) + "WAFEREXE"(8)
+  Two parts:
+    codegen::compile_consolidated_module()
+      Builds the multi-function module.
+    outer::ForthVM::consolidate()
+      Collects ir_bodies, computes table layout, compiles,
+      instantiates, and patches the shared function table.
 
 
-10. CRATE STRUCTURE
+10. EXPORT PIPELINE (`wafer build`)
+----------------------------------
+
+  export.rs::export_module() steps:
+    1. Evaluate the source file with recording_toplevel = true
+    2. Collect every IR word + recorded top-level IR
+    3. Resolve entry point (priority):
+         --entry <name>  >  MAIN  >  synthetic _start from the
+         recorded top-level
+    4. Snapshot WASM linear memory (system vars + dictionary +
+       any user data)
+    5. Walk the IR, find every Call/TailCall to a host word
+       not in the consolidated set: those become required
+       imports of the exported module
+    6. Build metadata (JSON, custom "wafer" section):
+         version, entry_table_index, host_functions,
+         memory_size, dsp/rsp/fsp_init
+    7. compile_exportable_module() emits the final WASM with
+       a passive data section seeded from the memory snapshot
+    8. Optional --js: also emit a JS loader + minimal HTML
+    9. Optional --native: AOT-compile and append to the wafer
+       binary itself, in this layout:
+         [wafer ELF/Mach-O][precompiled WASM][metadata]
+         [trailer: payload_len(8) | metadata_len(8) | "WAFEREXE"]
+       The CLI detects the trailer at startup and runs the
+       embedded payload directly (single-file distribution).
+
+
+11. CRATE STRUCTURE
 -------------------
 
   crates/
-    core/     wafer-core: compiler, optimizer, codegen, dictionary, Runtime trait
-              Feature flags: default=["native"], "native" enables wasmtime
-              Without features: pure Rust (dictionary, IR, optimizer, codegen, outer)
-    cli/      wafer: CLI REPL (rustyline), wafer build/run commands
-    web/      wafer-web: browser REPL (wasm-bindgen + WebRuntime + HTML/CSS/JS)
+    core/   wafer-core: compiler, optimizer, codegen,
+            dictionary, runtime trait, outer interpreter.
+            Largest file: codegen.rs (~4.3k LOC).
+            Feature flags:
+              default = ["native"]
+              "native" pulls in wasmtime + NativeRuntime +
+                       runner.rs (CLI executor) + export.rs
+              "crypto" enables SHA1/256/512 host words
+              No features: pure-Rust core for wafer-web
+                       (dictionary, IR, optimizer, codegen,
+                        outer interpreter only)
+    cli/    wafer: rustyline REPL + `wafer build` / `wafer run`
+    web/    wafer-web: browser REPL.
 
   Key web files:
-    crates/web/src/lib.rs          WaferRepl wasm-bindgen entry point
-    crates/web/src/runtime_web.rs  WebRuntime: js_sys WebAssembly API
-    crates/web/www/app.js          Frontend JS (terminal emulation)
-    crates/web/www/index.html      HTML shell
-    crates/web/www/style.css       Styling
+    crates/web/src/lib.rs           WaferRepl wasm-bindgen entry
+    crates/web/src/runtime_web.rs   WebRuntime: js_sys WebAssembly
+    crates/web/www/app.js           Frontend (terminal emulation)
+    crates/web/www/index.html       HTML shell
+    crates/web/www/style.css        Styling
+    crates/web/www/pkg/             wasm-pack output (gitignored)
 
 
-11. BOOT SEQUENCE
+12. BOOT SEQUENCE
 -----------------
 
   ForthVM::<R>::new() ->
     1. R::new() — create runtime (wasmtime or browser WASM)
-    2. register_primitives() in batch_mode:
-       - ~40 IR primitives (DUP, +, @, etc.)
-       - ~60 host functions (., .S, M*, ACCEPT, etc.)
-       - ~30 special words (IF, DO, :, VARIABLE, etc.)
-    3. compile_batch() - single WASM module for all IR primitives
-    4. Load boot.fth - Forth replaces Rust host functions:
-       Phase 1: Stack/memory (DEPTH, PICK, 2OVER, FILL, MOVE)
-       Phase 2: Double-cell arithmetic (D+, DNEGATE, D<)
-       Phase 3: Mixed arithmetic (SM/REM, FM/MOD, */, */MOD)
-       Phase 4: HERE, ALLOT, comma, ALIGN
-       Phase 5: I/O, pictured numeric output (., U., TYPE, <# # #>)
-       Phase 6: DEFER support
-       Phase 7: String operations (COMPARE, SOURCE, FALIGNED)
+    2. register_primitives() in batch_mode = true:
+       - ~110 IR primitive registrations (DUP, +, @, ...)
+       - ~87 host primitive registrations (., .S, M*, ACCEPT, ...)
+       - special interpreter tokens (IF, DO, :, VARIABLE, S",
+         {: :}, [: ;], CONSOLIDATE, ...) handled directly in
+         interpret_token_immediate / compile_token, no IR op
+    3. Word-set registrations:
+         core, double, exception, facility, file (subset),
+         floating-point, locals, memory, search-order,
+         programming-tools, string, optional crypto
+    4. batch_compile_deferred() — single WASM module for all
+       deferred IR primitives
+    5. Load boot.fth (include_str!), evaluated line by line so
+       `\` comments terminate at end-of-line:
+         Phase 1: stack/memory (DEPTH, PICK, 2OVER, FILL, MOVE,
+                  CMOVE, /STRING, -TRAILING)
+         Phase 2: double-cell arithmetic (D+, DNEGATE, D<, D=)
+         Phase 3: mixed arithmetic (SM/REM, FM/MOD, */, */MOD)
+         Phase 4: HERE, ALLOT, comma, ALIGN, ALIGNED
+         Phase 5: I/O + pictured output (., U., TYPE, <# # #>,
+                  SIGN, HOLD)
+         Phase 6: DEFER support (DEFER, IS, ACTION-OF)
+         Phase 7: more replacements (COMPARE, SOURCE, FALIGNED,
+                  DFALIGN, structures, S" hint, ...)
+
+
+13. RUNTIME-VS-EXPORT NOTE
+--------------------------
+
+  Two separate codegen entry points produce multi-function
+  WASM modules from the same IR:
+
+    compile_consolidated_module()  used by CONSOLIDATE
+      - Targets the live runtime
+      - Re-uses the shared globals/table/memory imports
+      - External calls remain call_indirect
+
+    compile_exportable_module()    used by `wafer build`
+      - Targets a standalone module
+      - Carries its own memory (passive data section seeded
+        from the snapshot) and embeds metadata
+      - Required host functions become imports the runner
+        (or AOT loader) must satisfy
+
+  Both share the same per-IrOp lowering helpers; the
+  difference is in module-level wiring.
