@@ -57,3 +57,9 @@ ci: fmt clippy deny test
 # Check compilation without running
 check:
     cargo check --workspace
+
+# Install bat syntax highlighting for WAFER / Forth
+install-syntax:
+    mkdir -p ~/.config/bat/syntaxes
+    cp tools/editor-support/bat/WAFER.sublime-syntax ~/.config/bat/syntaxes/
+    bat cache --build
