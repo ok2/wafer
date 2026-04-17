@@ -852,6 +852,29 @@ impl<R: Runtime> ForthVM<R> {
     fn compile_token(&mut self, token: &str) -> anyhow::Result<()> {
         let token_upper = token.to_ascii_uppercase();
 
+        // Forth 2012 §13.3.3.2 — locals supersede dictionary names (and,
+        // by extension, hardcoded compile-mode shortcuts) within their
+        // declaration scope. Checked here, before any hardcoded token
+        // handling, to keep that precedence uniform — otherwise e.g. a
+        // local named `s` would be hijacked by the `S` string shortcut
+        // below.
+        if let Some(idx) = self
+            .compiling_locals
+            .iter()
+            .position(|n| n.eq_ignore_ascii_case(token))
+        {
+            let kind = self.compiling_local_kinds[idx];
+            let kind_idx = self.compiling_local_kinds[0..idx]
+                .iter()
+                .filter(|k| **k == kind)
+                .count() as u32;
+            match kind {
+                LocalKind::Int => self.push_ir(IrOp::ForthLocalGet(kind_idx)),
+                LocalKind::Float => self.push_ir(IrOp::ForthFLocalGet(kind_idx)),
+            }
+            return Ok(());
+        }
+
         // Handle string literals in compile mode
         if token_upper == ".\"" {
             // Parse until closing quote, emit characters as EMIT calls
@@ -1158,24 +1181,6 @@ impl<R: Runtime> ForthVM<R> {
                 return self.compile_locals_block();
             }
             _ => {}
-        }
-
-        // Check for local variable reference (locals supersede dictionary words)
-        if let Some(idx) = self
-            .compiling_locals
-            .iter()
-            .position(|n| n.eq_ignore_ascii_case(token))
-        {
-            let kind = self.compiling_local_kinds[idx];
-            let kind_idx = self.compiling_local_kinds[0..idx]
-                .iter()
-                .filter(|k| **k == kind)
-                .count() as u32;
-            match kind {
-                LocalKind::Int => self.push_ir(IrOp::ForthLocalGet(kind_idx)),
-                LocalKind::Float => self.push_ir(IrOp::ForthFLocalGet(kind_idx)),
-            }
-            return Ok(());
         }
 
         // Look up in dictionary (search order, then fallback to all wordlists)
@@ -7874,6 +7879,39 @@ mod tests {
         vm.evaluate(": U {: | F: tmp :} 9E TO tmp tmp ;").unwrap();
         vm.evaluate("U F>S").unwrap();
         assert_eq!(vm.data_stack(), vec![9]);
+    }
+
+    #[test]
+    fn test_local_named_s_not_hijacked_by_s_shortcut() {
+        // Forth 2012 §13.3.3.2: locals supersede dictionary names within
+        // their scope. Regression — local `s` was previously hijacked by
+        // the compile-mode `S` string shortcut in compile_token.
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        vm.evaluate("VARIABLE V 42 V !").unwrap();
+        vm.evaluate(": T {: | s :} V TO s s @ ;").unwrap();
+        vm.evaluate("T").unwrap();
+        assert_eq!(vm.data_stack(), vec![42]);
+    }
+
+    #[test]
+    fn test_local_named_s_with_fetch_and_store() {
+        // Exercises both ForthLocalGet and ForthLocalSet for a local named `s`.
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        vm.evaluate("VARIABLE V 0 V !").unwrap();
+        vm.evaluate(": STORE-VIA-S {: | s :} V TO s 99 s ! ;")
+            .unwrap();
+        vm.evaluate("STORE-VIA-S V @").unwrap();
+        assert_eq!(vm.data_stack(), vec![99]);
+    }
+
+    #[test]
+    fn test_int_uninit_local_via_pipe_syntax() {
+        // Missing coverage: int uninit locals via `{: | name :}` — only the
+        // float variant was covered (test_flocal_uninit).
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        vm.evaluate(": U {: | tmp :} 7 TO tmp tmp ;").unwrap();
+        vm.evaluate("U").unwrap();
+        assert_eq!(vm.data_stack(), vec![7]);
     }
 
     // ===================================================================
