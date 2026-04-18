@@ -119,6 +119,13 @@ enum PendingAction {
     CsRoll(u32),
     /// Compile a control-flow operation (from POSTPONE of compile-time keywords).
     CompileControl(i32),
+    /// Forth 2012 §13.6.1.0086 `(LOCAL)` non-sentinel: declare a local of the
+    /// given name. Name is already ASCII-uppercased by the host primitive.
+    DeclareLocal(String),
+    /// Forth 2012 §13.6.1.0086 `(LOCAL)` sentinel (`0 0 (LOCAL)`): emit the
+    /// init code for locals declared since the last sentinel (or start of
+    /// the current colon definition).
+    DeclareLocalEnd,
 }
 
 // Control-flow action codes for PendingAction::CompileControl
@@ -254,6 +261,11 @@ pub struct ForthVM<R: Runtime> {
     compiling_locals: Vec<String>,
     /// Parallel to `compiling_locals`: kind of each local (Int or Float).
     compiling_local_kinds: Vec<LocalKind>,
+    /// Forth 2012 §13.6.1.0086 `(LOCAL)` batch base: index into
+    /// `compiling_locals` where the current `(LOCAL)` batch started.
+    /// `None` means no pending batch. Set on the first `DeclareLocal` of a
+    /// batch, cleared on `DeclareLocalEnd`, reset on `finish_colon_def`.
+    local_batch_base: Option<usize>,
     /// Substitution table for SUBSTITUTE/REPLACES (String word set)
     substitutions: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     /// Search order: list of wordlist IDs (first = top of search order).
@@ -283,6 +295,7 @@ struct CompileFrame {
     saw_create_in_def: bool,
     compiling_locals: Vec<String>,
     compiling_local_kinds: Vec<LocalKind>,
+    local_batch_base: Option<usize>,
     state: i32,
 }
 
@@ -293,6 +306,24 @@ struct CompileFrame {
 pub enum LocalKind {
     Int,
     Float,
+}
+
+/// Advance past the next `\n` in `buf`, starting at `from`. Returns the
+/// byte index of the first character on the next line (or `buf.len()` if
+/// there's no more newline). Used by the `\` line-comment handler per
+/// Forth 2012 §6.2.2535 to correctly stop at end-of-line instead of
+/// end-of-input when the input buffer spans multiple lines.
+fn skip_to_end_of_line(buf: &str, from: usize) -> usize {
+    let bytes = buf.as_bytes();
+    let mut i = from;
+    while i < bytes.len() {
+        let ch = bytes[i];
+        i += 1;
+        if ch == b'\n' {
+            break;
+        }
+    }
+    i
 }
 
 impl<R: Runtime> ForthVM<R> {
@@ -358,6 +389,7 @@ impl<R: Runtime> ForthVM<R> {
             next_block_label: 0,
             compiling_locals: Vec::new(),
             compiling_local_kinds: Vec::new(),
+            local_batch_base: None,
             substitutions: Arc::new(Mutex::new(HashMap::new())),
             search_order: Arc::new(Mutex::new(vec![1])),
             next_wid: Arc::new(Mutex::new(2)),
@@ -367,7 +399,11 @@ impl<R: Runtime> ForthVM<R> {
                     .duration_since(UNIX_EPOCH)
                     .map(|d| d.as_nanos() as u64)
                     .unwrap_or(0xDEAD_BEEF_CAFE_BABE);
-                Arc::new(Mutex::new(if seed == 0 { 0xDEAD_BEEF_CAFE_BABE } else { seed }))
+                Arc::new(Mutex::new(if seed == 0 {
+                    0xDEAD_BEEF_CAFE_BABE
+                } else {
+                    seed
+                }))
             },
             compile_frames: Vec::new(),
             compiling_word_addr: 0,
@@ -399,6 +435,7 @@ impl<R: Runtime> ForthVM<R> {
                     self.compiling_word_id = None;
                     self.compiling_locals.clear();
                     self.compiling_local_kinds.clear();
+                    self.local_batch_base = None;
                     self.compile_frames.clear();
                     return Err(e);
                 }
@@ -750,8 +787,10 @@ impl<R: Runtime> ForthVM<R> {
             return Ok(());
         }
         if token_upper == "\\" {
-            // Line comment -- skip rest of input
-            self.input_pos = self.input_buffer.len();
+            // Forth 2012 §6.2.2535: `\` parses and discards the remainder
+            // of the *line*, not the remainder of the input buffer. Stop
+            // at the first `\n`; fall through to end-of-buffer otherwise.
+            self.input_pos = skip_to_end_of_line(&self.input_buffer, self.input_pos);
             return Ok(());
         }
 
@@ -938,7 +977,8 @@ impl<R: Runtime> ForthVM<R> {
             return Ok(());
         }
         if token_upper == "\\" {
-            self.input_pos = self.input_buffer.len();
+            // See interpret-mode branch: `\` ends at `\n`, not at `#TIB`.
+            self.input_pos = skip_to_end_of_line(&self.input_buffer, self.input_pos);
             return Ok(());
         }
 
@@ -1948,6 +1988,7 @@ impl<R: Runtime> ForthVM<R> {
             saw_create_in_def: self.saw_create_in_def,
             compiling_locals: std::mem::take(&mut self.compiling_locals),
             compiling_local_kinds: std::mem::take(&mut self.compiling_local_kinds),
+            local_batch_base: self.local_batch_base.take(),
             state: self.state,
         };
         self.compile_frames.push(frame);
@@ -1993,6 +2034,7 @@ impl<R: Runtime> ForthVM<R> {
         self.saw_create_in_def = frame.saw_create_in_def;
         self.compiling_locals = frame.compiling_locals;
         self.compiling_local_kinds = frame.compiling_local_kinds;
+        self.local_batch_base = frame.local_batch_base;
         self.state = frame.state;
 
         if self.state != 0 {
@@ -2095,6 +2137,7 @@ impl<R: Runtime> ForthVM<R> {
 
         self.compiling_locals.clear();
         self.compiling_local_kinds.clear();
+        self.local_batch_base = None;
 
         let name = self
             .compiling_name
@@ -2685,6 +2728,9 @@ impl<R: Runtime> ForthVM<R> {
 
         // CS-PICK, CS-ROLL, __CTRL__ for Programming-Tools / POSTPONE of control words
         self.register_cs_pick_roll()?;
+
+        // (LOCAL) for Forth 2012 §13.6.1.0086 lower-level locals primitive
+        self.register_local_paren()?;
 
         // Runtime DOES> patch for double-DOES> support
         self.register_does_patch()?;
@@ -4229,6 +4275,7 @@ impl<R: Runtime> ForthVM<R> {
         let saved_control = std::mem::take(&mut self.control_stack);
         let saved_locals = std::mem::take(&mut self.compiling_locals);
         let saved_local_kinds = std::mem::take(&mut self.compiling_local_kinds);
+        let saved_local_batch_base = self.local_batch_base.take();
 
         self.compiling_ir.clear();
         self.compiling_name = Some("_does_action_".to_string());
@@ -4273,6 +4320,7 @@ impl<R: Runtime> ForthVM<R> {
         self.control_stack = saved_control;
         self.compiling_locals = saved_locals;
         self.compiling_local_kinds = saved_local_kinds;
+        self.local_batch_base = saved_local_batch_base;
 
         // Register the defining word as a "does-defining" word.
         let has_create = self.saw_create_in_def;
@@ -4738,6 +4786,45 @@ impl<R: Runtime> ForthVM<R> {
         Ok(())
     }
 
+    /// Register `(LOCAL)` per Forth 2012 §13.6.1.0086.
+    ///
+    /// Compile-time `( c-addr u -- )`. When `u > 0`, declare a local named by
+    /// the byte slice at `c-addr`/`u`. When `u = 0`, emit the initialization
+    /// code for all locals declared since the last sentinel (the runtime
+    /// `ForthLocalSet`s that pop args from the data stack in reverse
+    /// declaration order).
+    ///
+    /// The word is non-immediate: it runs when its containing immediate word
+    /// (typically user-defined `LOCAL` or `END-LOCALS`) executes during the
+    /// outer compilation loop. Because `HostAccess` cannot reach into the
+    /// outer-interpreter compile state directly, the actual mutation is
+    /// deferred via `PendingAction::DeclareLocal` / `DeclareLocalEnd` and
+    /// processed in `handle_pending_actions` once the immediate word returns.
+    fn register_local_paren(&mut self) -> anyhow::Result<()> {
+        let pending = Arc::clone(&self.pending_actions);
+
+        let func: HostFn = Box::new(move |ctx: &mut dyn HostAccess| {
+            // ( c-addr u -- ) — pop both cells.
+            let sp = ctx.get_dsp();
+            let u = ctx.mem_read_i32(sp) as u32;
+            let addr = ctx.mem_read_i32(sp + CELL_SIZE) as u32;
+            ctx.set_dsp(sp + 2 * CELL_SIZE);
+
+            let action = if u == 0 {
+                PendingAction::DeclareLocalEnd
+            } else {
+                let bytes = ctx.mem_read_slice(addr, u as usize);
+                let name = String::from_utf8_lossy(&bytes).to_ascii_uppercase();
+                PendingAction::DeclareLocal(name)
+            };
+            pending.lock().unwrap().push(action);
+            Ok(())
+        });
+
+        self.register_host_primitive("(LOCAL)", false, func)?;
+        Ok(())
+    }
+
     /// Register `_does_patch_` as a host function for runtime DOES> patching.
     /// ( `does_action_id` -- ) Signals the outer interpreter to patch the most
     /// recently `CREATEd` word with a new DOES> action.
@@ -5011,6 +5098,39 @@ impl<R: Runtime> ForthVM<R> {
                     CTRL_AHEAD => self.compile_ahead()?,
                     _ => anyhow::bail!("unknown control code: {code}"),
                 },
+                // Forth 2012 §13.6.1.0086 `(LOCAL)`: append the named local
+                // to the current compile context. Locals declared via
+                // `(LOCAL)` are int-only per spec (float locals are not
+                // covered by this word).
+                PendingAction::DeclareLocal(name) => {
+                    if self.state == 0 {
+                        anyhow::bail!("(LOCAL): only valid during compilation");
+                    }
+                    if self.local_batch_base.is_none() {
+                        self.local_batch_base = Some(self.compiling_locals.len());
+                    }
+                    self.compiling_locals.push(name);
+                    self.compiling_local_kinds.push(LocalKind::Int);
+                }
+                // Forth 2012 §13.6.1.0086 `(LOCAL)` sentinel: emit init
+                // code for the batch of locals just declared. Pop the
+                // runtime args from the data stack in reverse declaration
+                // order — consistent with `compile_locals_block` at the
+                // `{: ... :}` flow.
+                PendingAction::DeclareLocalEnd => {
+                    if let Some(base) = self.local_batch_base.take() {
+                        for slot in (base..self.compiling_locals.len()).rev() {
+                            let kind_idx = self.compiling_local_kinds[0..slot]
+                                .iter()
+                                .filter(|k| **k == LocalKind::Int)
+                                .count() as u32;
+                            self.push_ir(IrOp::ForthLocalSet(kind_idx));
+                        }
+                    }
+                    // No-op if no batch is pending — spec-permissible for
+                    // a user that calls `0 0 (LOCAL)` at the top of a
+                    // definition before declaring anything.
+                }
             }
         }
         Ok(())
@@ -5088,11 +5208,24 @@ impl<R: Runtime> ForthVM<R> {
     /// Register `\` as an immediate host function that sets >IN to end of input.
     fn register_backslash(&mut self) -> anyhow::Result<()> {
         let func: HostFn = Box::new(move |ctx: &mut dyn HostAccess| {
-            // Read #TIB (input buffer length)
+            // Forth 2012 §6.2.2535 `\`: "Parse and discard the remainder of
+            // the parse area." The parse area extends to the end of the
+            // current **line**, not the end of the input buffer. Scan from
+            // the current `>IN` forward for the first `\n`, and set `>IN`
+            // to the position after it. If there's no newline, stop at
+            // `#TIB` (end of buffer), matching the single-line case.
             let b: [u8; 4] = ctx.mem_read_i32(SYSVAR_NUM_TIB as u32).to_le_bytes();
             let num_tib = u32::from_le_bytes(b);
-            // Set >IN to end of input
-            ctx.mem_write_i32(SYSVAR_TO_IN as u32, num_tib as i32);
+            let b: [u8; 4] = ctx.mem_read_i32(SYSVAR_TO_IN as u32).to_le_bytes();
+            let mut to_in = u32::from_le_bytes(b);
+            while to_in < num_tib {
+                let ch = ctx.mem_read_u8(INPUT_BUFFER_BASE + to_in);
+                to_in += 1;
+                if ch == b'\n' {
+                    break;
+                }
+            }
+            ctx.mem_write_i32(SYSVAR_TO_IN as u32, to_in as i32);
             Ok(())
         });
 
@@ -5300,7 +5433,11 @@ impl<R: Runtime> ForthVM<R> {
             let seed = ctx.mem_read_i32(sp as u32) as u32 as u64;
             ctx.set_dsp(sp + CELL_SIZE);
             let mut s = state.lock().unwrap();
-            *s = if seed == 0 { 0xDEAD_BEEF_CAFE_BABE } else { seed };
+            *s = if seed == 0 {
+                0xDEAD_BEEF_CAFE_BABE
+            } else {
+                seed
+            };
             Ok(())
         });
         self.register_host_primitive("RND-SEED", false, func)?;
@@ -7914,6 +8051,56 @@ mod tests {
         assert_eq!(vm.data_stack(), vec![7]);
     }
 
+    #[test]
+    fn test_local_primitive_lt32() {
+        // Forth 2012 §13.6.1.0086 `(LOCAL)` — replica of LT32 from
+        // localstest.fth line 118-120 (the test that was silently skipped
+        // before `(LOCAL)` was implemented).
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        vm.evaluate(": LOCAL BL WORD COUNT (LOCAL) ; IMMEDIATE")
+            .unwrap();
+        vm.evaluate(": END-LOCALS 0 0 (LOCAL) ; IMMEDIATE").unwrap();
+        vm.evaluate(": LT32 LOCAL A LOCAL B LOCAL C END-LOCALS A B C ;")
+            .unwrap();
+        vm.evaluate("61 62 63 LT32").unwrap();
+        assert_eq!(vm.data_stack(), vec![63, 62, 61]);
+    }
+
+    #[test]
+    fn test_multiline_colon_then_variable() {
+        // Regression: combined `:` def across newlines must leave state at
+        // interpret afterwards. Earlier, WAFER's `\` (backslash comment)
+        // consumed to `#TIB` instead of the next `\n`, so multi-line chunks
+        // lost the closing `;` inside a comment and left state in compile
+        // mode. The symptom was a later `VARIABLE X 0 X !` erroring on
+        // `unknown word: X`, because the outer `:` never actually closed.
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        vm.evaluate(": EMPTY-STACK\n   DEPTH ?DUP IF DUP 0< IF NEGATE 0 DO 0 LOOP ELSE 0 DO DROP LOOP THEN THEN ;").unwrap();
+        vm.evaluate("VARIABLE #ERRORS 0 #ERRORS !").unwrap();
+        vm.evaluate("#ERRORS @").unwrap();
+        assert_eq!(vm.data_stack(), vec![0]);
+    }
+
+    #[test]
+    fn test_backslash_stops_at_newline() {
+        // Forth 2012 §6.2.2535 `\`: parse-and-discard ends at end-of-line,
+        // not end of input buffer. Multi-line input must survive a `\`
+        // comment on a prior line.
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        vm.evaluate("\\ comment line\n42").unwrap();
+        assert_eq!(vm.data_stack(), vec![42]);
+    }
+
+    #[test]
+    fn test_local_primitive_end_sentinel_only() {
+        // `0 0 (LOCAL)` with no prior names must be a harmless no-op.
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        vm.evaluate(": END-LOCALS 0 0 (LOCAL) ; IMMEDIATE").unwrap();
+        vm.evaluate(": T END-LOCALS 42 ;").unwrap();
+        vm.evaluate("T").unwrap();
+        assert_eq!(vm.data_stack(), vec![42]);
+    }
+
     // ===================================================================
     // Quotations: [: ... ;]
     // ===================================================================
@@ -7999,11 +8186,11 @@ mod tests {
     fn test_random_deterministic_after_seed() {
         let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
         vm.evaluate("42 RND-SEED RANDOM RANDOM RANDOM").unwrap();
-        let first = vm.data_stack().to_vec();
+        let first = vm.data_stack().clone();
 
         let mut vm2 = ForthVM::<NativeRuntime>::new().unwrap();
         vm2.evaluate("42 RND-SEED RANDOM RANDOM RANDOM").unwrap();
-        let second = vm2.data_stack().to_vec();
+        let second = vm2.data_stack().clone();
 
         assert_eq!(first, second, "same seed must produce same sequence");
         assert_eq!(first.len(), 3);
@@ -8021,7 +8208,11 @@ mod tests {
         }
         // xorshift64's low-32 sequence repeats after a long period; 1000 pulls
         // should hit at least 900 unique cells.
-        assert!(seen.len() >= 900, "only {} distinct out of 1000", seen.len());
+        assert!(
+            seen.len() >= 900,
+            "only {} distinct out of 1000",
+            seen.len()
+        );
     }
 
     #[test]
@@ -8030,7 +8221,10 @@ mod tests {
         let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
         vm.evaluate("0 RND-SEED RANDOM RANDOM").unwrap();
         let stack = vm.data_stack();
-        assert!(stack[0] != 0 || stack[1] != 0, "seed-0 must not freeze the stream");
+        assert!(
+            stack[0] != 0 || stack[1] != 0,
+            "seed-0 must not freeze the stream"
+        );
     }
 
     // ===================================================================
