@@ -1,6 +1,6 @@
 //! End-to-end tests for the `SHA1` / `SHA256` / `SHA512` Forth host words.
 //!
-//! These run inside a real WAFER VM (NativeRuntime). The Forth program writes
+//! These run inside a real WAFER VM (`NativeRuntime`). The Forth program writes
 //! a counted string into `PAD`, calls the hash word, then the test reads the
 //! digest out of WAFER linear memory and compares it to the RFC-3174 / FIPS-180
 //! reference vectors.
@@ -26,10 +26,16 @@ fn hash_via_forth(word: &str, input: &[u8]) -> Vec<u8> {
 
     // Stack now: ( c-addr2 u2 ). Read u2 then c-addr2 from data stack.
     let stack = vm.data_stack();
-    assert!(stack.len() >= 2, "expected (addr len) on stack, got {stack:?}");
+    assert!(
+        stack.len() >= 2,
+        "expected (addr len) on stack, got {stack:?}"
+    );
     let u2 = stack[0] as usize;
     let addr2 = stack[1] as u32;
-    assert_eq!(addr2, HASH_SCRATCH_BASE, "digest should land in HASH_SCRATCH");
+    assert_eq!(
+        addr2, HASH_SCRATCH_BASE,
+        "digest should land in HASH_SCRATCH"
+    );
 
     // Read the digest out of WAFER linear memory.
     let mut bytes = Vec::with_capacity(u2);

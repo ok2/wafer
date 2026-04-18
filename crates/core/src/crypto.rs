@@ -80,7 +80,10 @@ mod tests {
 
     #[test]
     fn sha1_rfc3174_abc() {
-        assert_eq!(hex(&sha1_hash(b"abc")), "a9993e364706816aba3e25717850c26c9cd0d89d");
+        assert_eq!(
+            hex(&sha1_hash(b"abc")),
+            "a9993e364706816aba3e25717850c26c9cd0d89d"
+        );
     }
 
     #[test]
