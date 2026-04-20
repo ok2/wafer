@@ -23,6 +23,8 @@ contexts:
     - include: strings
     - include: numbers
     - include: definitions
+    - include: locals
+    - include: structures
     - include: control
     - include: stack_ops
     - include: return_stack
@@ -36,6 +38,7 @@ contexts:
     - include: exception
     - include: parsing
     - include: literals
+    - include: hashing
     - include: wafer_extras
 
   comments:
@@ -89,6 +92,9 @@ contexts:
         3: entity.name.function.forth
     - match: '(?i)(?:^|(?<=\s));{{ident_break}}'
       scope: keyword.other.definition.forth
+    # Quotations (Core-Ext 6.2.0455): [: ... ;] compiles an anonymous word.
+    - match: '(?i)(?:^|(?<=\s))(\[:|;\]){{ident_break}}'
+      scope: keyword.other.definition.forth
     - match: '(?i)(?:^|(?<=\s))(VARIABLE|2VARIABLE|CONSTANT|2CONSTANT|VALUE|CREATE|DEFER|MARKER|BUFFER:|FCONSTANT|FVARIABLE)(\s+)(\S+)?'
       captures:
         1: keyword.other.defining.forth
@@ -141,15 +147,43 @@ contexts:
       scope: keyword.control.exception.forth
 
   parsing:
-    - match: '(?i)(?:^|(?<=\s))(PARSE|PARSE-NAME|WORD|REFILL|EVALUATE|SOURCE|SOURCE-ID|>IN|BASE|STATE|>NUMBER|SEARCH|SUBSTITUTE|UNESCAPE|REPLACES){{ident_break}}'
+    - match: '(?i)(?:^|(?<=\s))(PARSE|PARSE-NAME|WORD|REFILL|EVALUATE|SOURCE|SOURCE-ID|>IN|BASE|STATE|>NUMBER|SEARCH|SUBSTITUTE|UNESCAPE|REPLACES|S){{ident_break}}'
       scope: support.function.parsing.forth
 
   literals:
     - match: '(?i)(?:^|(?<=\s))(TRUE|FALSE|BL|CHAR|\[CHAR\]|\[COMPILE\]){{ident_break}}'
       scope: constant.language.forth
 
+  # Forth 2012 §13 Locals. `{: ... :}` is the user-facing form; `{F:` is the
+  # float-locals variant (gforth/SwiftForth-style). `(LOCAL)` is the low-level
+  # primitive from §13.6.1.0086; user code typically builds `LOCAL` /
+  # `END-LOCALS` on top of it. `TO` rebinds a VALUE or local; `LOCALS|` is the
+  # §13 legacy (Forth-94) form.
+  locals:
+    - match: '(?i)(?:^|(?<=\s))(\{:|:\}|\{F:|LOCALS\|){{ident_break}}'
+      scope: keyword.other.locals.forth
+    - match: '(?i)(?:^|(?<=\s))(TO|END-LOCALS){{ident_break}}'
+      scope: keyword.other.locals.forth
+    - match: '(?i)(?:^|(?<=\s))\(LOCAL\){{ident_break}}'
+      scope: support.function.locals.forth
+
+  # Structure words — Facility-ext 10.6.2.0935 (defined in boot.fth).
+  structures:
+    - match: '(?i)(?:^|(?<=\s))(BEGIN-STRUCTURE)(\s+)(\S+)?'
+      captures:
+        1: keyword.other.struct.forth
+        3: entity.name.struct.forth
+    - match: '(?i)(?:^|(?<=\s))(END-STRUCTURE|\+FIELD|FIELD:|CFIELD:|FFIELD:|SFFIELD:|DFFIELD:){{ident_break}}'
+      scope: keyword.other.struct.forth
+
+  # Hash primitives — mirrors the registry in crates/core/src/crypto.rs. When
+  # new algorithms are added to `crypto::ALGOS`, extend this alternation.
+  hashing:
+    - match: '(?i)(?:^|(?<=\s))(SHA1|SHA256|SHA512){{ident_break}}'
+      scope: support.function.hash.forth
+
   wafer_extras:
     # WAFER-specific extensions beyond the Forth 2012 standard.
     # When the language grows new user-facing non-standard words, add them here.
-    - match: '(?i)(?:^|(?<=\s))(CONSOLIDATE|RANDOM|RND-SEED|UTIME){{ident_break}}'
+    - match: '(?i)(?:^|(?<=\s))(CONSOLIDATE|RANDOM|RND-SEED|UTIME|READ-PASSWORD){{ident_break}}'
       scope: support.function.wafer-extra.forth
