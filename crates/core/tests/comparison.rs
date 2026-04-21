@@ -26,8 +26,7 @@ fn probe_gforth(candidate: &str) -> bool {
         .arg("-e")
         .arg("bye")
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|o| o.status.success())
 }
 
 fn find_gforth() -> Option<&'static str> {

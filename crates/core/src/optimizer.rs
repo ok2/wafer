@@ -591,15 +591,15 @@ fn contains_call_to(ops: &[IrOp], target: WordId) -> bool {
                     return true;
                 }
             }
-            IrOp::DoLoop { body, .. } | IrOp::BeginUntil { body } | IrOp::BeginAgain { body } => {
-                if contains_call_to(body, target) {
-                    return true;
-                }
+            IrOp::DoLoop { body, .. } | IrOp::BeginUntil { body } | IrOp::BeginAgain { body }
+                if contains_call_to(body, target) =>
+            {
+                return true;
             }
-            IrOp::BeginWhileRepeat { test, body } => {
-                if contains_call_to(test, target) || contains_call_to(body, target) {
-                    return true;
-                }
+            IrOp::BeginWhileRepeat { test, body }
+                if contains_call_to(test, target) || contains_call_to(body, target) =>
+            {
+                return true;
             }
             IrOp::BeginDoubleWhileRepeat {
                 outer_test,
@@ -651,15 +651,13 @@ fn contains_exit(ops: &[IrOp]) -> bool {
                     return true;
                 }
             }
-            IrOp::DoLoop { body, .. } | IrOp::BeginUntil { body } | IrOp::BeginAgain { body } => {
-                if contains_exit(body) {
-                    return true;
-                }
+            IrOp::DoLoop { body, .. } | IrOp::BeginUntil { body } | IrOp::BeginAgain { body }
+                if contains_exit(body) =>
+            {
+                return true;
             }
-            IrOp::BeginWhileRepeat { test, body } => {
-                if contains_exit(test) || contains_exit(body) {
-                    return true;
-                }
+            IrOp::BeginWhileRepeat { test, body } if contains_exit(test) || contains_exit(body) => {
+                return true;
             }
             _ => {}
         }

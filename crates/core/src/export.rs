@@ -131,10 +131,8 @@ pub fn export_module(
 fn collect_external_calls(ops: &[IrOp], ir_ids: &HashSet<WordId>, host_ids: &mut HashSet<WordId>) {
     for op in ops {
         match op {
-            IrOp::Call(id) | IrOp::TailCall(id) => {
-                if !ir_ids.contains(id) {
-                    host_ids.insert(*id);
-                }
+            IrOp::Call(id) | IrOp::TailCall(id) if !ir_ids.contains(id) => {
+                host_ids.insert(*id);
             }
             IrOp::If {
                 then_body,

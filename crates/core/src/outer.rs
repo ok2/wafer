@@ -397,8 +397,7 @@ impl<R: Runtime> ForthVM<R> {
                 use std::time::{SystemTime, UNIX_EPOCH};
                 let seed = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_nanos() as u64)
-                    .unwrap_or(0xDEAD_BEEF_CAFE_BABE);
+                    .map_or(0xDEAD_BEEF_CAFE_BABE, |d| d.as_nanos() as u64);
                 Arc::new(Mutex::new(if seed == 0 {
                     0xDEAD_BEEF_CAFE_BABE
                 } else {

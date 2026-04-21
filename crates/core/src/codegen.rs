@@ -2012,14 +2012,12 @@ fn emit_promoted_op(f: &mut Function, op: &IrOp, sim: &mut StackSim) {
             // Outside loops, RFetch shouldn't appear in promoted code
         }
 
-        IrOp::LoopJ => {
-            if sim.loop_index_stack.len() >= 2 {
-                let (outer_index, _) = sim.loop_index_stack[sim.loop_index_stack.len() - 2];
-                let result = sim.alloc();
-                f.instruction(&Instruction::LocalGet(outer_index));
-                f.instruction(&Instruction::LocalSet(result));
-                sim.push(result);
-            }
+        IrOp::LoopJ if sim.loop_index_stack.len() >= 2 => {
+            let (outer_index, _) = sim.loop_index_stack[sim.loop_index_stack.len() - 2];
+            let result = sim.alloc();
+            f.instruction(&Instruction::LocalGet(outer_index));
+            f.instruction(&Instruction::LocalSet(result));
+            sim.push(result);
         }
 
         IrOp::Exit => {
@@ -2147,15 +2145,15 @@ fn needs_f64_locals(ops: &[IrOp]) -> bool {
                     return true;
                 }
             }
-            IrOp::DoLoop { body, .. } | IrOp::BeginUntil { body } | IrOp::BeginAgain { body } => {
-                if needs_f64_locals(body) {
-                    return true;
-                }
+            IrOp::DoLoop { body, .. } | IrOp::BeginUntil { body } | IrOp::BeginAgain { body }
+                if needs_f64_locals(body) =>
+            {
+                return true;
             }
-            IrOp::BeginWhileRepeat { test, body } => {
-                if needs_f64_locals(test) || needs_f64_locals(body) {
-                    return true;
-                }
+            IrOp::BeginWhileRepeat { test, body }
+                if needs_f64_locals(test) || needs_f64_locals(body) =>
+            {
+                return true;
             }
             IrOp::BeginDoubleWhileRepeat {
                 outer_test,
@@ -2209,15 +2207,15 @@ fn body_needs_return_stack(ops: &[IrOp]) -> bool {
                     return true;
                 }
             }
-            IrOp::DoLoop { body, .. } | IrOp::BeginUntil { body } | IrOp::BeginAgain { body } => {
-                if body_needs_return_stack(body) {
-                    return true;
-                }
+            IrOp::DoLoop { body, .. } | IrOp::BeginUntil { body } | IrOp::BeginAgain { body }
+                if body_needs_return_stack(body) =>
+            {
+                return true;
             }
-            IrOp::BeginWhileRepeat { test, body } => {
-                if body_needs_return_stack(test) || body_needs_return_stack(body) {
-                    return true;
-                }
+            IrOp::BeginWhileRepeat { test, body }
+                if body_needs_return_stack(test) || body_needs_return_stack(body) =>
+            {
+                return true;
             }
             IrOp::BeginDoubleWhileRepeat {
                 outer_test,
