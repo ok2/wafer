@@ -73,6 +73,19 @@
   REPEAT ;
 
 \ ---------------------------------------------------------------
+\ Common extensions (not in Forth 2012, gforth-compatible)
+\ ---------------------------------------------------------------
+
+\ -ROT ( x1 x2 x3 -- x3 x1 x2 )  rotate top item to third place
+: -ROT  ROT ROT ;
+
+\ <= ( n1 n2 -- flag )  true if n1 <= n2 (signed)
+: <=  > 0= ;
+
+\ >= ( n1 n2 -- flag )  true if n1 >= n2 (signed)
+: >=  < 0= ;
+
+\ ---------------------------------------------------------------
 \ Phase 2: Double-cell arithmetic
 \ ---------------------------------------------------------------
 

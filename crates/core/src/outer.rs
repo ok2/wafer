@@ -7462,6 +7462,12 @@ mod tests {
         assert_eq!(eval_stack("1 2 3 ROT"), vec![1, 3, 2]);
     }
 
+    #[test]
+    fn test_minus_rot() {
+        // ( 1 2 3 -- 3 1 2 )  top-first: [2, 1, 3]
+        assert_eq!(eval_stack("1 2 3 -ROT"), vec![2, 1, 3]);
+    }
+
     // -- Comparison --
 
     #[test]
@@ -7480,6 +7486,20 @@ mod tests {
     fn test_greater_than() {
         assert_eq!(eval_stack("5 3 >"), vec![-1]);
         assert_eq!(eval_stack("3 5 >"), vec![0]);
+    }
+
+    #[test]
+    fn test_less_or_equal() {
+        assert_eq!(eval_stack("3 5 <="), vec![-1]);
+        assert_eq!(eval_stack("5 5 <="), vec![-1]);
+        assert_eq!(eval_stack("5 3 <="), vec![0]);
+    }
+
+    #[test]
+    fn test_greater_or_equal() {
+        assert_eq!(eval_stack("5 3 >="), vec![-1]);
+        assert_eq!(eval_stack("5 5 >="), vec![-1]);
+        assert_eq!(eval_stack("3 5 >="), vec![0]);
     }
 
     // -- Logic --
