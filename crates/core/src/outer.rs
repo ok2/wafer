@@ -393,6 +393,11 @@ impl<R: Runtime> ForthVM<R> {
             substitutions: Arc::new(Mutex::new(HashMap::new())),
             search_order: Arc::new(Mutex::new(vec![1])),
             next_wid: Arc::new(Mutex::new(2)),
+            // SystemTime::now() PANICS on wasm32-unknown-unknown (no time
+            // source), which turned VM construction into an `unreachable`
+            // trap in the browser. Seed from the wall clock only where one
+            // exists; wasm hosts start deterministic and reseed via RND-SEED.
+            #[cfg(not(target_arch = "wasm32"))]
             rng_state: {
                 use std::time::{SystemTime, UNIX_EPOCH};
                 let seed = SystemTime::now()
@@ -404,6 +409,8 @@ impl<R: Runtime> ForthVM<R> {
                     seed
                 }))
             },
+            #[cfg(target_arch = "wasm32")]
+            rng_state: Arc::new(Mutex::new(0xDEAD_BEEF_CAFE_BABE)),
             compile_frames: Vec::new(),
             compiling_word_addr: 0,
         };
@@ -5383,20 +5390,30 @@ impl<R: Runtime> ForthVM<R> {
     /// UTIME ( -- ud ) push microseconds since epoch as a double-cell value.
     fn register_utime(&mut self) -> anyhow::Result<()> {
         let func: HostFn = Box::new(move |ctx: &mut dyn HostAccess| {
-            use std::time::{SystemTime, UNIX_EPOCH};
-            let us = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_micros() as u64;
-            let lo = us as i32;
-            let hi = (us >> 32) as i32;
-            // Push double: lo first (deeper), then hi on top
-            let sp = ctx.get_dsp();
-            let new_sp = sp - 2 * CELL_SIZE;
-            ctx.mem_write_i32(new_sp as u32, hi as i32);
-            ctx.mem_write_slice(new_sp as u32 + 4, &lo.to_le_bytes());
-            ctx.set_dsp((new_sp as i32) as u32);
-            Ok(())
+            // SystemTime::now() panics on wasm32-unknown-unknown; fail as a
+            // catchable Forth error instead of poisoning the VM with a trap.
+            #[cfg(target_arch = "wasm32")]
+            {
+                let _ = ctx;
+                Err(anyhow::anyhow!("UTIME: no time source on this platform"))
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                use std::time::{SystemTime, UNIX_EPOCH};
+                let us = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_micros() as u64;
+                let lo = us as i32;
+                let hi = (us >> 32) as i32;
+                // Push double: lo first (deeper), then hi on top
+                let sp = ctx.get_dsp();
+                let new_sp = sp - 2 * CELL_SIZE;
+                ctx.mem_write_i32(new_sp as u32, hi as i32);
+                ctx.mem_write_slice(new_sp as u32 + 4, &lo.to_le_bytes());
+                ctx.set_dsp((new_sp as i32) as u32);
+                Ok(())
+            }
         });
 
         self.register_host_primitive("UTIME", false, func)?;
