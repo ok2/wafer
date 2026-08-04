@@ -43,6 +43,10 @@ bench:
 bench-opts:
     cargo test -p wafer-core --test benchmark_report -- --nocapture --ignored
 
+# Cross-engine performance report: WAFER vs gforth vs SwiftForth (sf64)
+bench-compare:
+    CARGO_PROFILE_RELEASE_STRIP=none cargo test -p wafer-core --release --test comparison -- --nocapture --ignored performance_report
+
 # Check dependency licenses and advisories
 deny:
     cargo deny check

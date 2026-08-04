@@ -1,8 +1,10 @@
 #![allow(dead_code)]
-//! Cross-engine comparison tests: WAFER vs gforth.
+//! Cross-engine comparison tests: WAFER vs gforth (and `SwiftForth` for perf).
 //!
 //! Validates that WAFER produces identical output to gforth for standard
-//! Forth programs, and benchmarks performance of both engines.
+//! Forth programs, and benchmarks performance of the engines. `SwiftForth`
+//! (`sf64`, native-code commercial compiler) joins the performance report
+//! as an upper-bound reference when installed.
 //!
 //! WAFER-only correctness:  `cargo test -p wafer-core --test comparison`
 //! Full comparison + perf:  `cargo test -p wafer-core --test comparison -- --nocapture --ignored`
@@ -61,6 +63,46 @@ fn find_gforth_fast() -> Option<&'static str> {
             None
         })
         .as_deref()
+}
+
+// -----------------------------------------------------------------------
+// SwiftForth (sf64) discovery (cached)
+// -----------------------------------------------------------------------
+
+static SF64_PATH: OnceLock<Option<String>> = OnceLock::new();
+
+/// Probe sf64 by piping `bye` via stdin — sf64 has no `-e` flag; it takes
+/// Forth source from stdin or as bare command-line arguments.
+fn probe_sf64(candidate: &str) -> bool {
+    run_via_stdin(candidate, "bye\n").is_some_and(|o| o.status.success())
+}
+
+fn find_sf64() -> Option<&'static str> {
+    SF64_PATH
+        .get_or_init(|| {
+            for candidate in &["/Applications/ForthInc/SwiftForth/bin/macos/sf64", "sf64"] {
+                if probe_sf64(candidate) {
+                    return Some(candidate.to_string());
+                }
+            }
+            None
+        })
+        .as_deref()
+}
+
+/// Spawn `binary`, write `input` to its stdin, and collect the output.
+fn run_via_stdin(binary: &str, input: &str) -> Option<std::process::Output> {
+    Command::new(binary)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child.stdin.take().unwrap().write_all(input.as_bytes())?;
+            child.wait_with_output()
+        })
+        .ok()
 }
 
 // -----------------------------------------------------------------------
@@ -698,31 +740,11 @@ fn measure_wafer_release(wafer: &str, bench: &PerfBenchmark) -> Option<u64> {
         define = bench.define,
         run = bench.run_code,
     );
-    let output = Command::new(wafer)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            child.stdin.take().unwrap().write_all(code.as_bytes())?;
-            child.wait_with_output()
-        })
-        .ok()?;
+    let output = run_via_stdin(wafer, &code)?;
     if !output.status.success() {
         return None;
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut times: Vec<u64> = stdout
-        .trim()
-        .lines()
-        .filter_map(|l| l.trim().parse::<u64>().ok())
-        .collect();
-    times.sort();
-    if times.is_empty() {
-        return None;
-    }
-    Some(times[times.len() / 2])
+    median_printed_time(&output.stdout)
 }
 
 /// Measure WAFER execution time after CONSOLIDATE (direct calls between all words).
@@ -734,21 +756,17 @@ fn measure_wafer_consolidated(wafer: &str, bench: &PerfBenchmark) -> Option<u64>
         define = bench.define,
         run = bench.run_code,
     );
-    let output = Command::new(wafer)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            child.stdin.take().unwrap().write_all(code.as_bytes())?;
-            child.wait_with_output()
-        })
-        .ok()?;
+    let output = run_via_stdin(wafer, &code)?;
     if !output.status.success() {
         return None;
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    median_printed_time(&output.stdout)
+}
+
+/// Parse the microsecond values printed by TIMED-BENCH (one per line) and
+/// return the median.
+fn median_printed_time(stdout: &[u8]) -> Option<u64> {
+    let stdout = String::from_utf8_lossy(stdout);
     let mut times: Vec<u64> = stdout
         .trim()
         .lines()
@@ -778,18 +796,28 @@ fn measure_gforth(gforth: &str, bench: &PerfBenchmark) -> Option<u64> {
     if !output.status.success() {
         return None;
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    // Parse the 3 timing values and take the median
-    let mut times: Vec<u64> = stdout
-        .trim()
-        .lines()
-        .filter_map(|l| l.trim().parse::<u64>().ok())
-        .collect();
-    times.sort();
-    if times.is_empty() {
+    median_printed_time(&output.stdout)
+}
+
+/// Measure `SwiftForth` (`sf64`) execution time using Forth-level `ucounter`
+/// (double-cell microsecond counter; `2swap d- drop` yields elapsed us —
+/// the same wrapper shape as gforth's `utime`). Timing excludes startup.
+/// sf64 has no `-e` flag, so the program is piped via stdin — one statement
+/// per line, because sf64 truncates input lines at ~256 chars.
+/// Returns microseconds, or None if sf64 is unavailable or fails.
+fn measure_sf64(sf64: &str, bench: &PerfBenchmark) -> Option<u64> {
+    let code = format!(
+        "{define}\n{run}\n\
+         : TIMED-BENCH ucounter {run} ucounter 2swap d- drop . cr ;\n\
+         TIMED-BENCH\nTIMED-BENCH\nTIMED-BENCH\nbye\n",
+        define = bench.define,
+        run = bench.run_code,
+    );
+    let output = run_via_stdin(sf64, &code)?;
+    if !output.status.success() {
         return None;
     }
-    Some(times[times.len() / 2])
+    median_printed_time(&output.stdout)
 }
 
 #[test]
@@ -830,18 +858,31 @@ fn performance_report() {
         );
     }
 
-    let sep = "=".repeat(80);
-    let thin = "-".repeat(80);
+    let sf64 = find_sf64();
+    if sf64.is_none() {
+        eprintln!("NOTE: sf64 (SwiftForth) not found — column skipped");
+    }
+
+    let sep = "=".repeat(100);
+    let thin = "-".repeat(100);
     println!("\n{sep}");
-    println!("  WAFER vs Gforth Performance Comparison (release mode)");
+    println!("  WAFER vs Gforth vs SwiftForth Performance Comparison (release mode)");
     println!("{sep}\n");
     println!(
-        "{:<22} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
-        "Benchmark", "WAFER", "CONSOL", "gforth", "gf-fast", "WAFER/gf", "limit"
+        "{:<22} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}",
+        "Benchmark",
+        "WAFER",
+        "CONSOL",
+        "gforth",
+        "gf-fast",
+        "sf64",
+        "WAFER/gf",
+        "WAFER/sf",
+        "limit"
     );
     println!(
-        "{:<22} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
-        "", "(us)", "(us)", "(us)", "(us)", "", ""
+        "{:<22} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}",
+        "", "(us)", "(us)", "(us)", "(us)", "(us)", "", "", ""
     );
     println!("{thin}");
 
@@ -856,9 +897,11 @@ fn performance_report() {
             .unwrap_or(0);
         let gf = gforth.and_then(|g| measure_gforth(g, bench));
         let gf_fast = gforth_fast.and_then(|g| measure_gforth(g, bench));
+        let sf = sf64.and_then(|s| measure_sf64(s, bench));
 
         let gf_str = gf.map_or_else(|| "-".to_string(), |v| format!("{v}"));
         let gf_fast_str = gf_fast.map_or_else(|| "-".to_string(), |v| format!("{v}"));
+        let sf_str = sf.map_or_else(|| "-".to_string(), |v| format!("{v}"));
         let best_wafer = if consol > 0 && consol < wafer {
             consol
         } else {
@@ -872,11 +915,15 @@ fn performance_report() {
             }
         });
         let ratio = ratio_val.map_or_else(|| "-".to_string(), |r| format!("{r:.2}x"));
+        let sf_ratio = sf.filter(|&s| s > 0).map_or_else(
+            || "-".to_string(),
+            |s| format!("{:.2}x", best_wafer as f64 / s as f64),
+        );
         let limit_str = format!("{:.2}x", bench.max_ratio);
 
         println!(
-            "{:<22} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
-            bench.name, wafer, consol, gf_str, gf_fast_str, ratio, limit_str
+            "{:<22} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}",
+            bench.name, wafer, consol, gf_str, gf_fast_str, sf_str, ratio, sf_ratio, limit_str
         );
 
         // Check regression limits
@@ -899,6 +946,9 @@ fn performance_report() {
     println!("{thin}");
     println!("  WAFER = all optimizations, CONSOL = after CONSOLIDATE");
     println!("  WAFER/gf = best(WAFER,CONSOL) vs gforth, < 1.0 means WAFER faster");
+    println!(
+        "  WAFER/sf = best(WAFER,CONSOL) vs SwiftForth sf64 (native code; informational, no limit)"
+    );
     println!("{sep}\n");
 
     if !regressions.is_empty() {
