@@ -425,12 +425,22 @@ fn run_repl(vm: &mut ForthVM<NativeRuntime>) -> anyhow::Result<()> {
                         }
                         let output = output.replace('\x0C', "");
                         if !vm.is_compiling() {
-                            // Move cursor back up to end of input line so
-                            // output appears inline, like traditional Forth:
-                            //   > 2 2 + . 4  ok
-                            let col = prompt.len() + line.len() + 1;
-                            print!("\x1b[A\x1b[{col}G {output} ok");
-                            println!();
+                            if output.contains('\n') {
+                                // Multi-line output (DUMP, WORDS, ...):
+                                // print as a block, then ok on its own line
+                                print!("{output}");
+                                if !output.ends_with('\n') {
+                                    println!();
+                                }
+                                println!(" ok");
+                            } else {
+                                // Move cursor back up to end of input line so
+                                // output appears inline, like traditional Forth:
+                                //   > 2 2 + . 4  ok
+                                let col = prompt.len() + line.len() + 1;
+                                print!("\x1b[A\x1b[{col}G {output} ok");
+                                println!();
+                            }
                         } else if !output.is_empty() {
                             print!("{output}");
                         }
