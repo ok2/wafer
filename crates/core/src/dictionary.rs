@@ -18,6 +18,8 @@ pub mod flags {
     pub const IMMEDIATE: u8 = 0x80;
     /// Word is hidden (being compiled, not yet findable).
     pub const HIDDEN: u8 = 0x40;
+    /// Word is an implementation detail: findable, but skipped by WORDS.
+    pub const INTERNAL: u8 = 0x20;
     /// Mask for the name length (lower 5 bits).
     pub const LENGTH_MASK: u8 = 0x1F;
     /// Maximum word name length.
@@ -95,10 +97,16 @@ impl Dictionary {
         // Write link field (points to previous LATEST)
         self.write_u32_unchecked(entry_start, self.latest);
 
-        // Write flags byte: HIDDEN | length, optionally IMMEDIATE
+        // Write flags byte: HIDDEN | length, optionally IMMEDIATE.
+        // Underscore-prefixed names are implementation details by repo
+        // convention (see tools/editor-support): flag them INTERNAL so
+        // WORDS and completion skip them while FIND still works.
         let mut flag_byte = flags::HIDDEN | (name_len as u8 & flags::LENGTH_MASK);
         if immediate {
             flag_byte |= flags::IMMEDIATE;
+        }
+        if name_bytes.first() == Some(&b'_') {
+            flag_byte |= flags::INTERNAL;
         }
         self.memory[(entry_start + 4) as usize] = flag_byte;
 
@@ -410,12 +418,15 @@ impl Dictionary {
     }
 
     /// Return names of all visible (non-hidden) words, newest first.
-    pub fn visible_words(&self) -> Vec<String> {
+    /// With `include_internal` false, words flagged INTERNAL are skipped.
+    pub fn visible_words(&self, include_internal: bool) -> Vec<String> {
         let mut names = Vec::new();
         let mut addr = self.latest;
         while addr != 0 {
             let flags_byte = self.memory[(addr + 4) as usize];
-            if flags_byte & flags::HIDDEN == 0 {
+            let skip = flags_byte & flags::HIDDEN != 0
+                || (!include_internal && flags_byte & flags::INTERNAL != 0);
+            if !skip {
                 let name_len = (flags_byte & flags::LENGTH_MASK) as usize;
                 let name_start = (addr + 5) as usize;
                 let name = String::from_utf8_lossy(&self.memory[name_start..name_start + name_len])

@@ -243,6 +243,9 @@
 \ U. ( u -- )  print unsigned number and space
 : U.  0 <# #S #> TYPE SPACE ;
 
+\ ? ( a-addr -- )  fetch and print
+: ?  @ . ;
+
 \ .R ( n width -- )  print right-justified signed number
 : .R  >R DUP ABS 0 <# #S ROT SIGN #> R> OVER - SPACES TYPE ;
 

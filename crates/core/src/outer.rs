@@ -227,6 +227,12 @@ pub struct ForthVM<R: Runtime> {
     pending_does_patch: Arc<Mutex<Option<u32>>>,
     // Exception word set: throw code shared between CATCH and THROW host functions
     throw_code: Arc<Mutex<Option<i32>>>,
+    // ABORT" texts by compiled index, plus the not-yet-reported payload of
+    // the most recent ABORT" (printed only if the -2 throw goes uncaught)
+    abort_messages: Arc<Mutex<Vec<String>>>,
+    abort_message: Arc<Mutex<Option<String>>>,
+    // Set by BYE: the embedding REPL/driver should exit
+    bye: Arc<std::sync::atomic::AtomicBool>,
     // Shared dictionary lookup: maps uppercase name -> (WordId, is_immediate)
     word_lookup: Arc<Mutex<HashMap<String, (u32, bool)>>>,
     // Set of word_ids that are 2VALUEs (need 2-cell TO semantics)
@@ -308,6 +314,68 @@ pub enum LocalKind {
     Float,
 }
 
+/// Standard message for a Forth 2012 THROW code (subset wafer can raise).
+fn throw_message(code: i32) -> Option<&'static str> {
+    Some(match code {
+        -1 => "ABORT",
+        -2 => "ABORT\"",
+        -3 => "Stack overflow",
+        -4 => "Stack underflow",
+        -5 => "Return stack overflow",
+        -6 => "Return stack underflow",
+        -8 => "Dictionary overflow",
+        -9 => "Invalid memory address",
+        -10 => "Division by zero",
+        -11 => "Result out of range",
+        -13 => "Undefined word",
+        -14 => "Interpreting a compile-only word",
+        -16 => "Attempt to use zero-length string as a name",
+        -18 => "Parsed string overflow",
+        -22 => "Control structure mismatch",
+        -24 => "Invalid numeric argument",
+        -28 => "User interrupt",
+        -31 => "Word not defined by CREATE",
+        -42 => "Floating-point divide by zero",
+        -43 => "Floating-point result out of range",
+        -45 => "Floating-point stack underflow",
+        -56 => "QUIT",
+        _ => return None,
+    })
+}
+
+/// Format a cell as Forth `.` would: signed, in the given base (2..=36).
+fn fmt_in_base(v: i32, base: u32) -> String {
+    let base = if (2..=36).contains(&base) { base } else { 10 };
+    if base == 10 {
+        return v.to_string();
+    }
+    let neg = v < 0;
+    let mut m = (v as i64).unsigned_abs();
+    let mut digits = Vec::new();
+    loop {
+        digits.push(char::from_digit((m % u64::from(base)) as u32, base).unwrap());
+        m /= u64::from(base);
+        if m == 0 {
+            break;
+        }
+    }
+    if neg {
+        digits.push('-');
+    }
+    digits.iter().rev().collect::<String>().to_ascii_uppercase()
+}
+
+/// Pop the data-stack top from host-function context.
+fn host_pop(ctx: &mut dyn HostAccess) -> anyhow::Result<i32> {
+    let sp = ctx.get_dsp();
+    if sp >= DATA_STACK_TOP {
+        anyhow::bail!("Stack underflow");
+    }
+    let v = ctx.mem_read_i32(sp);
+    ctx.set_dsp(sp + CELL_SIZE);
+    Ok(v)
+}
+
 /// Advance past the next `\n` in `buf`, starting at `from`. Returns the
 /// byte index of the first character on the next line (or `buf.len()` if
 /// there's no more newline). Used by the `\` line-comment handler per
@@ -372,6 +440,9 @@ impl<R: Runtime> ForthVM<R> {
             pending_actions: Arc::new(Mutex::new(Vec::new())),
             pending_does_patch: Arc::new(Mutex::new(None)),
             throw_code: Arc::new(Mutex::new(None)),
+            abort_messages: Arc::new(Mutex::new(Vec::new())),
+            abort_message: Arc::new(Mutex::new(None)),
+            bye: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             word_lookup: Arc::new(Mutex::new(HashMap::new())),
             two_value_words: std::collections::HashSet::new(),
             fvalue_words: std::collections::HashSet::new(),
@@ -443,8 +514,11 @@ impl<R: Runtime> ForthVM<R> {
                     self.compiling_local_kinds.clear();
                     self.local_batch_base = None;
                     self.compile_frames.clear();
-                    return Err(e);
+                    return Err(self.describe_uncaught(e));
                 }
+            }
+            if self.bye.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
             }
             // Read >IN back from WASM memory. Only apply if Forth code changed it
             // (i.e., the WASM value differs from what sync_input_to_wasm wrote).
@@ -465,6 +539,32 @@ impl<R: Runtime> ForthVM<R> {
     /// Check if the VM is currently in compile mode.
     pub fn is_compiling(&self) -> bool {
         self.state != 0
+    }
+
+    /// True once BYE has executed; the embedding REPL/driver should exit.
+    pub fn bye_requested(&self) -> bool {
+        self.bye.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Turn an internal error into the message shown to the user.
+    ///
+    /// An uncaught THROW leaves its code in `throw_code` (the "forth-throw"
+    /// sentinel error itself may get wrapped in a wasmtime trap when the
+    /// throw crosses compiled code, so the code — not the message — is the
+    /// reliable signal). Map the code to its standard message, or to the
+    /// recorded text for `ABORT"`. Always drains the payload so a stale
+    /// code can't leak into a later, unrelated error.
+    fn describe_uncaught(&mut self, e: anyhow::Error) -> anyhow::Error {
+        let code = self.throw_code.lock().unwrap().take();
+        let text = self.abort_message.lock().unwrap().take();
+        match (code, text) {
+            (Some(-2), Some(t)) => anyhow::anyhow!("{t}"),
+            (Some(code), _) => match throw_message(code) {
+                Some(m) => anyhow::anyhow!("{m} (throw {code})"),
+                None => anyhow::anyhow!("Catch = {code}"),
+            },
+            (None, _) => e,
+        }
     }
 
     /// Get and clear the output buffer.
@@ -540,6 +640,12 @@ impl<R: Runtime> ForthVM<R> {
     /// Map of host-function `WordId`s to their Forth names.
     pub fn host_function_names(&self) -> &HashMap<WordId, String> {
         &self.host_word_names
+    }
+
+    /// Names of all user-facing words (visible, non-internal), newest
+    /// first — the completion/browsing view of the dictionary.
+    pub fn word_names(&self) -> Vec<String> {
+        self.dictionary.visible_words(false)
     }
 
     /// Resolve a word name to its `WordId`. Returns `None` if not found.
@@ -836,11 +942,20 @@ impl<R: Runtime> ForthVM<R> {
             "CONSOLIDATE" => return self.consolidate(),
             "SYNONYM" => return self.define_synonym(),
             "ORDER" => {
+                // wid 1 is FORTH-WORDLIST; other wids are anonymous.
+                let wid_name = |wid: u32| {
+                    if wid == 1 {
+                        "FORTH".to_string()
+                    } else {
+                        format!("wid#{wid}")
+                    }
+                };
                 let so = self.search_order.lock().unwrap();
+                let names: Vec<String> = so.iter().map(|&w| wid_name(w)).collect();
                 let output = format!(
-                    "Search order: {:?} Compilation: {}\n",
-                    *so,
-                    self.dictionary.current_wid()
+                    "Search order: {}  Compilation: {}\n",
+                    names.join(" "),
+                    wid_name(self.dictionary.current_wid())
                 );
                 self.output.lock().unwrap().push_str(&output);
                 return Ok(());
@@ -991,22 +1106,18 @@ impl<R: Runtime> ForthVM<R> {
         // Handle ABORT" in compile mode
         if token_upper == "ABORT\"" {
             if let Some(s) = self.parse_until('"') {
-                // Compile: IF <push-addr> <push-len> TYPE ABORT THEN
-                // The flag is already on stack; compile the check
-                self.refresh_user_here();
-                let addr = self.user_here;
-                let bytes = s.as_bytes();
-                let len = bytes.len() as u32;
-                self.rt.mem_write_slice(addr as u32, bytes);
-                self.user_here += len;
-                self.sync_here_cell();
-
-                // ABORT" throws -2 without displaying the message.
-                // The message (addr, len) is saved but not typed here.
-                let throw_call = self.dictionary.find("THROW").map(|(_, id, _)| id);
-                let mut then_body = vec![IrOp::PushI32(-2)];
-                if let Some(throw_id) = throw_call {
-                    then_body.push(IrOp::Call(throw_id));
+                // Record the text and compile: IF <idx> _ABORT_Q_ THEN.
+                // _ABORT_Q_ stashes the text as the pending abort payload
+                // and throws -2; the text is shown only if nothing CATCHes.
+                let idx = {
+                    let mut msgs = self.abort_messages.lock().unwrap();
+                    msgs.push(s);
+                    (msgs.len() - 1) as i32
+                };
+                let abort_q = self.dictionary.find("_ABORT_Q_").map(|(_, id, _)| id);
+                let mut then_body = vec![IrOp::PushI32(idx)];
+                if let Some(id) = abort_q {
+                    then_body.push(IrOp::Call(id));
                 }
                 self.push_ir(IrOp::If {
                     then_body,
@@ -2700,6 +2811,7 @@ impl<R: Runtime> ForthVM<R> {
         self.register_environment_q()?;
         // SOURCE: defined in boot.fth
         self.register_abort()?;
+        self.register_tools()?;
 
         // . (dot): defined in boot.fth
         self.register_dot_s()?;
@@ -2886,12 +2998,14 @@ impl<R: Runtime> ForthVM<R> {
                 return Ok(());
             }
             let depth = (DATA_STACK_TOP - sp) / CELL_SIZE;
+            let base = ctx.mem_read_i32(SYSVAR_BASE_VAR) as u32;
             out.push_str(&format!("<{depth}> "));
-            // Print from bottom to top
+            // Print from bottom to top, in the current BASE
             let mut addr = DATA_STACK_TOP - CELL_SIZE;
             while addr >= sp {
                 let v = ctx.mem_read_i32(addr as u32);
-                out.push_str(&format!("{v} "));
+                out.push_str(&fmt_in_base(v, base));
+                out.push(' ');
                 if addr < CELL_SIZE {
                     break;
                 }
@@ -2901,6 +3015,63 @@ impl<R: Runtime> ForthVM<R> {
         });
 
         self.register_host_primitive(".S", false, func)?;
+        Ok(())
+    }
+
+    /// Register interactive inspection tools: DUMP and F.S.
+    fn register_tools(&mut self) -> anyhow::Result<()> {
+        // DUMP ( addr u -- ) hex+ASCII dump, 16 bytes per line.
+        let output = Arc::clone(&self.output);
+        let func: HostFn = Box::new(move |ctx: &mut dyn HostAccess| {
+            const MAX: i32 = 4096;
+            let len = host_pop(ctx)?;
+            let addr = host_pop(ctx)? as u32;
+            let end = ctx.mem_len() as u32;
+            let clipped = (len.clamp(0, MAX) as u32).min(end.saturating_sub(addr.min(end)));
+            let bytes = ctx.mem_read_slice(addr, clipped as usize);
+            let mut out = output.lock().unwrap();
+            for (i, row) in bytes.chunks(16).enumerate() {
+                let hex: Vec<String> = row.iter().map(|b| format!("{b:02X}")).collect();
+                let ascii: String = row
+                    .iter()
+                    .map(|&b| {
+                        if (0x20..0x7F).contains(&b) {
+                            b as char
+                        } else {
+                            '.'
+                        }
+                    })
+                    .collect();
+                let row_addr = addr + (i as u32) * 16;
+                out.push_str(&format!(
+                    "{row_addr:08X}: {:<47} |{ascii}|\n",
+                    hex.join(" ")
+                ));
+            }
+            if len as u32 > clipped {
+                out.push_str("... (truncated)\n");
+            }
+            Ok(())
+        });
+        self.register_host_primitive("DUMP", false, func)?;
+
+        // F.S ( -- ) print the float stack without consuming.
+        let output = Arc::clone(&self.output);
+        let func: HostFn = Box::new(move |ctx: &mut dyn HostAccess| {
+            let sp = ctx.get_fsp();
+            let depth = (FLOAT_STACK_TOP.saturating_sub(sp)) / FLOAT_SIZE;
+            let mut out = output.lock().unwrap();
+            out.push_str(&format!("F:<{depth}> "));
+            for i in (0..depth).rev() {
+                let bytes: [u8; 8] = ctx
+                    .mem_read_slice(sp + i * FLOAT_SIZE, 8)
+                    .try_into()
+                    .unwrap();
+                out.push_str(&format!("{} ", f64::from_le_bytes(bytes)));
+            }
+            Ok(())
+        });
+        self.register_host_primitive("F.S", false, func)?;
         Ok(())
     }
 
@@ -3888,14 +4059,35 @@ impl<R: Runtime> ForthVM<R> {
 
     /// ABORT -- clear stacks and throw error.
     fn register_abort(&mut self) -> anyhow::Result<()> {
+        let throw_code = Arc::clone(&self.throw_code);
         let func: HostFn = Box::new(move |ctx: &mut dyn HostAccess| {
-            // Reset stack pointers
+            // Reset stack pointers and throw -1 (ABORT)
             ctx.set_dsp((DATA_STACK_TOP as i32) as u32);
             ctx.set_rsp((RETURN_STACK_TOP as i32) as u32);
-            Err(anyhow::anyhow!("ABORT"))
+            *throw_code.lock().unwrap() = Some(-1);
+            Err(anyhow::anyhow!("forth-throw"))
         });
-
         self.register_host_primitive("ABORT", false, func)?;
+
+        // _ABORT_Q_ ( idx -- ) runtime of ABORT": record text, throw -2.
+        let msgs = Arc::clone(&self.abort_messages);
+        let pending = Arc::clone(&self.abort_message);
+        let throw_code = Arc::clone(&self.throw_code);
+        let func: HostFn = Box::new(move |ctx: &mut dyn HostAccess| {
+            let idx = host_pop(ctx)? as usize;
+            *pending.lock().unwrap() = msgs.lock().unwrap().get(idx).cloned();
+            *throw_code.lock().unwrap() = Some(-2);
+            Err(anyhow::anyhow!("forth-throw"))
+        });
+        self.register_host_primitive("_ABORT_Q_", false, func)?;
+
+        // BYE ( -- ) request REPL/driver exit.
+        let bye = Arc::clone(&self.bye);
+        let func: HostFn = Box::new(move |_ctx: &mut dyn HostAccess| {
+            bye.store(true, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        });
+        self.register_host_primitive("BYE", false, func)?;
         Ok(())
     }
 
@@ -5784,14 +5976,35 @@ impl<R: Runtime> ForthVM<R> {
         Ok(())
     }
 
-    /// WORDS ( -- ) Print all visible dictionary words.
+    /// WORDS ( -- ) list visible words; `WORDS <substring>` filters them
+    /// (case-insensitive). Internal (underscore-prefixed) words are
+    /// skipped. Output wraps at 78 columns and ends with a count.
     fn do_words(&mut self) {
-        let names = self.dictionary.visible_words();
+        // In interpret mode an optional token on the same line is a filter.
+        let filter = if self.state == 0 {
+            self.next_token().map(|t| t.to_ascii_uppercase())
+        } else {
+            None
+        };
+        let names = self.dictionary.visible_words(false);
         let mut out = self.output.lock().unwrap();
-        for name in &names {
+        let mut shown = 0usize;
+        let mut col = 0usize;
+        for name in names.iter().filter(|n| {
+            filter
+                .as_ref()
+                .is_none_or(|f| n.to_ascii_uppercase().contains(f))
+        }) {
+            if col + name.len() + 1 > 78 && col > 0 {
+                out.push('\n');
+                col = 0;
+            }
             out.push_str(name);
             out.push(' ');
+            col += name.len() + 1;
+            shown += 1;
         }
+        out.push_str(&format!("\n{shown} words\n"));
     }
 
     /// Register Search-Order word set words.
@@ -8751,6 +8964,84 @@ mod tests {
     fn test_words_includes_user_defined() {
         let output = eval_output(": MYTEST 42 ; WORDS");
         assert!(output.contains("MYTEST"));
+    }
+
+    #[test]
+    fn test_words_filter_and_count() {
+        let output = eval_output("WORDS FDEPTH");
+        assert!(output.contains("FDEPTH"));
+        assert!(!output.contains("SWAP"));
+        assert!(output.contains(" words\n"));
+    }
+
+    #[test]
+    fn test_words_hides_internal() {
+        let output = eval_output("WORDS");
+        assert!(!output.contains("_ABORT_Q_"));
+        assert!(!output.contains("__CTRL__"));
+    }
+
+    #[test]
+    fn test_dot_s_honors_base() {
+        assert_eq!(eval_output("HEX FF .S"), "<1> FF ");
+        assert_eq!(eval_output("HEX -A .S"), "<1> -A ");
+        assert_eq!(eval_output("5 2 BASE ! .S"), "<1> 101 ");
+    }
+
+    #[test]
+    fn test_question_fetches_and_prints() {
+        assert_eq!(eval_output("VARIABLE QV 17 QV ! QV ?"), "17 ");
+    }
+
+    #[test]
+    fn test_dump_smoke() {
+        let output = eval_output("VARIABLE DV 65 DV C! DV 4 DUMP");
+        assert!(output.contains("41"));
+        assert!(output.contains("|A"));
+    }
+
+    #[test]
+    fn test_f_dot_s() {
+        let output = eval_output("1.5E0 2.5E0 F.S");
+        assert!(output.starts_with("F:<2> 1.5 2.5"));
+    }
+
+    #[test]
+    fn test_bye_sets_flag_and_stops_line() {
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        vm.evaluate("1 BYE 2").unwrap();
+        assert!(vm.bye_requested());
+        // BYE stops the rest of the line: only the 1 was pushed
+        assert_eq!(vm.data_stack(), vec![1]);
+    }
+
+    #[test]
+    fn test_uncaught_throw_has_message() {
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        let e = vm.evaluate("-4 THROW").unwrap_err();
+        assert_eq!(e.to_string(), "Stack underflow (throw -4)");
+        let e = vm.evaluate("-77 THROW").unwrap_err();
+        assert_eq!(e.to_string(), "Catch = -77");
+    }
+
+    #[test]
+    fn test_uncaught_abort_quote_shows_text() {
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        let e = vm
+            .evaluate(": TST -1 ABORT\" all is lost\" ; TST")
+            .unwrap_err();
+        assert_eq!(e.to_string(), "all is lost");
+        // Caught -2 must NOT print the text, and the payload must not leak
+        vm.evaluate(": TC ['] TST CATCH ; TC").unwrap();
+        assert_eq!(vm.take_output(), "");
+        assert_eq!(vm.data_stack(), vec![-2]);
+    }
+
+    #[test]
+    fn test_order_names_forth() {
+        let output = eval_output("ORDER");
+        assert!(output.contains("FORTH"));
+        assert!(!output.contains('['));
     }
 
     // ===================================================================

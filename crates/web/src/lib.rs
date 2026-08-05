@@ -6,8 +6,9 @@ use send_wrapper::SendWrapper;
 use wasm_bindgen::prelude::*;
 
 use wafer_core::config::WaferConfig;
-use wafer_core::memory::{CELL_SIZE, PAD_BASE, PAD_SIZE};
+use wafer_core::memory::{CELL_SIZE, PAD_BASE, PAD_SIZE, SYSVAR_BASE_VAR};
 use wafer_core::outer::ForthVM;
+use wafer_core::runtime::Runtime;
 use wafer_core::runtime::{HostAccess, HostFn};
 
 use crate::runtime_web::WebRuntime;
@@ -53,9 +54,12 @@ impl WaferRepl {
 
     /// Get the current number base (10 = decimal, 16 = hex).
     pub fn base(&mut self) -> u32 {
-        // BASE is stored at SYSVAR_BASE_VAR in WASM memory
-        self.vm.take_output(); // no-op side effect; just return base
-        10 // TODO: read from memory once we have a getter
+        self.vm.runtime_mut().mem_read_i32(SYSVAR_BASE_VAR) as u32
+    }
+
+    /// Names of all user-facing words (visible, non-internal), newest first.
+    pub fn words(&self) -> Vec<String> {
+        self.vm.word_names()
     }
 
     /// Reset the VM to initial state.
