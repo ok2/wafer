@@ -24,8 +24,8 @@ use crate::ir::IrOp;
 use crate::memory::HASH_SCRATCH_BASE;
 use crate::memory::{
     CELL_SIZE, DATA_STACK_TOP, FLOAT_SIZE, FLOAT_STACK_BASE, FLOAT_STACK_TOP, INPUT_BUFFER_BASE,
-    INPUT_BUFFER_SIZE, RETURN_STACK_TOP, SYSVAR_BASE_VAR, SYSVAR_HERE, SYSVAR_LEAVE_FLAG,
-    SYSVAR_NUM_TIB, SYSVAR_STATE, SYSVAR_TO_IN,
+    INPUT_BUFFER_SIZE, RETURN_STACK_TOP, SYSVAR_BASE_VAR, SYSVAR_FAULT_CODE, SYSVAR_HERE,
+    SYSVAR_LEAVE_FLAG, SYSVAR_NUM_TIB, SYSVAR_STATE, SYSVAR_TO_IN,
 };
 use crate::optimizer::optimize;
 
@@ -270,6 +270,8 @@ pub struct ForthVM<R: Runtime> {
     marker_states: HashMap<u32, MarkerState>,
     /// EMPTY's rollback target: boot state, or wherever GILD re-baselined.
     gild_state: Option<Box<MarkerState>>,
+    /// Table index of `_STACK_FAULT_` (compiled stack-guard target).
+    stack_fault_id: u32,
     /// Pending MARKER restore: after a marker word executes, restore this state
     pending_marker_restore: Arc<Mutex<Option<u32>>>,
     /// Conditional compilation skip depth: >0 means we're skipping tokens for [IF]/[ELSE]
@@ -350,6 +352,7 @@ fn throw_message(code: i32) -> Option<&'static str> {
         -31 => "Word not defined by CREATE",
         -42 => "Floating-point divide by zero",
         -43 => "Floating-point result out of range",
+        -44 => "Floating-point stack overflow",
         -45 => "Floating-point stack underflow",
         -56 => "QUIT",
         _ => return None,
@@ -469,6 +472,7 @@ impl<R: Runtime> ForthVM<R> {
             recording_toplevel: false,
             marker_states: HashMap::new(),
             gild_state: None,
+            stack_fault_id: 0,
             pending_marker_restore: Arc::new(Mutex::new(None)),
             conditional_skip_depth: 0,
             next_block_label: 0,
@@ -2298,11 +2302,7 @@ impl<R: Runtime> ForthVM<R> {
         self.ir_bodies.insert(word_id, ir.clone());
 
         // Compile to WASM
-        let config = CodegenConfig {
-            base_fn_index: word_id.0,
-            table_size: self.table_size(),
-            stack_to_local_promotion: self.config.codegen.stack_to_local_promotion,
-        };
+        let config = self.codegen_config(word_id.0);
         let compiled =
             compile_word(&name, &ir, &config).map_err(|e| anyhow::anyhow!("codegen error: {e}"))?;
 
@@ -2361,8 +2361,13 @@ impl<R: Runtime> ForthVM<R> {
         let table_size = self.table_size();
 
         // Compile the consolidated module
-        let module_bytes = compile_consolidated_module(&words, &local_fn_map, table_size)
-            .map_err(|e| anyhow::anyhow!("consolidation codegen error: {e}"))?;
+        let module_bytes = compile_consolidated_module(
+            &words,
+            &local_fn_map,
+            table_size,
+            self.stack_guard_param(),
+        )
+        .map_err(|e| anyhow::anyhow!("consolidation codegen error: {e}"))?;
 
         // Instantiate: the element section in the module handles table placement
         // We use fn_index=0 since the element section has the correct offsets
@@ -2386,8 +2391,13 @@ impl<R: Runtime> ForthVM<R> {
         self.ensure_table_size(self.next_table_index)?;
         let table_size = self.table_size();
 
-        let module_bytes = compile_consolidated_module(&words, &local_fn_map, table_size)
-            .map_err(|e| anyhow::anyhow!("batch compile error: {e}"))?;
+        let module_bytes = compile_consolidated_module(
+            &words,
+            &local_fn_map,
+            table_size,
+            self.stack_guard_param(),
+        )
+        .map_err(|e| anyhow::anyhow!("batch compile error: {e}"))?;
 
         self.total_module_bytes += module_bytes.len() as u64;
         // Instantiate: the element section in the module handles table placement
@@ -2644,6 +2654,24 @@ impl<R: Runtime> ForthVM<R> {
     // Primitive registration
     // -----------------------------------------------------------------------
 
+    /// `_STACK_FAULT_` table index when stack guards are enabled.
+    pub(crate) fn stack_guard_param(&self) -> Option<u32> {
+        self.config
+            .codegen
+            .stack_guards
+            .then_some(self.stack_fault_id)
+    }
+
+    /// Codegen configuration for compiling one word.
+    fn codegen_config(&mut self, base_fn_index: u32) -> CodegenConfig {
+        CodegenConfig {
+            base_fn_index,
+            table_size: self.table_size(),
+            stack_to_local_promotion: self.config.codegen.stack_to_local_promotion,
+            stack_guards: self.stack_guard_param(),
+        }
+    }
+
     /// Register a primitive word by compiling its IR body and installing it.
     fn register_primitive(
         &mut self,
@@ -2666,11 +2694,7 @@ impl<R: Runtime> ForthVM<R> {
             // Defer WASM compilation for batch processing
             self.deferred_ir.push((word_id, ir_body));
         } else {
-            let config = CodegenConfig {
-                base_fn_index: word_id.0,
-                table_size: self.table_size(),
-                stack_to_local_promotion: self.config.codegen.stack_to_local_promotion,
-            };
+            let config = self.codegen_config(word_id.0);
             let compiled = compile_word(name, &ir_body, &config)
                 .map_err(|e| anyhow::anyhow!("codegen error for {name}: {e}"))?;
             self.instantiate_and_install(&compiled, word_id)?;
@@ -2708,6 +2732,19 @@ impl<R: Runtime> ForthVM<R> {
     /// Register all built-in primitive words.
     fn register_primitives(&mut self) -> anyhow::Result<()> {
         self.batch_mode = true;
+
+        // _STACK_FAULT_ must exist before any guarded word is compiled:
+        // compiled guards write a throw code to SYSVAR_FAULT_CODE and
+        // call this word, which converts it into a Forth THROW.
+        let throw_code = Arc::clone(&self.throw_code);
+        let func: HostFn = Box::new(move |ctx: &mut dyn HostAccess| {
+            let code = ctx.mem_read_i32(SYSVAR_FAULT_CODE);
+            *throw_code.lock().unwrap() = Some(code);
+            Err(anyhow::anyhow!("forth-throw"))
+        });
+        self.stack_fault_id = self
+            .register_host_primitive("_STACK_FAULT_", false, func)?
+            .0;
 
         // -- Stack manipulation --
         self.register_primitive("DUP", false, vec![IrOp::Dup])?;
@@ -3192,11 +3229,7 @@ impl<R: Runtime> ForthVM<R> {
         // Compile a tiny word that pushes the variable's address
         let ir_body = vec![IrOp::PushI32(var_addr as i32)];
         self.ir_bodies.insert(word_id, ir_body.clone());
-        let config = CodegenConfig {
-            base_fn_index: word_id.0,
-            table_size: self.table_size(),
-            stack_to_local_promotion: self.config.codegen.stack_to_local_promotion,
-        };
+        let config = self.codegen_config(word_id.0);
         let compiled = compile_word(&name, &ir_body, &config)
             .map_err(|e| anyhow::anyhow!("codegen error for VARIABLE {name}: {e}"))?;
 
@@ -3224,11 +3257,7 @@ impl<R: Runtime> ForthVM<R> {
         // Compile a word that pushes the constant value
         let ir_body = vec![IrOp::PushI32(value)];
         self.ir_bodies.insert(word_id, ir_body.clone());
-        let config = CodegenConfig {
-            base_fn_index: word_id.0,
-            table_size: self.table_size(),
-            stack_to_local_promotion: self.config.codegen.stack_to_local_promotion,
-        };
+        let config = self.codegen_config(word_id.0);
         let compiled = compile_word(&name, &ir_body, &config)
             .map_err(|e| anyhow::anyhow!("codegen error for CONSTANT {name}: {e}"))?;
 
@@ -3261,11 +3290,7 @@ impl<R: Runtime> ForthVM<R> {
         // Compile a word that pushes the pfa
         let ir_body = vec![IrOp::PushI32(pfa as i32)];
         self.ir_bodies.insert(word_id, ir_body.clone());
-        let config = CodegenConfig {
-            base_fn_index: word_id.0,
-            table_size: self.table_size(),
-            stack_to_local_promotion: self.config.codegen.stack_to_local_promotion,
-        };
+        let config = self.codegen_config(word_id.0);
         let compiled = compile_word(&name, &ir_body, &config)
             .map_err(|e| anyhow::anyhow!("codegen error for CREATE {name}: {e}"))?;
 
@@ -3307,11 +3332,7 @@ impl<R: Runtime> ForthVM<R> {
         // Compile a word that fetches from the value's address
         let ir_body = vec![IrOp::PushI32(val_addr as i32), IrOp::Fetch];
         self.ir_bodies.insert(word_id, ir_body.clone());
-        let config = CodegenConfig {
-            base_fn_index: word_id.0,
-            table_size: self.table_size(),
-            stack_to_local_promotion: self.config.codegen.stack_to_local_promotion,
-        };
+        let config = self.codegen_config(word_id.0);
         let compiled = compile_word(&name, &ir_body, &config)
             .map_err(|e| anyhow::anyhow!("codegen error for VALUE {name}: {e}"))?;
 
@@ -3349,11 +3370,7 @@ impl<R: Runtime> ForthVM<R> {
         // Compile a word that fetches the xt and executes it
         let ir_body = vec![IrOp::PushI32(defer_addr as i32), IrOp::Fetch, IrOp::Execute];
         self.ir_bodies.insert(word_id, ir_body.clone());
-        let config = CodegenConfig {
-            base_fn_index: word_id.0,
-            table_size: self.table_size(),
-            stack_to_local_promotion: self.config.codegen.stack_to_local_promotion,
-        };
+        let config = self.codegen_config(word_id.0);
         let compiled = compile_word(&name, &ir_body, &config)
             .map_err(|e| anyhow::anyhow!("codegen error for DEFER {name}: {e}"))?;
 
@@ -3386,11 +3403,7 @@ impl<R: Runtime> ForthVM<R> {
 
             let ir_body = vec![IrOp::Call(word_id)];
             self.ir_bodies.insert(new_word_id, ir_body.clone());
-            let config = CodegenConfig {
-                base_fn_index: new_word_id.0,
-                table_size: self.table_size(),
-                stack_to_local_promotion: self.config.codegen.stack_to_local_promotion,
-            };
+            let config = self.codegen_config(new_word_id.0);
             let compiled = compile_word(&new_name, &ir_body, &config)
                 .map_err(|e| anyhow::anyhow!("codegen error for SYNONYM: {e}"))?;
             self.instantiate_and_install(&compiled, new_word_id)?;
@@ -3438,11 +3451,7 @@ impl<R: Runtime> ForthVM<R> {
         // Compile a word that pushes the buffer address
         let ir_body = vec![IrOp::PushI32(buf_addr as i32)];
         self.ir_bodies.insert(word_id, ir_body.clone());
-        let config = CodegenConfig {
-            base_fn_index: word_id.0,
-            table_size: self.table_size(),
-            stack_to_local_promotion: self.config.codegen.stack_to_local_promotion,
-        };
+        let config = self.codegen_config(word_id.0);
         let compiled = compile_word(&name, &ir_body, &config)
             .map_err(|e| anyhow::anyhow!("codegen error for BUFFER: {name}: {e}"))?;
 
@@ -3530,11 +3539,7 @@ impl<R: Runtime> ForthVM<R> {
             .ok_or_else(|| anyhow::anyhow!("_MARKER_RESTORE_ not found"))?;
         let ir_body = vec![IrOp::PushI32(word_id.0 as i32), IrOp::Call(restore_id)];
         self.ir_bodies.insert(word_id, ir_body.clone());
-        let config = CodegenConfig {
-            base_fn_index: word_id.0,
-            table_size: self.table_size(),
-            stack_to_local_promotion: self.config.codegen.stack_to_local_promotion,
-        };
+        let config = self.codegen_config(word_id.0);
         let compiled = compile_word(&name, &ir_body, &config)
             .map_err(|e| anyhow::anyhow!("codegen error for MARKER {name}: {e}"))?;
 
@@ -4417,11 +4422,7 @@ impl<R: Runtime> ForthVM<R> {
         let word_id = WordId(fn_index);
 
         // Compile and replace
-        let config = CodegenConfig {
-            base_fn_index: word_id.0,
-            table_size: self.table_size(),
-            stack_to_local_promotion: self.config.codegen.stack_to_local_promotion,
-        };
+        let config = self.codegen_config(word_id.0);
         let name = self
             .dictionary
             .word_name(latest)
@@ -4511,11 +4512,7 @@ impl<R: Runtime> ForthVM<R> {
             }
 
             let second_ir = std::mem::take(&mut self.compiling_ir);
-            let config = CodegenConfig {
-                base_fn_index: second_word_id.0,
-                table_size: self.table_size(),
-                stack_to_local_promotion: self.config.codegen.stack_to_local_promotion,
-            };
+            let config = self.codegen_config(second_word_id.0);
             let compiled = compile_word("_does_action2_", &second_ir, &config)
                 .map_err(|e| anyhow::anyhow!("codegen error for DOES> body 2: {e}"))?;
             self.instantiate_and_install(&compiled, second_word_id)?;
@@ -4573,11 +4570,7 @@ impl<R: Runtime> ForthVM<R> {
         }
 
         let does_ir = std::mem::take(&mut self.compiling_ir);
-        let config = CodegenConfig {
-            base_fn_index: does_word_id.0,
-            table_size: self.table_size(),
-            stack_to_local_promotion: self.config.codegen.stack_to_local_promotion,
-        };
+        let config = self.codegen_config(does_word_id.0);
         let compiled = compile_word("_does_action_", &does_ir, &config)
             .map_err(|e| anyhow::anyhow!("codegen error for DOES> body: {e}"))?;
         self.instantiate_and_install(&compiled, does_word_id)?;
@@ -4603,11 +4596,7 @@ impl<R: Runtime> ForthVM<R> {
 
         // Compile the defining word as a no-op (the actual work is done
         // by the outer interpreter when it detects the does-definition).
-        let config = CodegenConfig {
-            base_fn_index: defining_word_id.0,
-            table_size: self.table_size(),
-            stack_to_local_promotion: self.config.codegen.stack_to_local_promotion,
-        };
+        let config = self.codegen_config(defining_word_id.0);
         let compiled = compile_word(&defining_name, &[], &config)
             .map_err(|e| anyhow::anyhow!("codegen error for defining word: {e}"))?;
         self.instantiate_and_install(&compiled, defining_word_id)?;
@@ -4664,11 +4653,7 @@ impl<R: Runtime> ForthVM<R> {
             // Temporarily install a "push PFA" word (will be patched later)
             let ir_body = vec![IrOp::PushI32(pfa as i32)];
             self.ir_bodies.insert(new_word_id, ir_body.clone());
-            let config = CodegenConfig {
-                base_fn_index: new_word_id.0,
-                table_size: self.table_size(),
-                stack_to_local_promotion: self.config.codegen.stack_to_local_promotion,
-            };
+            let config = self.codegen_config(new_word_id.0);
             let compiled = compile_word(&name, &ir_body, &config)
                 .map_err(|e| anyhow::anyhow!("codegen: {e}"))?;
             self.instantiate_and_install(&compiled, new_word_id)?;
@@ -4687,11 +4672,7 @@ impl<R: Runtime> ForthVM<R> {
             let tmp_word_id = WordId(tmp_fn_idx);
             self.next_table_index = self.next_table_index.max(tmp_fn_idx + 1);
 
-            let config = CodegenConfig {
-                base_fn_index: tmp_word_id.0,
-                table_size: self.table_size(),
-                stack_to_local_promotion: self.config.codegen.stack_to_local_promotion,
-            };
+            let config = self.codegen_config(tmp_word_id.0);
             let compiled = compile_word("_create_part_", &create_ir, &config)
                 .map_err(|e| anyhow::anyhow!("codegen: {e}"))?;
             self.instantiate_and_install(&compiled, tmp_word_id)?;
@@ -4700,11 +4681,7 @@ impl<R: Runtime> ForthVM<R> {
             // Step 4: Patch the new word to push PFA and call does-action
             self.refresh_user_here();
             let patched_ir = vec![IrOp::PushI32(pfa as i32), IrOp::Call(does_action_id)];
-            let config = CodegenConfig {
-                base_fn_index: new_word_id.0,
-                table_size: self.table_size(),
-                stack_to_local_promotion: self.config.codegen.stack_to_local_promotion,
-            };
+            let config = self.codegen_config(new_word_id.0);
             let compiled = compile_word(&name, &patched_ir, &config)
                 .map_err(|e| anyhow::anyhow!("DOES> patch codegen: {e}"))?;
             self.instantiate_and_install(&compiled, new_word_id)?;
@@ -4728,11 +4705,7 @@ impl<R: Runtime> ForthVM<R> {
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
 
             let patched_ir = vec![IrOp::PushI32(pfa as i32), IrOp::Call(does_action_id)];
-            let config = CodegenConfig {
-                base_fn_index: target_word_id.0,
-                table_size: self.table_size(),
-                stack_to_local_promotion: self.config.codegen.stack_to_local_promotion,
-            };
+            let config = self.codegen_config(target_word_id.0);
             let compiled = compile_word(&name, &patched_ir, &config)
                 .map_err(|e| anyhow::anyhow!("DOES> patch codegen: {e}"))?;
             self.instantiate_and_install(&compiled, target_word_id)?;
@@ -5429,11 +5402,7 @@ impl<R: Runtime> ForthVM<R> {
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
 
             let patched_ir = vec![IrOp::PushI32(pfa as i32), IrOp::Call(WordId(action_id))];
-            let config = CodegenConfig {
-                base_fn_index: target_word_id.0,
-                table_size: self.table_size(),
-                stack_to_local_promotion: self.config.codegen.stack_to_local_promotion,
-            };
+            let config = self.codegen_config(target_word_id.0);
             let compiled = compile_word(&name, &patched_ir, &config)
                 .map_err(|e| anyhow::anyhow!("runtime DOES> patch codegen: {e}"))?;
             self.instantiate_and_install(&compiled, target_word_id)?;
@@ -6515,11 +6484,7 @@ impl<R: Runtime> ForthVM<R> {
 
         let ir = vec![IrOp::PushI32(lo), IrOp::PushI32(hi)];
         self.ir_bodies.insert(word_id, ir.clone());
-        let config = CodegenConfig {
-            base_fn_index: word_id.0,
-            table_size: self.table_size(),
-            stack_to_local_promotion: self.config.codegen.stack_to_local_promotion,
-        };
+        let config = self.codegen_config(word_id.0);
         let compiled = compile_word(&name, &ir, &config)
             .map_err(|e| anyhow::anyhow!("2CONSTANT codegen: {e}"))?;
         self.instantiate_and_install(&compiled, word_id)?;
@@ -6545,11 +6510,7 @@ impl<R: Runtime> ForthVM<R> {
 
         let ir = vec![IrOp::PushI32(addr as i32)];
         self.ir_bodies.insert(word_id, ir.clone());
-        let config = CodegenConfig {
-            base_fn_index: word_id.0,
-            table_size: self.table_size(),
-            stack_to_local_promotion: self.config.codegen.stack_to_local_promotion,
-        };
+        let config = self.codegen_config(word_id.0);
         let compiled = compile_word(&name, &ir, &config)
             .map_err(|e| anyhow::anyhow!("2VARIABLE codegen: {e}"))?;
         self.instantiate_and_install(&compiled, word_id)?;
@@ -6588,11 +6549,7 @@ impl<R: Runtime> ForthVM<R> {
             IrOp::Fetch,
         ];
         self.ir_bodies.insert(word_id, ir.clone());
-        let config = CodegenConfig {
-            base_fn_index: word_id.0,
-            table_size: self.table_size(),
-            stack_to_local_promotion: self.config.codegen.stack_to_local_promotion,
-        };
+        let config = self.codegen_config(word_id.0);
         let compiled = compile_word(&name, &ir, &config)
             .map_err(|e| anyhow::anyhow!("2VALUE codegen: {e}"))?;
         self.instantiate_and_install(&compiled, word_id)?;
@@ -7342,11 +7299,7 @@ impl<R: Runtime> ForthVM<R> {
         // Compile a word that pushes the address onto the DATA stack
         let ir_body = vec![IrOp::PushI32(addr as i32)];
         self.ir_bodies.insert(word_id, ir_body.clone());
-        let config = CodegenConfig {
-            base_fn_index: word_id.0,
-            table_size: self.table_size(),
-            stack_to_local_promotion: self.config.codegen.stack_to_local_promotion,
-        };
+        let config = self.codegen_config(word_id.0);
         let compiled = compile_word(&name, &ir_body, &config)
             .map_err(|e| anyhow::anyhow!("codegen error for FVARIABLE {name}: {e}"))?;
 
@@ -9079,6 +9032,76 @@ mod tests {
         assert!(vm.bye_requested());
         // BYE stops the rest of the line: only the 1 was pushed
         assert_eq!(vm.data_stack(), vec![1]);
+    }
+
+    #[test]
+    fn test_stack_guard_underflow_interpreted() {
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        let e = vm.evaluate("DROP").unwrap_err();
+        assert_eq!(e.to_string(), "Stack underflow (throw -4)");
+        // Stack machinery intact afterwards
+        vm.evaluate("7 .").unwrap();
+        assert_eq!(vm.take_output(), "7 ");
+    }
+
+    #[test]
+    fn test_stack_guard_underflow_in_compiled_word() {
+        // Straight-line word (promoted path) and mid-word underflow
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        vm.evaluate(": D2 DROP DROP ;").unwrap();
+        let e = vm.evaluate("1 D2").unwrap_err();
+        assert_eq!(e.to_string(), "Stack underflow (throw -4)");
+        // The guard fires BEFORE corruption: the 1 must still be there
+        assert_eq!(vm.data_stack(), vec![1]);
+        // Non-promoted (contains a call): same guard. Fresh VM — the
+        // failed D2 call above deliberately left its stack untouched.
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        vm.evaluate(": D3 DUP . DROP DROP ;").unwrap();
+        let e = vm.evaluate("2 D3").unwrap_err();
+        assert_eq!(e.to_string(), "Stack underflow (throw -4)");
+    }
+
+    #[test]
+    fn test_stack_guard_overflow_compiled_loop() {
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        vm.evaluate(": FLOOD BEGIN 1 AGAIN ;").unwrap();
+        let e = vm.evaluate("FLOOD").unwrap_err();
+        assert_eq!(e.to_string(), "Stack overflow (throw -3)");
+    }
+
+    #[test]
+    fn test_stack_guard_float_underflow() {
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        vm.evaluate(": FD FDROP ;").unwrap();
+        let e = vm.evaluate("FD").unwrap_err();
+        assert_eq!(e.to_string(), "Floating-point stack underflow (throw -45)");
+    }
+
+    #[test]
+    fn test_stack_guard_return_stack_underflow() {
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        vm.evaluate(": RU R> DROP ;").unwrap();
+        // R> with nothing user-pushed underflows the return stack
+        let e = vm.evaluate("RU").unwrap_err();
+        assert_eq!(e.to_string(), "Return stack underflow (throw -6)");
+    }
+
+    #[test]
+    fn test_stack_guard_catchable() {
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        vm.evaluate(": BAD DROP ;").unwrap();
+        vm.evaluate("' BAD CATCH").unwrap();
+        assert_eq!(vm.data_stack(), vec![-4]);
+    }
+
+    #[test]
+    fn test_stack_guards_off_config() {
+        let mut cfg = crate::config::WaferConfig::all();
+        cfg.codegen.stack_guards = false;
+        let mut vm = ForthVM::<NativeRuntime>::new_with_config(cfg).unwrap();
+        // Compiled DROP underflows silently (documented unguarded mode)
+        vm.evaluate(": D1 DROP ;").unwrap();
+        assert!(vm.evaluate("D1").is_ok());
     }
 
     #[test]

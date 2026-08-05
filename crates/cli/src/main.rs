@@ -137,7 +137,8 @@ fn cmd_build(
 ) -> anyhow::Result<()> {
     let source = std::fs::read_to_string(file)?;
 
-    let mut vm = ForthVM::<NativeRuntime>::new()?;
+    // Exported modules are production artifacts: no stack guards by default
+    let mut vm = ForthVM::<NativeRuntime>::new_with_config(vm_config(false))?;
     vm.set_recording(true);
     vm.evaluate(&source)?;
 
@@ -260,9 +261,21 @@ fn cmd_run(file: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `WaferConfig` for CLI-created VMs. `WAFER_STACK_GUARDS=0|1` overrides
+/// the per-command default (REPL/file execution on, build off).
+fn vm_config(default_guards: bool) -> wafer_core::config::WaferConfig {
+    let mut cfg = wafer_core::config::WaferConfig::all();
+    cfg.codegen.stack_guards = match std::env::var("WAFER_STACK_GUARDS").ok().as_deref() {
+        Some("0") => false,
+        Some(_) => true,
+        None => default_guards,
+    };
+    cfg
+}
+
 /// `wafer` (REPL) or `wafer program.fth` (evaluate and exit)
 fn cmd_eval_or_repl(file: Option<&str>) -> anyhow::Result<()> {
-    let mut vm = ForthVM::<NativeRuntime>::new()?;
+    let mut vm = ForthVM::<NativeRuntime>::new_with_config(vm_config(true))?;
 
     match file {
         Some(file) => {

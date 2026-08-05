@@ -93,6 +93,8 @@ fn find_sf64() -> Option<&'static str> {
 /// Spawn `binary`, write `input` to its stdin, and collect the output.
 fn run_via_stdin(binary: &str, input: &str) -> Option<std::process::Output> {
     Command::new(binary)
+        // Perf lanes measure unguarded code (only the wafer binary reads this)
+        .env("WAFER_STACK_GUARDS", "0")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

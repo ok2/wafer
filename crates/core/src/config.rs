@@ -7,6 +7,11 @@ use crate::optimizer::OptConfig;
 pub struct CodegenOpts {
     /// Enable stack-to-local promotion for straight-line words.
     pub stack_to_local_promotion: bool,
+    /// Emit stack under/overflow guards in compiled words. Faults throw
+    /// standard codes (-3/-4/-5/-6/-44/-45) instead of silently
+    /// corrupting stack pointers. On by default; benchmarks and
+    /// exported production modules turn it off.
+    pub stack_guards: bool,
 }
 
 /// Master configuration for all WAFER optimizations.
@@ -32,6 +37,7 @@ impl WaferConfig {
             },
             codegen: CodegenOpts {
                 stack_to_local_promotion: true,
+                stack_guards: true,
             },
         }
     }
@@ -49,6 +55,7 @@ impl WaferConfig {
             },
             codegen: CodegenOpts {
                 stack_to_local_promotion: false,
+                stack_guards: false,
             },
         }
     }

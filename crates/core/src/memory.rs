@@ -106,6 +106,8 @@ pub const SYSVAR_NUM_TIB: u32 = SYSVAR_BASE + 24;
 pub const SYSVAR_HLD: u32 = SYSVAR_BASE + 28;
 /// LEAVE flag: nonzero when LEAVE has been called inside a DO loop.
 pub const SYSVAR_LEAVE_FLAG: u32 = SYSVAR_BASE + 32;
+/// Throw code left by a compiled stack-guard fault for `_STACK_FAULT_`.
+pub const SYSVAR_FAULT_CODE: u32 = SYSVAR_BASE + 36;
 
 #[cfg(test)]
 mod tests {
