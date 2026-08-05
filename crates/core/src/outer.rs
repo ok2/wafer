@@ -162,6 +162,7 @@ struct DoesDefinition {
 }
 
 /// Saved VM state for a MARKER word.
+#[derive(Clone)]
 struct MarkerState {
     dict_state: DictionaryState,
     user_here: u32,
@@ -172,6 +173,16 @@ struct MarkerState {
     host_word_names: HashMap<WordId, String>,
     two_value_words: std::collections::HashSet<u32>,
     fvalue_words: std::collections::HashSet<u32>,
+    // Namespace + text state: search order, wordlist allocation,
+    // REPLACES table, ABORT" texts
+    search_order: Vec<u32>,
+    next_wid: u32,
+    current_wid: u32,
+    substitutions: HashMap<String, Vec<u8>>,
+    abort_messages_len: usize,
+    // REMEMBER-style marker: state was saved just AFTER the marker word
+    // was defined, and the entry survives its own execution (re-runnable)
+    keep: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -257,6 +268,8 @@ pub struct ForthVM<R: Runtime> {
     recording_toplevel: bool,
     /// Saved states for MARKER words: `marker_id` -> `MarkerState`
     marker_states: HashMap<u32, MarkerState>,
+    /// EMPTY's rollback target: boot state, or wherever GILD re-baselined.
+    gild_state: Option<Box<MarkerState>>,
     /// Pending MARKER restore: after a marker word executes, restore this state
     pending_marker_restore: Arc<Mutex<Option<u32>>>,
     /// Conditional compilation skip depth: >0 means we're skipping tokens for [IF]/[ELSE]
@@ -455,6 +468,7 @@ impl<R: Runtime> ForthVM<R> {
             toplevel_ir: Vec::new(),
             recording_toplevel: false,
             marker_states: HashMap::new(),
+            gild_state: None,
             pending_marker_restore: Arc::new(Mutex::new(None)),
             conditional_skip_depth: 0,
             next_block_label: 0,
@@ -487,6 +501,9 @@ impl<R: Runtime> ForthVM<R> {
         };
 
         vm.register_primitives()?;
+
+        // Boot state is the default EMPTY target (until GILD re-baselines)
+        vm.gild_state = Some(Box::new(vm.snapshot_marker_state(true)));
 
         Ok(vm)
     }
@@ -932,7 +949,18 @@ impl<R: Runtime> ForthVM<R> {
                 return Ok(());
             }
             "BUFFER:" => return self.define_buffer(),
-            "MARKER" => return self.define_marker(),
+            "MARKER" => return self.define_marker(false),
+            "REMEMBER" => return self.define_marker(true),
+            "GILD" => {
+                self.gild_state = Some(Box::new(self.snapshot_marker_state(true)));
+                return Ok(());
+            }
+            "EMPTY" => {
+                if let Some(state) = self.gild_state.clone() {
+                    self.apply_marker_state(*state);
+                }
+                return Ok(());
+            }
             "2CONSTANT" => return self.define_2constant(),
             "2VARIABLE" => return self.define_2variable(),
             "2VALUE" => return self.define_2value(),
@@ -3430,13 +3458,9 @@ impl<R: Runtime> ForthVM<R> {
 
     /// MARKER <name> -- create a marker that restores dictionary state.
     /// Saves a snapshot of the VM; when the marker word is executed, restores it.
-    fn define_marker(&mut self) -> anyhow::Result<()> {
-        let name = self
-            .next_token()
-            .ok_or_else(|| anyhow::anyhow!("MARKER: expected name"))?;
-
-        // Save state BEFORE creating the marker word itself
-        let saved = MarkerState {
+    /// Snapshot everything a marker rollback restores.
+    fn snapshot_marker_state(&self, keep: bool) -> MarkerState {
+        MarkerState {
             dict_state: self.dictionary.save_state(),
             user_here: self.user_here,
             next_table_index: self.next_table_index,
@@ -3446,15 +3470,57 @@ impl<R: Runtime> ForthVM<R> {
             host_word_names: self.host_word_names.clone(),
             two_value_words: self.two_value_words.clone(),
             fvalue_words: self.fvalue_words.clone(),
-        };
+            search_order: self.search_order.lock().unwrap().clone(),
+            next_wid: *self.next_wid.lock().unwrap(),
+            current_wid: self.dictionary.current_wid(),
+            substitutions: self.substitutions.lock().unwrap().clone(),
+            abort_messages_len: self.abort_messages.lock().unwrap().len(),
+            keep,
+        }
+    }
+
+    /// Roll the VM back to a marker snapshot. Also discards marker
+    /// entries created after the snapshot (their words no longer exist).
+    fn apply_marker_state(&mut self, state: MarkerState) {
+        self.dictionary.restore_state(state.dict_state);
+        self.dictionary.set_current_wid(state.current_wid);
+        self.user_here = state.user_here;
+        self.next_table_index = state.next_table_index;
+        self.word_pfa_map = state.word_pfa_map;
+        self.ir_bodies = state.ir_bodies;
+        self.does_definitions = state.does_definitions;
+        self.host_word_names = state.host_word_names;
+        self.two_value_words = state.two_value_words;
+        self.fvalue_words = state.fvalue_words;
+        *self.search_order.lock().unwrap() = state.search_order;
+        *self.next_wid.lock().unwrap() = state.next_wid;
+        *self.substitutions.lock().unwrap() = state.substitutions;
+        self.abort_messages
+            .lock()
+            .unwrap()
+            .truncate(state.abort_messages_len);
+        self.marker_states
+            .retain(|&k, _| k < state.next_table_index);
+        self.sync_here_cell();
+        self.rebuild_word_lookup();
+    }
+
+    /// MARKER <name> (keep = false): rollback to just BEFORE the marker
+    /// was defined; the marker removes itself.
+    /// REMEMBER <name> (keep = true): rollback to just AFTER the marker
+    /// was defined; the marker survives and can be re-run.
+    fn define_marker(&mut self, keep: bool) -> anyhow::Result<()> {
+        let name = self
+            .next_token()
+            .ok_or_else(|| anyhow::anyhow!("MARKER: expected name"))?;
+
+        // MARKER saves state before its own word exists
+        let before = (!keep).then(|| self.snapshot_marker_state(false));
 
         let word_id = self
             .dictionary
             .create(&name, false)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-        // Store the saved state keyed by word_id
-        self.marker_states.insert(word_id.0, saved);
 
         // Compile the marker word: push marker_id, call _MARKER_RESTORE_
         let restore_id = self
@@ -3475,6 +3541,10 @@ impl<R: Runtime> ForthVM<R> {
         self.instantiate_and_install(&compiled, word_id)?;
         self.dictionary.reveal();
         self.next_table_index = self.next_table_index.max(word_id.0 + 1);
+
+        // REMEMBER saves state after its own word is fully in place
+        let saved = before.unwrap_or_else(|| self.snapshot_marker_state(true));
+        self.marker_states.insert(word_id.0, saved);
 
         Ok(())
     }
@@ -5379,22 +5449,18 @@ impl<R: Runtime> ForthVM<R> {
             let mut p = self.pending_marker_restore.lock().unwrap();
             p.take()
         };
-        if let Some(id) = marker_id
-            && let Some(state) = self.marker_states.remove(&id)
-        {
-            self.dictionary.restore_state(state.dict_state);
-            self.user_here = state.user_here;
-            self.next_table_index = state.next_table_index;
-            self.word_pfa_map = state.word_pfa_map;
-            self.ir_bodies = state.ir_bodies;
-            self.does_definitions = state.does_definitions;
-            self.host_word_names = state.host_word_names;
-            self.two_value_words = state.two_value_words;
-            self.fvalue_words = state.fvalue_words;
-            self.sync_here_cell();
-            self.rebuild_word_lookup();
-            // Remove any marker states that were created after this one
-            self.marker_states.retain(|&k, _| k < id);
+        if let Some(id) = marker_id {
+            // REMEMBER-style entries survive their own execution; MARKER
+            // entries remove themselves. apply_marker_state discards all
+            // entries newer than the snapshot either way.
+            let state = match self.marker_states.get(&id) {
+                Some(s) if s.keep => Some(s.clone()),
+                Some(_) => self.marker_states.remove(&id),
+                None => None,
+            };
+            if let Some(state) = state {
+                self.apply_marker_state(state);
+            }
         }
         Ok(())
     }
@@ -9272,6 +9338,51 @@ mod tests {
         vm.evaluate("MARKER MARK1").unwrap();
         // MARK1 should exist and be callable
         vm.evaluate("MARK1").unwrap();
+        // ...and remove itself when executed
+        assert!(vm.evaluate("MARK1").is_err());
+    }
+
+    #[test]
+    fn test_remember_survives_and_reruns() {
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        vm.evaluate("REMEMBER RST : AA 1 ;").unwrap();
+        vm.evaluate("RST").unwrap();
+        assert!(vm.evaluate("AA").is_err(), "AA must be pruned");
+        // RST survived its own execution and is re-runnable
+        vm.evaluate(": BB 2 ; RST").unwrap();
+        assert!(vm.evaluate("BB").is_err(), "BB must be pruned");
+        // VM stays fully usable afterwards
+        vm.evaluate(": CC 3 ; CC").unwrap();
+        assert_eq!(vm.data_stack(), vec![3]);
+    }
+
+    #[test]
+    fn test_remember_restores_wordlist_allocation() {
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        vm.evaluate("REMEMBER RST WORDLIST DROP RST WORDLIST")
+            .unwrap();
+        // wid allocation rolled back: the post-RST WORDLIST reuses wid 2
+        assert_eq!(vm.data_stack(), vec![2]);
+    }
+
+    #[test]
+    fn test_empty_returns_to_boot() {
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        vm.evaluate(": ZZ 9 ;").unwrap();
+        vm.evaluate("EMPTY").unwrap();
+        assert!(vm.evaluate("ZZ").is_err(), "ZZ must be pruned");
+        vm.evaluate("1 2 + .").unwrap();
+        assert_eq!(vm.take_output(), "3 ");
+    }
+
+    #[test]
+    fn test_gild_rebaselines_empty() {
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        vm.evaluate(": KEEP1 1 ; GILD : GONE1 2 ;").unwrap();
+        vm.evaluate("EMPTY").unwrap();
+        assert!(vm.evaluate("GONE1").is_err(), "GONE1 must be pruned");
+        vm.evaluate("KEEP1 .").unwrap();
+        assert_eq!(vm.take_output(), "1 ");
     }
 
     #[test]
