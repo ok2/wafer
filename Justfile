@@ -66,6 +66,13 @@ ci: fmt clippy deny test
 check:
     cargo check --workspace
 
+# Install the wafer CLI (release build) and bat syntax highlighting.
+# STRIP=none: Cargo's release default (strip = "debuginfo") emits dylibs that
+# macOS 27's dyld rejects ("mis-aligned LINKEDIT string pool"), so proc macros
+# fail to load during the build itself.
+install: install-syntax
+    CARGO_PROFILE_RELEASE_STRIP=none cargo install --path crates/cli --locked
+
 # Install bat syntax highlighting for WAFER / Forth
 install-syntax:
     mkdir -p ~/.config/bat/syntaxes
