@@ -5,6 +5,32 @@ All notable changes to WAFER are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] - 2026-08-06
+
+### Added
+
+- **SwiftForth-style input number conversion.** Punctuation (`,` `.` `+`
+  `/` `:` and an embedded `-`) anywhere after the leftmost digit now forces
+  double-cell conversion, so `12.34`, `1,234`, `12:30:45` and `2026-08-06`
+  all convert as doubles without a custom parser. Previously only a
+  trailing `.` worked and `1.5` was an "unknown word" error. The
+  punctuation is a double-cell marker, not a fractional point: every
+  spelling of `1234` (`1234.`, `123.4`, `.1234`) yields the same value.
+- **`DPL`** ( -- addr ): digits to the right of the rightmost punctuation
+  character in the last converted number, negative when the token carried
+  none. Seeded at -1024 and bumped once per digit, matching `sf64`.
+  Together with `<# #>` this is how fixed-point input is scaled.
+- **`NH`** ( -- addr ): the high-order cell dropped by a single-cell
+  conversion, so a token that overflows a cell can be recovered as a
+  double (`4000000000 NH @ D.`).
+
+Verified token-for-token against SwiftForth `sf64`: DPL values, double
+promotion and sign handling agree on every probed form. One deliberate
+divergence — WAFER also accepts a sign before a base prefix (`-$FF`), which
+`sf64` rejects; the Forth 2012 spelling `$-FF` works in both. A leading `+`
+is punctuation rather than a sign in both engines, so `+7` is the double 7
+with `DPL` = 1.
+
 ## [0.2.1] - 2026-08-06
 
 ### Fixed

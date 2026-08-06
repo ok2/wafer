@@ -23,11 +23,63 @@ use crate::ir::IrOp;
 #[cfg(feature = "crypto")]
 use crate::memory::HASH_SCRATCH_BASE;
 use crate::memory::{
-    CELL_SIZE, DATA_STACK_TOP, FLOAT_SIZE, FLOAT_STACK_BASE, FLOAT_STACK_TOP, INPUT_BUFFER_BASE,
-    INPUT_BUFFER_SIZE, RETURN_STACK_TOP, SYSVAR_BASE_VAR, SYSVAR_FAULT_CODE, SYSVAR_HERE,
-    SYSVAR_LEAVE_FLAG, SYSVAR_NUM_TIB, SYSVAR_STATE, SYSVAR_TO_IN,
+    CELL_SIZE, DATA_STACK_TOP, DPL_INIT, FLOAT_SIZE, FLOAT_STACK_BASE, FLOAT_STACK_TOP,
+    INPUT_BUFFER_BASE, INPUT_BUFFER_SIZE, RETURN_STACK_TOP, SYSVAR_BASE_VAR, SYSVAR_DPL,
+    SYSVAR_FAULT_CODE, SYSVAR_HERE, SYSVAR_LEAVE_FLAG, SYSVAR_NH, SYSVAR_NUM_TIB, SYSVAR_STATE,
+    SYSVAR_TO_IN,
 };
 use crate::optimizer::optimize;
+
+// ---------------------------------------------------------------------------
+// Number conversion
+// ---------------------------------------------------------------------------
+
+/// Characters that force double-cell conversion when they appear after the
+/// leftmost digit, following `SwiftForth`'s input number conversion rules.
+///
+/// A leading `-` or `+` is a sign rather than punctuation, which keeps `-1`
+/// a single-cell number while `1-2` converts as a double.
+const DOUBLE_PUNCTUATION: [u8; 6] = *b",.+-/:";
+
+/// Split a leading minus off a token, returning whether it was negative.
+///
+/// Only `-` is a sign. A leading `+` stays punctuation, matching `sf64`,
+/// where `+7` converts as the double 7 with `DPL` = 1.
+///
+/// The sign may sit between a base-override prefix and the digits (`$-FF`,
+/// the Forth 2012 spelling) or, as a WAFER extension, before the prefix
+/// (`-$FF`), so this runs at both positions.
+fn strip_sign(s: &str) -> (bool, &str) {
+    match s.as_bytes().first() {
+        Some(b'-') => (true, &s[1..]),
+        _ => (false, s),
+    }
+}
+
+/// A numeric token that converted successfully.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NumberLiteral {
+    /// The accumulated 64-bit value, sign applied.
+    value: i64,
+    /// Digits right of the rightmost punctuation character. Negative when the
+    /// token carried no punctuation, which is how `DPL` reports "single-cell".
+    dpl: i32,
+    /// Whether punctuation forced double-cell conversion.
+    is_double: bool,
+}
+
+impl NumberLiteral {
+    /// Low-order cell — the value a single-cell conversion leaves on the stack.
+    fn lo(self) -> i32 {
+        self.value as i32
+    }
+
+    /// High-order cell. For a single-cell conversion this is what `NH` holds,
+    /// letting an out-of-range token be recovered as a double.
+    fn hi(self) -> i32 {
+        (self.value >> 32) as i32
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Control-flow compilation state
@@ -1194,22 +1246,18 @@ impl<R: Runtime> ForthVM<R> {
             return Ok(());
         }
 
-        // Try to parse as double-number (trailing dot)
-        if let Some((lo, hi)) = self.parse_double_number(token) {
-            self.push_data_stack(lo)?;
-            self.push_data_stack(hi)?;
+        // Try to convert as a number; punctuation makes it double-cell
+        if let Some(lit) = self.parse_numeric_literal(token) {
+            self.record_number_conversion(lit);
+            self.push_data_stack(lit.lo())?;
             if self.recording_toplevel && self.state == 0 {
-                self.toplevel_ir.push(IrOp::PushI32(lo));
-                self.toplevel_ir.push(IrOp::PushI32(hi));
+                self.toplevel_ir.push(IrOp::PushI32(lit.lo()));
             }
-            return Ok(());
-        }
-
-        // Try to parse as number
-        if let Some(n) = self.parse_number(token) {
-            self.push_data_stack(n)?;
-            if self.recording_toplevel && self.state == 0 {
-                self.toplevel_ir.push(IrOp::PushI32(n));
+            if lit.is_double {
+                self.push_data_stack(lit.hi())?;
+                if self.recording_toplevel && self.state == 0 {
+                    self.toplevel_ir.push(IrOp::PushI32(lit.hi()));
+                }
             }
             return Ok(());
         }
@@ -1571,16 +1619,13 @@ impl<R: Runtime> ForthVM<R> {
             return Ok(());
         }
 
-        // Try to parse as double-number (trailing dot)
-        if let Some((lo, hi)) = self.parse_double_number(token) {
-            self.push_ir(IrOp::PushI32(lo));
-            self.push_ir(IrOp::PushI32(hi));
-            return Ok(());
-        }
-
-        // Try to parse as number
-        if let Some(n) = self.parse_number(token) {
-            self.push_ir(IrOp::PushI32(n));
+        // Try to convert as a number; punctuation makes it double-cell
+        if let Some(lit) = self.parse_numeric_literal(token) {
+            self.record_number_conversion(lit);
+            self.push_ir(IrOp::PushI32(lit.lo()));
+            if lit.is_double {
+                self.push_ir(IrOp::PushI32(lit.hi()));
+            }
             return Ok(());
         }
 
@@ -2731,83 +2776,109 @@ impl<R: Runtime> ForthVM<R> {
     // Number parsing
     // -----------------------------------------------------------------------
 
-    /// Try to parse a token as a number.
-    fn parse_number(&self, token: &str) -> Option<i32> {
+    /// Try to convert a token to a number, following `SwiftForth`'s input
+    /// number conversion rules.
+    ///
+    /// Punctuation (`,` `.` `+` `-` `/` `:`) anywhere after the leftmost digit
+    /// forces double-cell conversion, so `12.34`, `1,234`, `12:30:45` and
+    /// `2026-08-06` all convert as doubles. A leading `-` or `+` is a sign, not
+    /// punctuation, which keeps `-1` single-cell.
+    ///
+    /// `DPL` counts up once per digit from [`DPL_INIT`] and resets to zero at
+    /// every punctuation character, so it ends up holding the digit count right
+    /// of the rightmost punctuation, and stays negative for unpunctuated tokens.
+    fn parse_numeric_literal(&self, token: &str) -> Option<NumberLiteral> {
         let token = token.trim();
         if token.is_empty() {
             return None;
         }
 
-        // Check for negative prefix
-        let (negative, rest) = if let Some(stripped) = token.strip_prefix('-') {
-            (true, stripped)
-        } else {
-            (false, token)
-        };
+        // A leading sign binds to the number; it is not double punctuation.
+        let (neg_outer, rest) = strip_sign(token);
 
         if rest.is_empty() {
             return None;
         }
 
-        // Parse based on prefix
-        let result = if let Some(hex) = rest.strip_prefix('$') {
-            i64::from_str_radix(hex, 16).ok()
-        } else if let Some(dec) = rest.strip_prefix('#') {
-            dec.parse::<i64>().ok()
-        } else if let Some(bin) = rest.strip_prefix('%') {
-            i64::from_str_radix(bin, 2).ok()
-        } else if rest.len() == 3 && rest.as_bytes()[0] == b'\'' && rest.as_bytes()[2] == b'\'' {
-            // Character literal: 'x' → ASCII value of x
-            Some(rest.as_bytes()[1] as i64)
-        } else {
-            i64::from_str_radix(rest, self.base).ok()
+        // Character literal: 'x' → ASCII value of x. No digits, so DPL stays
+        // at its seed and the result is always single-cell.
+        if rest.len() == 3 && rest.as_bytes()[0] == b'\'' && rest.as_bytes()[2] == b'\'' {
+            let value = i64::from(rest.as_bytes()[1]);
+            return Some(NumberLiteral {
+                value: if neg_outer { -value } else { value },
+                dpl: DPL_INIT,
+                is_double: false,
+            });
+        }
+
+        // A base-override prefix sits before the leftmost digit.
+        let (radix, after_prefix) = match rest.as_bytes()[0] {
+            b'$' => (16, &rest[1..]),
+            b'#' => (10, &rest[1..]),
+            b'%' => (2, &rest[1..]),
+            _ => (self.base, rest),
         };
 
-        result.map(|n| if negative { -(n as i32) } else { n as i32 })
+        // Forth 2012 spells a signed based number `#-1289`, so the sign can
+        // also follow the prefix. Either way it precedes the leftmost digit
+        // and so is a sign rather than double punctuation.
+        let (neg_inner, digits) = strip_sign(after_prefix);
+        let negative = neg_outer ^ neg_inner;
+
+        if digits.is_empty() {
+            return None;
+        }
+
+        // Walk the digit string, stripping punctuation and tracking DPL.
+        let mut buf = String::with_capacity(digits.len());
+        let mut dpl = DPL_INIT;
+        let mut is_double = false;
+        for &b in digits.as_bytes() {
+            if DOUBLE_PUNCTUATION.contains(&b) {
+                is_double = true;
+                dpl = 0;
+            } else {
+                buf.push(char::from(b));
+                dpl += 1;
+            }
+        }
+
+        if buf.is_empty() {
+            return None;
+        }
+
+        // i128 accumulation so the full u64 range survives conversion.
+        let magnitude = i128::from_str_radix(&buf, radix).ok()?;
+        let value = if negative {
+            -(magnitude as i64)
+        } else {
+            magnitude as i64
+        };
+
+        Some(NumberLiteral {
+            value,
+            dpl,
+            is_double,
+        })
     }
 
-    /// Try to parse a token as a double-number (token ends with `.`).
-    /// Returns (lo, hi) where the double-cell value is (hi << 32) | lo.
-    fn parse_double_number(&self, token: &str) -> Option<(i32, i32)> {
-        let token = token.trim();
-        if token.is_empty() {
-            return None;
+    /// Publish the outcome of a conversion in `DPL` and `NH`.
+    ///
+    /// `NH` only carries meaning after a single-cell conversion, where it holds
+    /// the high-order cell that the stack result dropped.
+    fn record_number_conversion(&mut self, lit: NumberLiteral) {
+        self.rt.mem_write_i32(SYSVAR_DPL, lit.dpl);
+        if !lit.is_double {
+            self.rt.mem_write_i32(SYSVAR_NH, lit.hi());
         }
+    }
 
-        // Check for trailing dot (double-number indicator)
-        let without_dot = token.strip_suffix('.')?;
-        if without_dot.is_empty() {
-            return None;
-        }
-
-        // Check for negative prefix
-        let (negative, rest) = if let Some(stripped) = without_dot.strip_prefix('-') {
-            (true, stripped)
-        } else {
-            (false, without_dot)
-        };
-
-        if rest.is_empty() {
-            return None;
-        }
-
-        // Parse based on prefix -- use i128 to handle the full u64 range
-        let result: Option<i128> = if let Some(hex) = rest.strip_prefix('$') {
-            i128::from_str_radix(hex, 16).ok()
-        } else if let Some(dec) = rest.strip_prefix('#') {
-            dec.parse::<i128>().ok()
-        } else if let Some(bin) = rest.strip_prefix('%') {
-            i128::from_str_radix(bin, 2).ok()
-        } else {
-            i128::from_str_radix(rest, self.base).ok()
-        };
-
-        result.map(|n| {
-            let val: i64 = if negative { -(n as i64) } else { n as i64 };
-            let lo = val as i32;
-            let hi = (val >> 32) as i32;
-            (lo, hi)
-        })
+    /// Try to parse a token as a single-cell number, ignoring `DPL`/`NH`.
+    /// Used where only a plain cell value is meaningful.
+    fn parse_number(&self, token: &str) -> Option<i32> {
+        self.parse_numeric_literal(token)
+            .filter(|lit| !lit.is_double)
+            .map(NumberLiteral::lo)
     }
 
     // -----------------------------------------------------------------------
@@ -3092,6 +3163,7 @@ impl<R: Runtime> ForthVM<R> {
         self.register_to_in()?;
         self.register_state_var()?;
         self.register_base_var()?;
+        self.register_number_conversion_vars()?;
 
         // Double-cell arithmetic
         self.register_m_star()?;
@@ -5148,6 +5220,22 @@ impl<R: Runtime> ForthVM<R> {
         self.rt.mem_write_i32(SYSVAR_BASE_VAR as u32, 10u32 as i32);
 
         self.register_primitive("BASE", false, vec![IrOp::PushI32(SYSVAR_BASE_VAR as i32)])?;
+        Ok(())
+    }
+
+    /// DPL ( -- addr ) and NH ( -- addr ): input number conversion results.
+    ///
+    /// `DPL` holds the digit count right of the rightmost punctuation
+    /// character in the last converted number, or a negative value when the
+    /// token carried none. `NH` holds the high-order cell dropped by a
+    /// single-cell conversion, so an out-of-range token can be recovered as a
+    /// double.
+    fn register_number_conversion_vars(&mut self) -> anyhow::Result<()> {
+        self.rt.mem_write_i32(SYSVAR_DPL, DPL_INIT);
+        self.rt.mem_write_i32(SYSVAR_NH, 0);
+
+        self.register_primitive("DPL", false, vec![IrOp::PushI32(SYSVAR_DPL as i32)])?;
+        self.register_primitive("NH", false, vec![IrOp::PushI32(SYSVAR_NH as i32)])?;
         Ok(())
     }
 
@@ -10826,6 +10914,111 @@ mod tests {
         // Absolute comparison
         assert_eq!(eval_stack("1E 1.5E 1E F~"), vec![-1]); // |1-1.5| < 1
         assert_eq!(eval_stack("1E 2.5E 1E F~"), vec![0]); // |1-2.5| = 1.5 >= 1
+    }
+
+    #[test]
+    fn punctuation_anywhere_converts_as_double() {
+        // The punctuation is a double-cell marker, not a fractional point:
+        // every form below carries the same digits, so the value is the same.
+        // eval_stack reports top-first, so a double reads as [hi, lo].
+        for token in ["1234.", "123.4", "12.34", "1.234", ".1234"] {
+            assert_eq!(eval_stack(token), vec![0, 1234], "token {token}");
+        }
+        // SwiftForth accepts comma, colon, slash, plus and dash too, which is
+        // what makes dates and times convert without a custom parser.
+        assert_eq!(eval_stack("1,234"), vec![0, 1234]);
+        assert_eq!(eval_stack("12:30:45"), vec![0, 123045]);
+        assert_eq!(eval_stack("2026-08-06"), vec![0, 20260806]);
+        assert_eq!(eval_stack("12/34"), vec![0, 1234]);
+        assert_eq!(eval_stack("1+234"), vec![0, 1234]);
+    }
+
+    #[test]
+    fn dpl_counts_digits_right_of_last_punctuation() {
+        for (token, dpl) in [("1234.", 0), ("123.4", 1), ("12.34", 2), (".1234", 4)] {
+            assert_eq!(eval_stack(&format!("{token} 2DROP DPL @")), vec![dpl]);
+        }
+        // Only the rightmost punctuation counts.
+        assert_eq!(eval_stack("12:30:45 2DROP DPL @"), vec![2]);
+    }
+
+    #[test]
+    fn dpl_stays_negative_for_unpunctuated_numbers() {
+        // A leading minus is a sign, not punctuation, so these stay single-cell.
+        for token in ["1234", "-1", "$FF"] {
+            let dpl = eval_stack(&format!("{token} DROP DPL @"))[0];
+            assert!(dpl < 0, "token {token} left DPL = {dpl}");
+        }
+        assert_eq!(eval_stack("-1"), vec![-1]);
+        // DPL counts up from its seed once per digit.
+        assert_eq!(eval_stack("1234 DROP DPL @"), vec![DPL_INIT + 4]);
+        assert_eq!(eval_stack("-1 DROP DPL @"), vec![DPL_INIT + 1]);
+    }
+
+    #[test]
+    fn leading_plus_is_punctuation_not_a_sign() {
+        // sf64 converts `+7` as the double 7 with DPL = 1: unlike `-`, a
+        // leading `+` does not bind to the number.
+        assert_eq!(eval_stack("+7"), vec![0, 7]);
+        assert_eq!(eval_stack("+7 2DROP DPL @"), vec![1]);
+        // Same after a base prefix.
+        assert_eq!(eval_stack("#+7"), vec![0, 7]);
+        assert_eq!(eval_stack("$+F"), vec![0, 15]);
+    }
+
+    #[test]
+    fn repeated_punctuation_only_counts_from_the_last_one() {
+        // sf64: `12..34` is 1234 with DPL 2, `1-2-3` is 123 with DPL 1.
+        assert_eq!(eval_stack("12..34"), vec![0, 1234]);
+        assert_eq!(eval_stack("12..34 2DROP DPL @"), vec![2]);
+        assert_eq!(eval_stack("1-2-3"), vec![0, 123]);
+        assert_eq!(eval_stack("1-2-3 2DROP DPL @"), vec![1]);
+    }
+
+    #[test]
+    fn nh_recovers_an_out_of_range_single_number() {
+        // 4000000000 overflows a signed cell, so the stack value is truncated.
+        assert_eq!(eval_stack("4000000000"), vec![-294967296]);
+        // NH carries the high cell, making the true value recoverable.
+        assert_eq!(eval_stack("4000000000 NH @"), vec![0, -294967296]);
+        assert_eq!(eval_output("4000000000 NH @ D."), "4000000000 ");
+    }
+
+    #[test]
+    fn float_literals_still_win_over_double_punctuation() {
+        // `1.5E0` has an embedded dot, but "15E0" is not a decimal number,
+        // so conversion falls through to the float parser.
+        assert_eq!(eval_output("1.5E0 F."), "1.500000 ");
+        assert_eq!(eval_output("-3.25E0 F."), "-3.250000 ");
+        assert_eq!(eval_output("1E-3 F."), "0.001000 ");
+    }
+
+    #[test]
+    fn double_punctuation_respects_base_prefixes() {
+        assert_eq!(eval_stack("$FF."), vec![0, 255]);
+        assert_eq!(eval_stack("$F.F"), vec![0, 255]);
+        assert_eq!(eval_stack("%1010."), vec![0, 10]);
+        assert_eq!(eval_stack("#12.34"), vec![0, 1234]);
+        assert_eq!(eval_stack("-$FF."), vec![-1, -255]);
+    }
+
+    #[test]
+    fn sign_after_a_base_prefix_is_a_sign_not_punctuation() {
+        // Forth 2012 spells signed based numbers with the sign after the
+        // prefix. The dash precedes the leftmost digit, so it must not
+        // trigger double-cell conversion.
+        assert_eq!(eval_stack("#-1289"), vec![-1289]);
+        assert_eq!(eval_stack("$-12eF"), vec![-4847]);
+        assert_eq!(eval_stack("%-10010110"), vec![-150]);
+        // The sign may also precede the prefix, and both spellings cancel.
+        assert_eq!(eval_stack("-$FF"), vec![-255]);
+        assert_eq!(eval_stack("-$-FF"), vec![255]);
+    }
+
+    #[test]
+    fn punctuated_numbers_compile_into_definitions() {
+        assert_eq!(eval_stack(": D1 12.34 ; D1"), vec![0, 1234]);
+        assert_eq!(eval_output(": STAMP 2026-08-06 D. ; STAMP"), "20260806 ");
     }
 
     #[test]

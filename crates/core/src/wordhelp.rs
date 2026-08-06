@@ -350,6 +350,16 @@ pub const WORD_DOCS: &[(&str, &str, &str)] = &[
         "Convert digits, accumulating into ud.",
     ),
     ("BASE", "( -- addr )", "Variable holding the number base."),
+    (
+        "DPL",
+        "( -- addr )",
+        "Variable: digits right of the last punctuation; negative if none.",
+    ),
+    (
+        "NH",
+        "( -- addr )",
+        "Variable: high cell dropped by the last single-cell conversion.",
+    ),
     ("HEX", "( -- )", "Set BASE to sixteen."),
     ("DECIMAL", "( -- )", "Set BASE to ten."),
     // -- Core: strings --
