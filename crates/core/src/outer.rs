@@ -161,6 +161,96 @@ struct DoesDefinition {
     has_create: bool,
 }
 
+/// Tokens handled directly by the outer interpreter (`interpret_token`,
+/// `interpret_token_immediate`, `compile_token` hardcoded match arms).
+/// Several have no dictionary entry at all; SEE/SEE-IR/HELP explain them
+/// instead of erroring. Keep in sync with those match arms.
+pub(crate) const INTERPRETER_TOKENS: &[&str] = &[
+    // Definition structure
+    ":",
+    ":NONAME",
+    ";",
+    "[:",
+    ";]",
+    "[",
+    "]",
+    "{:",
+    // Conditional compilation
+    "[IF]",
+    "[ELSE]",
+    "[THEN]",
+    "[DEFINED]",
+    "[UNDEFINED]",
+    // Strings + comments
+    ".\"",
+    ".(",
+    "S\"",
+    "S\\\"",
+    "C\"",
+    "S",
+    "(",
+    "\\",
+    "ABORT\"",
+    // Defining words
+    "VARIABLE",
+    "CONSTANT",
+    "CREATE",
+    "VALUE",
+    "DOES>",
+    "2CONSTANT",
+    "2VARIABLE",
+    "2VALUE",
+    "FVARIABLE",
+    "FCONSTANT",
+    "FVALUE",
+    "BUFFER:",
+    "MARKER",
+    "REMEMBER",
+    "GILD",
+    "EMPTY",
+    "SYNONYM",
+    "CONSOLIDATE",
+    // Parsing words
+    "'",
+    "[']",
+    "CHAR",
+    "[CHAR]",
+    "EVALUATE",
+    "WORD",
+    "TO",
+    "IS",
+    "ACTION-OF",
+    "PARSE",
+    "PARSE-NAME",
+    "REFILL",
+    "ORDER",
+    // Compile-mode control flow
+    "IF",
+    "ELSE",
+    "THEN",
+    "DO",
+    "?DO",
+    "LOOP",
+    "+LOOP",
+    "BEGIN",
+    "UNTIL",
+    "AGAIN",
+    "WHILE",
+    "REPEAT",
+    "AHEAD",
+    "CASE",
+    "OF",
+    "ENDOF",
+    "ENDCASE",
+    "RECURSE",
+    "EXIT",
+    "LITERAL",
+    "2LITERAL",
+    "FLITERAL",
+    "SLITERAL",
+    "POSTPONE",
+];
+
 /// Saved VM state for a MARKER word.
 #[derive(Clone)]
 struct MarkerState {
@@ -171,6 +261,7 @@ struct MarkerState {
     ir_bodies: HashMap<WordId, Vec<IrOp>>,
     does_definitions: HashMap<WordId, DoesDefinition>,
     host_word_names: HashMap<WordId, String>,
+    word_sources: HashMap<WordId, String>,
     two_value_words: std::collections::HashSet<u32>,
     fvalue_words: std::collections::HashSet<u32>,
     // Namespace + text state: search order, wordlist allocation,
@@ -204,6 +295,14 @@ pub struct ForthVM<R: Runtime> {
     compiling_ir: Vec<IrOp>,
     control_stack: Vec<ControlEntry>,
     compiling_word_id: Option<WordId>,
+    // SEE source capture: verbatim text of the colon definition in progress
+    // (accumulated across evaluate() calls), the position in the CURRENT
+    // input buffer where capture (re)starts, the byte offset of the most
+    // recently read token, and completed sources by word id.
+    compiling_source: String,
+    source_capture_from: Option<usize>,
+    last_token_start: usize,
+    word_sources: HashMap<WordId, String>,
     // Output buffer
     output: Arc<Mutex<String>>,
     // Next table index (mirrors dictionary.next_fn_index conceptually,
@@ -230,7 +329,11 @@ pub struct ForthVM<R: Runtime> {
     // True when CREATE appeared in the current colon definition before DOES>
     saw_create_in_def: bool,
     // Pending action from compiled defining/parsing words
-    // 0 = none, 1 = CONSTANT, 2 = VARIABLE, 3 = CREATE, 4 = EVALUATE
+    // 0 = none, 1 = CONSTANT, 2 = VARIABLE, 3 = CREATE, 4 = EVALUATE,
+    // 5 = WORD, 6 = FIND, 7 = PARSE, 8 = PARSE-NAME, 9 = 2CONSTANT,
+    // 10 = 2VARIABLE, 11 = DEFER, 12 = IMMEDIATE, 20 = GET-CURRENT,
+    // 21 = SET-CURRENT, 25 = SEARCH-WORDLIST, 33 = DEFINITIONS,
+    // 40 = WORDS, 41 = SEE, 42 = SEE-IR, 43 = HELP
     pending_define: Arc<Mutex<Vec<i32>>>,
     /// Pending actions from host functions (COMPILE,, CS-PICK, CS-ROLL, POSTPONE of control words).
     pending_actions: Arc<Mutex<Vec<PendingAction>>>,
@@ -440,6 +543,10 @@ impl<R: Runtime> ForthVM<R> {
             compiling_ir: Vec::new(),
             control_stack: Vec::new(),
             compiling_word_id: None,
+            compiling_source: String::new(),
+            source_capture_from: None,
+            last_token_start: 0,
+            word_sources: HashMap::new(),
             output,
             next_table_index: 0,
             host_word_names: HashMap::new(),
@@ -535,6 +642,8 @@ impl<R: Runtime> ForthVM<R> {
                     self.compiling_local_kinds.clear();
                     self.local_batch_base = None;
                     self.compile_frames.clear();
+                    self.compiling_source.clear();
+                    self.source_capture_from = None;
                     return Err(self.describe_uncaught(e));
                 }
             }
@@ -552,6 +661,17 @@ impl<R: Runtime> ForthVM<R> {
             if self.input_pos >= self.input_buffer.len() {
                 break;
             }
+        }
+
+        // Multi-line definition: bank this buffer's tail into the capture
+        // and continue from the start of the next buffer.
+        if self.state != 0
+            && let Some(from) = self.source_capture_from
+        {
+            let from = from.min(self.input_buffer.len());
+            self.compiling_source.push_str(&self.input_buffer[from..]);
+            self.compiling_source.push('\n');
+            self.source_capture_from = Some(0);
         }
 
         Ok(())
@@ -701,6 +821,7 @@ impl<R: Runtime> ForthVM<R> {
             return None;
         }
         let start = self.input_pos;
+        self.last_token_start = start;
         while self.input_pos < bytes.len() && !bytes[self.input_pos].is_ascii_whitespace() {
             self.input_pos += 1;
         }
@@ -2102,6 +2223,10 @@ impl<R: Runtime> ForthVM<R> {
         if self.state != 0 {
             anyhow::bail!("nested colon definitions not allowed");
         }
+        // SEE source capture starts at the `:` token itself (its position
+        // was recorded by next_token before dispatch reached us).
+        self.compiling_source.clear();
+        self.source_capture_from = Some(self.last_token_start);
         let name = self
             .next_token()
             .ok_or_else(|| anyhow::anyhow!("expected word name after :"))?;
@@ -2296,6 +2421,16 @@ impl<R: Runtime> ForthVM<R> {
             .compiling_word_id
             .take()
             .ok_or_else(|| anyhow::anyhow!("no word being compiled"))?;
+        // SEE: bank the tail of the current buffer through the `;` token.
+        // Capture is only armed by `:` — :NONAME and quotations never store.
+        if let Some(from) = self.source_capture_from.take() {
+            let end = self.input_pos.min(self.input_buffer.len());
+            let mut src = std::mem::take(&mut self.compiling_source);
+            src.push_str(&self.input_buffer[from.min(end)..end]);
+            self.word_sources
+                .insert(word_id, src.trim_end().to_string());
+        }
+
         let ir = std::mem::take(&mut self.compiling_ir);
         let bodies = self.ir_bodies.clone();
         let ir = self.optimize_ir(ir, &bodies);
@@ -3229,6 +3364,8 @@ impl<R: Runtime> ForthVM<R> {
         // Compile a tiny word that pushes the variable's address
         let ir_body = vec![IrOp::PushI32(var_addr as i32)];
         self.ir_bodies.insert(word_id, ir_body.clone());
+        self.word_sources
+            .insert(word_id, format!("VARIABLE {name}"));
         let config = self.codegen_config(word_id.0);
         let compiled = compile_word(&name, &ir_body, &config)
             .map_err(|e| anyhow::anyhow!("codegen error for VARIABLE {name}: {e}"))?;
@@ -3257,6 +3394,8 @@ impl<R: Runtime> ForthVM<R> {
         // Compile a word that pushes the constant value
         let ir_body = vec![IrOp::PushI32(value)];
         self.ir_bodies.insert(word_id, ir_body.clone());
+        self.word_sources
+            .insert(word_id, format!("{value} CONSTANT {name}"));
         let config = self.codegen_config(word_id.0);
         let compiled = compile_word(&name, &ir_body, &config)
             .map_err(|e| anyhow::anyhow!("codegen error for CONSTANT {name}: {e}"))?;
@@ -3290,6 +3429,7 @@ impl<R: Runtime> ForthVM<R> {
         // Compile a word that pushes the pfa
         let ir_body = vec![IrOp::PushI32(pfa as i32)];
         self.ir_bodies.insert(word_id, ir_body.clone());
+        self.word_sources.insert(word_id, format!("CREATE {name}"));
         let config = self.codegen_config(word_id.0);
         let compiled = compile_word(&name, &ir_body, &config)
             .map_err(|e| anyhow::anyhow!("codegen error for CREATE {name}: {e}"))?;
@@ -3403,6 +3543,8 @@ impl<R: Runtime> ForthVM<R> {
 
             let ir_body = vec![IrOp::Call(word_id)];
             self.ir_bodies.insert(new_word_id, ir_body.clone());
+            self.word_sources
+                .insert(new_word_id, format!("SYNONYM {new_name} {old_name}"));
             let config = self.codegen_config(new_word_id.0);
             let compiled = compile_word(&new_name, &ir_body, &config)
                 .map_err(|e| anyhow::anyhow!("codegen error for SYNONYM: {e}"))?;
@@ -3451,6 +3593,8 @@ impl<R: Runtime> ForthVM<R> {
         // Compile a word that pushes the buffer address
         let ir_body = vec![IrOp::PushI32(buf_addr as i32)];
         self.ir_bodies.insert(word_id, ir_body.clone());
+        self.word_sources
+            .insert(word_id, format!("{size} BUFFER: {name}"));
         let config = self.codegen_config(word_id.0);
         let compiled = compile_word(&name, &ir_body, &config)
             .map_err(|e| anyhow::anyhow!("codegen error for BUFFER: {name}: {e}"))?;
@@ -3477,6 +3621,7 @@ impl<R: Runtime> ForthVM<R> {
             ir_bodies: self.ir_bodies.clone(),
             does_definitions: self.does_definitions.clone(),
             host_word_names: self.host_word_names.clone(),
+            word_sources: self.word_sources.clone(),
             two_value_words: self.two_value_words.clone(),
             fvalue_words: self.fvalue_words.clone(),
             search_order: self.search_order.lock().unwrap().clone(),
@@ -3499,6 +3644,7 @@ impl<R: Runtime> ForthVM<R> {
         self.ir_bodies = state.ir_bodies;
         self.does_definitions = state.does_definitions;
         self.host_word_names = state.host_word_names;
+        self.word_sources = state.word_sources;
         self.two_value_words = state.two_value_words;
         self.fvalue_words = state.fvalue_words;
         *self.search_order.lock().unwrap() = state.search_order;
@@ -4316,9 +4462,21 @@ impl<R: Runtime> ForthVM<R> {
             }
         }
 
+        // A definition left open by the EVALUATEd string: bank its tail and
+        // re-anchor capture at the resume point of the restored buffer.
+        let capture_open = self.state != 0 && self.source_capture_from.is_some();
+        if let Some(from) = self.source_capture_from.filter(|_| self.state != 0) {
+            let from = from.min(self.input_buffer.len());
+            self.compiling_source.push_str(&self.input_buffer[from..]);
+            self.compiling_source.push('\n');
+        }
+
         // Restore input state, SOURCE-ID, and sync back to WASM
         self.input_buffer = saved_buffer;
         self.input_pos = saved_pos;
+        if capture_open {
+            self.source_capture_from = Some(self.input_pos);
+        }
         {
             let bytes = self.input_buffer.as_bytes();
             let len = bytes.len().min(INPUT_BUFFER_SIZE as usize);
@@ -5299,6 +5457,9 @@ impl<R: Runtime> ForthVM<R> {
                     }
                 }
                 40 => self.do_words(),
+                41 => self.do_see()?,
+                42 => self.do_see_ir()?,
+                43 => self.do_help()?,
                 _ => {}
             }
         }
@@ -6042,6 +6203,184 @@ impl<R: Runtime> ForthVM<R> {
         out.push_str(&format!("\n{shown} words\n"));
     }
 
+    /// Map function-table index -> word name via a dictionary walk.
+    /// Newest-first, so redefinitions resolve to the visible name.
+    fn word_id_names(&self) -> HashMap<u32, String> {
+        let mut map = HashMap::new();
+        let mut addr = self.dictionary.latest();
+        while addr != 0 {
+            if let (Ok(name), Ok(code)) = (
+                self.dictionary.word_name(addr),
+                self.dictionary.code_field(addr),
+            ) {
+                map.entry(code).or_insert(name);
+            }
+            let link = self.dictionary.read_link(addr);
+            if link == addr {
+                break;
+            }
+            addr = link;
+        }
+        map
+    }
+
+    /// Parse the mandatory word-name argument of SEE/SEE-IR/HELP.
+    fn parse_name_arg(&mut self, who: &str) -> anyhow::Result<String> {
+        self.next_token()
+            .ok_or_else(|| anyhow::anyhow!("{who}: expected word name"))
+    }
+
+    /// `HELP [name]` — stack effect + description from the doc table; user
+    /// words echo their leading `( ... -- ... )` comment from the captured
+    /// source. Bare HELP prints usage.
+    fn do_help(&mut self) -> anyhow::Result<()> {
+        // Like WORDS' filter, the name is read from the same line (optional).
+        let name = if self.state == 0 {
+            self.next_token()
+        } else {
+            None
+        };
+        let Some(name) = name else {
+            self.output.lock().unwrap().push_str(
+                "HELP <word>  -- stack effect + description. \
+                 Also try: WORDS, SEE <word>, SEE-IR <word>\n",
+            );
+            return Ok(());
+        };
+        let upper = name.to_ascii_uppercase();
+        let found = self.dictionary.find(&upper);
+        let mut line = if let Some((effect, desc)) = crate::wordhelp::lookup(&upper) {
+            format!("{upper}  {effect}  {desc}")
+        } else if let Some((_, word_id, _)) = found {
+            match self
+                .word_sources
+                .get(&word_id)
+                .and_then(|s| crate::wordhelp::stack_comment(s))
+            {
+                Some(effect) => {
+                    format!("{upper}  {effect}  user word; SEE {upper} shows the source")
+                }
+                None => format!("no help for {upper}; try SEE {upper}"),
+            }
+        } else if INTERPRETER_TOKENS.contains(&upper.as_str()) {
+            format!("{upper} is handled by the outer interpreter")
+        } else {
+            anyhow::bail!("HELP: unknown word: {name}");
+        };
+        if found.is_some_and(|(_, _, imm)| imm) {
+            line.push_str("  immediate");
+        }
+        line.push('\n');
+        self.output.lock().unwrap().push_str(&line);
+        Ok(())
+    }
+
+    /// `SEE name` — print captured source, a synthesized definition for
+    /// data words, or an IR/stub fallback. Never dead-ends on a defined word.
+    fn do_see(&mut self) -> anyhow::Result<()> {
+        let name = self.parse_name_arg("SEE")?;
+        let upper = name.to_ascii_uppercase();
+        let Some((addr, word_id, is_immediate)) = self.dictionary.find(&upper) else {
+            if INTERPRETER_TOKENS.contains(&upper.as_str()) {
+                self.output.lock().unwrap().push_str(&format!(
+                    "SEE: {upper} is handled by the outer interpreter (compiler word)\n"
+                ));
+                return Ok(());
+            }
+            anyhow::bail!("SEE: unknown word: {name}");
+        };
+        let stored_name = self.dictionary.word_name(addr).unwrap_or(upper);
+        // Built-in words carry their HELP line as a leading comment.
+        let help = crate::wordhelp::lookup(&stored_name)
+            .map(|(effect, desc)| format!("\\ {stored_name}  {effect}  {desc}\n"))
+            .unwrap_or_default();
+        let mut text = if let Some(src) = self.word_sources.get(&word_id) {
+            src.clone()
+        } else if let Some(synth) = self.synthesize_data_word(&stored_name, word_id) {
+            synth
+        } else if let Some(body) = self.ir_bodies.get(&word_id) {
+            let names = self.word_id_names();
+            let ir = crate::see::format_ir_with(body, &|id| names.get(&id.0).cloned());
+            format!("\\ {stored_name} is a primitive; IR:\n{}", ir.trim_end())
+        } else if self.host_word_names.contains_key(&word_id) {
+            format!("\\ {stored_name} is a built-in host word")
+        } else {
+            format!("\\ {stored_name}: no source available")
+        };
+        if is_immediate {
+            text.push_str("\nimmediate");
+        }
+        text.push('\n');
+        self.output.lock().unwrap().push_str(&(help + &text));
+        Ok(())
+    }
+
+    /// Synthesize `SEE` output for mutable data words (VALUE family, DEFER)
+    /// whose current value lives in WASM memory. Gated on `word_pfa_map` so
+    /// address-pushing primitives (BASE, ...) never masquerade as data
+    /// words. A DOES>-product whose body happens to match a VALUE shape
+    /// prints as one — behaviorally equivalent, provenance lost.
+    fn synthesize_data_word(&mut self, name: &str, word_id: WordId) -> Option<String> {
+        let &pfa = self.word_pfa_map.get(&word_id.0)?;
+        if self.two_value_words.contains(&word_id.0) {
+            let lo = self.rt.mem_read_i32(pfa);
+            let hi = self.rt.mem_read_i32(pfa + CELL_SIZE);
+            return Some(format!("{lo} {hi} 2VALUE {name}"));
+        }
+        if self.fvalue_words.contains(&word_id.0) {
+            let bytes: [u8; 8] = self.rt.mem_read_slice(pfa, 8).try_into().ok()?;
+            let r = f64::from_le_bytes(bytes);
+            return Some(format!("{r:e} FVALUE {name}"));
+        }
+        match self.ir_bodies.get(&word_id)?.as_slice() {
+            [IrOp::PushI32(addr), IrOp::Fetch] => {
+                let cur = self.rt.mem_read_i32(*addr as u32);
+                Some(format!("{cur} VALUE {name}"))
+            }
+            [IrOp::PushI32(addr), IrOp::Fetch, IrOp::Execute] => {
+                let xt = self.rt.mem_read_i32(*addr as u32) as u32;
+                Some(match self.word_id_names().get(&xt) {
+                    Some(t) => format!("DEFER {name}  ( IS {t} )"),
+                    None => format!("DEFER {name}"),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// `SEE-IR name` — print the stored post-optimization IR of a word.
+    fn do_see_ir(&mut self) -> anyhow::Result<()> {
+        let name = self.parse_name_arg("SEE-IR")?;
+        let upper = name.to_ascii_uppercase();
+        let help = crate::wordhelp::lookup(&upper)
+            .map(|(effect, desc)| format!("\\ {upper}  {effect}  {desc}\n"))
+            .unwrap_or_default();
+        let text = if let Some((_addr, word_id, is_immediate)) = self.dictionary.find(&upper) {
+            if let Some(body) = self.ir_bodies.get(&word_id) {
+                let mut header = format!("\\ {upper} -- {} ops (optimized IR)", body.len());
+                if is_immediate {
+                    header.push_str(" immediate");
+                }
+                if self.does_definitions.contains_key(&word_id) {
+                    header.push_str(" does>");
+                }
+                header.push('\n');
+                let names = self.word_id_names();
+                header + &crate::see::format_ir_with(body, &|id| names.get(&id.0).cloned())
+            } else if self.host_word_names.contains_key(&word_id) {
+                format!("SEE-IR: {upper} is a built-in host word\n")
+            } else {
+                format!("SEE-IR: {upper} has no IR body\n")
+            }
+        } else if INTERPRETER_TOKENS.contains(&upper.as_str()) {
+            format!("SEE-IR: {upper} is handled directly by the outer interpreter\n")
+        } else {
+            anyhow::bail!("SEE-IR: unknown word: {name}");
+        };
+        self.output.lock().unwrap().push_str(&(help + &text));
+        Ok(())
+    }
+
     /// Register Search-Order word set words.
     fn register_search_order(&mut self) -> anyhow::Result<()> {
         // FORTH-WORDLIST ( -- wid )
@@ -6267,14 +6606,18 @@ impl<R: Runtime> ForthVM<R> {
         Ok(())
     }
 
-    /// Register WORDS for the Programming-Tools word set.
+    /// Register WORDS / SEE-IR for the Programming-Tools word set.
+    /// Each runs Rust-side via `pending_define` so it can parse arguments
+    /// with `next_token()` and write to `self.output`.
     fn register_words(&mut self) -> anyhow::Result<()> {
-        let pending = Arc::clone(&self.pending_define);
-        let func: HostFn = Box::new(move |_ctx: &mut dyn HostAccess| {
-            pending.lock().unwrap().push(40); // WORDS action
-            Ok(())
-        });
-        self.register_host_primitive("WORDS", false, func)?;
+        for (name, code) in [("WORDS", 40), ("SEE", 41), ("SEE-IR", 42), ("HELP", 43)] {
+            let pending = Arc::clone(&self.pending_define);
+            let func: HostFn = Box::new(move |_ctx: &mut dyn HostAccess| {
+                pending.lock().unwrap().push(code);
+                Ok(())
+            });
+            self.register_host_primitive(name, false, func)?;
+        }
         Ok(())
     }
 
@@ -6484,6 +6827,8 @@ impl<R: Runtime> ForthVM<R> {
 
         let ir = vec![IrOp::PushI32(lo), IrOp::PushI32(hi)];
         self.ir_bodies.insert(word_id, ir.clone());
+        self.word_sources
+            .insert(word_id, format!("{lo} {hi} 2CONSTANT {name}"));
         let config = self.codegen_config(word_id.0);
         let compiled = compile_word(&name, &ir, &config)
             .map_err(|e| anyhow::anyhow!("2CONSTANT codegen: {e}"))?;
@@ -6510,6 +6855,8 @@ impl<R: Runtime> ForthVM<R> {
 
         let ir = vec![IrOp::PushI32(addr as i32)];
         self.ir_bodies.insert(word_id, ir.clone());
+        self.word_sources
+            .insert(word_id, format!("2VARIABLE {name}"));
         let config = self.codegen_config(word_id.0);
         let compiled = compile_word(&name, &ir, &config)
             .map_err(|e| anyhow::anyhow!("2VARIABLE codegen: {e}"))?;
@@ -7299,6 +7646,8 @@ impl<R: Runtime> ForthVM<R> {
         // Compile a word that pushes the address onto the DATA stack
         let ir_body = vec![IrOp::PushI32(addr as i32)];
         self.ir_bodies.insert(word_id, ir_body.clone());
+        self.word_sources
+            .insert(word_id, format!("FVARIABLE {name}"));
         let config = self.codegen_config(word_id.0);
         let compiled = compile_word(&name, &ir_body, &config)
             .map_err(|e| anyhow::anyhow!("codegen error for FVARIABLE {name}: {e}"))?;
@@ -7339,6 +7688,8 @@ impl<R: Runtime> ForthVM<R> {
         self.rt.ensure_table_size(word_id.0)?;
         self.rt.register_host_func(word_id.0, func)?;
         self.dictionary.reveal();
+        self.word_sources
+            .insert(word_id, format!("{val:e} FCONSTANT {name}"));
         self.sync_word_lookup(&name, word_id, false);
         self.next_table_index = self.next_table_index.max(word_id.0 + 1);
 
@@ -9000,6 +9351,281 @@ mod tests {
         assert!(!output.contains("__CTRL__"));
     }
 
+    // -- HELP --
+
+    #[test]
+    fn test_help_documented_word() {
+        let output = eval_output("HELP DUP");
+        assert_eq!(
+            output,
+            "DUP  ( x -- x x )  Duplicate the top of the data stack.\n"
+        );
+        // Case-insensitive.
+        assert_eq!(eval_output("HELP dup"), output);
+    }
+
+    #[test]
+    fn test_help_bare_prints_usage() {
+        let output = eval_output("HELP");
+        assert!(output.contains("HELP <word>"), "{output}");
+        assert!(output.contains("SEE <word>"), "{output}");
+    }
+
+    #[test]
+    fn test_help_user_word_echoes_stack_comment() {
+        let output = eval_output(": SQ ( n -- n^2 ) DUP * ; HELP SQ");
+        assert!(output.contains("SQ  ( n -- n^2 )"), "{output}");
+        assert!(output.contains("SEE SQ"), "{output}");
+    }
+
+    #[test]
+    fn test_help_undocumented_user_word_hints_see() {
+        let output = eval_output(": MYW 1 ; HELP MYW");
+        assert_eq!(output, "no help for MYW; try SEE MYW\n");
+    }
+
+    #[test]
+    fn test_help_immediate_marker() {
+        let output = eval_output(": IMH 1 ; IMMEDIATE HELP IMH");
+        assert!(output.contains("immediate"), "{output}");
+    }
+
+    #[test]
+    fn test_help_unknown_word_errors() {
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        let err = vm.evaluate("HELP NOSUCHWORD").unwrap_err();
+        assert!(err.to_string().contains("HELP: unknown word: NOSUCHWORD"));
+    }
+
+    #[test]
+    fn test_help_covers_every_word_in_fresh_vm() {
+        // Total-coverage gate: every visible dictionary word and every
+        // outer-interpreter token must have a WORD_DOCS entry, and every
+        // entry must resolve back to a real word or token.
+        let vm = ForthVM::<NativeRuntime>::new().unwrap();
+        let mut missing: Vec<String> = Vec::new();
+        let mut names = vm.word_names();
+        names.extend(INTERPRETER_TOKENS.iter().map(ToString::to_string));
+        for name in &names {
+            if crate::wordhelp::lookup(name).is_none() {
+                missing.push(name.clone());
+            }
+        }
+        missing.sort();
+        missing.dedup();
+        assert!(missing.is_empty(), "words without HELP docs: {missing:?}");
+
+        for (name, effect, desc) in crate::wordhelp::WORD_DOCS {
+            let known = vm.dictionary.find(&name.to_ascii_uppercase()).is_some()
+                || INTERPRETER_TOKENS
+                    .iter()
+                    .any(|t| t.eq_ignore_ascii_case(name));
+            // SHA words vanish without the crypto feature; keep their docs.
+            let feature_gated = !cfg!(feature = "crypto") && name.starts_with("SHA");
+            assert!(
+                known || feature_gated,
+                "WORD_DOCS entry for nonexistent word: {name}"
+            );
+            assert!(!desc.is_empty(), "empty description for {name}");
+            let e = *effect;
+            assert!(
+                e.starts_with('(') && e.ends_with(')'),
+                "malformed stack effect for {name}: {e:?}"
+            );
+        }
+    }
+
+    // -- SEE --
+
+    #[test]
+    fn test_see_colon_word_verbatim() {
+        let output = eval_output(": SQ DUP * ; SEE SQ");
+        assert_eq!(output, ": SQ DUP * ;\n");
+    }
+
+    #[test]
+    fn test_see_multiline_definition() {
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        vm.evaluate(": TRI").unwrap();
+        vm.evaluate("  DUP DUP ;").unwrap();
+        vm.evaluate("SEE TRI").unwrap();
+        assert_eq!(vm.take_output(), ": TRI\n  DUP DUP ;\n");
+    }
+
+    #[test]
+    fn test_see_comment_survives() {
+        let output = eval_output(": C ( n -- n ) 1+ ; SEE C");
+        assert!(output.contains("( n -- n )"), "{output}");
+    }
+
+    #[test]
+    fn test_see_data_words() {
+        assert_eq!(eval_output("42 CONSTANT A SEE A"), "42 CONSTANT A\n");
+        assert_eq!(eval_output("VARIABLE V SEE V"), "VARIABLE V\n");
+        assert_eq!(eval_output("CREATE CR8 SEE CR8"), "CREATE CR8\n");
+        assert_eq!(eval_output("16 BUFFER: B SEE B"), "16 BUFFER: B\n");
+        assert_eq!(eval_output("1 2 2CONSTANT D2 SEE D2"), "1 2 2CONSTANT D2\n");
+        assert_eq!(
+            eval_output("SYNONYM NEWDUP DUP SEE NEWDUP"),
+            "SYNONYM NEWDUP DUP\n"
+        );
+    }
+
+    #[test]
+    fn test_see_value_shows_current() {
+        assert_eq!(eval_output("5 VALUE X SEE X"), "5 VALUE X\n");
+        assert_eq!(eval_output("5 VALUE X 9 TO X SEE X"), "9 VALUE X\n");
+    }
+
+    #[test]
+    fn test_see_defer_shows_target() {
+        let output = eval_output("DEFER D ' DUP IS D SEE D");
+        assert_eq!(output, "DEFER D  ( IS DUP )\n");
+    }
+
+    #[test]
+    fn test_see_boot_word_shows_source() {
+        // WITHIN is defined in boot.fth as a colon word; SEE must show
+        // real source (with its HELP header line), not an IR dump.
+        let output = eval_output("SEE WITHIN");
+        assert!(output.starts_with("\\ WITHIN  ("), "{output}");
+        assert!(
+            output.ends_with(": WITHIN  OVER - >R - R> U< ;\n"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn test_see_primitive_ir_fallback() {
+        let output = eval_output("SEE DUP");
+        assert!(output.contains("DUP is a primitive; IR:"), "{output}");
+        assert!(output.contains("dup"), "{output}");
+    }
+
+    #[test]
+    fn test_see_host_word_and_interpreter_token() {
+        let output = eval_output("SEE WORDS");
+        assert!(output.contains("WORDS is a built-in host word"), "{output}");
+        // `:` has no dictionary entry — outer-interpreter stub.
+        let output = eval_output("SEE :");
+        assert!(
+            output.contains(": is handled by the outer interpreter"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn test_see_immediate_flag() {
+        let output = eval_output(": I2 ; IMMEDIATE SEE I2");
+        assert!(output.contains(": I2 ;\nimmediate"), "{output}");
+    }
+
+    #[test]
+    fn test_see_unknown_word_errors() {
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        let err = vm.evaluate("SEE NOSUCHWORD").unwrap_err();
+        assert!(err.to_string().contains("SEE: unknown word: NOSUCHWORD"));
+    }
+
+    #[test]
+    fn test_see_error_path_no_capture_debris() {
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        // Force an unknown-word error mid-definition, then define fresh.
+        assert!(vm.evaluate(": BAD NOSUCHWORD ;").is_err());
+        vm.evaluate(": GOOD 1 ; SEE GOOD").unwrap();
+        assert_eq!(vm.take_output(), ": GOOD 1 ;\n");
+    }
+
+    #[test]
+    fn test_see_marker_roundtrip_restores_source() {
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        vm.evaluate(": W 1 ; MARKER MK : W 2 ;").unwrap();
+        vm.evaluate("SEE W").unwrap();
+        assert_eq!(vm.take_output(), ": W 2 ;\n");
+        vm.evaluate("MK SEE W").unwrap();
+        assert_eq!(vm.take_output(), ": W 1 ;\n");
+    }
+
+    #[test]
+    fn test_see_redefinition_shows_newest() {
+        let output = eval_output(": R 1 ; : R 2 ; SEE R");
+        assert_eq!(output, ": R 2 ;\n");
+    }
+
+    // -- SEE-IR --
+
+    #[test]
+    fn test_see_ir_colon_word() {
+        let output = eval_output(": SQ DUP * ; SEE-IR SQ");
+        assert!(output.contains("\\ SQ -- 2 ops (optimized IR)"), "{output}");
+        assert!(output.contains("dup"));
+        assert!(output.contains("mul"));
+    }
+
+    #[test]
+    fn test_see_ir_shows_inlined_body() {
+        let output = eval_output(": SQ DUP * ; : FOO SQ SQ ; SEE-IR FOO");
+        // Inlining threshold covers SQ: FOO's stored IR has both muls inlined.
+        assert_eq!(output.matches("mul").count(), 2, "{output}");
+        assert!(!output.contains("call"), "{output}");
+    }
+
+    #[test]
+    fn test_see_ir_resolves_callee_names() {
+        // A body over the inlining threshold keeps its calls.
+        let output = eval_output(
+            ": BIG DUP DUP DUP DUP DUP DUP DUP DUP DUP * * * * * * * * * ; \
+             : USER BIG BIG ; SEE-IR USER",
+        );
+        assert!(
+            output.contains("call BIG") || output.contains("tail-call BIG"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn test_see_ir_primitive_and_host_word() {
+        let output = eval_output("SEE-IR DUP");
+        assert!(output.contains("(optimized IR)"), "{output}");
+        assert!(output.contains("dup"));
+        let output = eval_output("SEE-IR WORDS");
+        assert!(output.contains("WORDS is a built-in host word"), "{output}");
+    }
+
+    #[test]
+    fn test_see_ir_control_flow_indented() {
+        let output = eval_output(": T IF 1 ELSE 2 THEN ; SEE-IR T");
+        assert!(
+            output.contains("if\n  push 1\nelse\n  push 2\nthen\n"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn test_see_ir_immediate_flag() {
+        let output = eval_output(": IMM 1 ; IMMEDIATE SEE-IR IMM");
+        assert!(output.contains("immediate"), "{output}");
+    }
+
+    #[test]
+    fn test_see_ir_interpreter_token() {
+        let output = eval_output("SEE-IR :");
+        assert!(
+            output.contains(": is handled directly by the outer interpreter"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn test_see_ir_errors() {
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        let err = vm.evaluate("SEE-IR NOSUCHWORD").unwrap_err();
+        assert!(err.to_string().contains("SEE-IR: unknown word: NOSUCHWORD"));
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        let err = vm.evaluate("SEE-IR").unwrap_err();
+        assert!(err.to_string().contains("SEE-IR: expected word name"));
+    }
+
     #[test]
     fn test_dot_s_honors_base() {
         assert_eq!(eval_output("HEX FF .S"), "<1> FF ");
@@ -9096,7 +9722,7 @@ mod tests {
 
     #[test]
     fn test_stack_guards_off_config() {
-        let mut cfg = crate::config::WaferConfig::all();
+        let mut cfg = WaferConfig::all();
         cfg.codegen.stack_guards = false;
         let mut vm = ForthVM::<NativeRuntime>::new_with_config(cfg).unwrap();
         // Compiled DROP underflows silently (documented unguarded mode)
