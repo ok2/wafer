@@ -108,6 +108,23 @@ pub const SYSVAR_HLD: u32 = SYSVAR_BASE + 28;
 pub const SYSVAR_LEAVE_FLAG: u32 = SYSVAR_BASE + 32;
 /// Throw code left by a compiled stack-guard fault for `_STACK_FAULT_`.
 pub const SYSVAR_FAULT_CODE: u32 = SYSVAR_BASE + 36;
+/// DPL: digits right of the rightmost punctuation in the last converted
+/// number; negative when the token carried no punctuation.
+pub const SYSVAR_DPL: u32 = SYSVAR_BASE + 40;
+/// NH: high-order cell of the last single-cell conversion, so an
+/// out-of-range token can be recovered as a double.
+pub const SYSVAR_NH: u32 = SYSVAR_BASE + 44;
+
+/// Seed for [`SYSVAR_DPL`] before conversion starts.
+///
+/// `SwiftForth` seeds DPL with a negative value and bumps it once per digit,
+/// so an unpunctuated token still ends up negative. Punctuation resets the
+/// counter to zero, which makes the final value the digit count right of the
+/// rightmost punctuation character.
+///
+/// The exact seed is observable: `sf64` reports DPL as -1020 after `1234`
+/// and -1023 after `-1`, both of which pin it to -1024.
+pub const DPL_INIT: i32 = -1024;
 
 #[cfg(test)]
 mod tests {
@@ -149,6 +166,9 @@ mod tests {
             SYSVAR_NUM_TIB,
             SYSVAR_HLD,
             SYSVAR_LEAVE_FLAG,
+            SYSVAR_FAULT_CODE,
+            SYSVAR_DPL,
+            SYSVAR_NH,
         ];
         for offset in all_offsets {
             assert!(offset + CELL_SIZE <= SYSVAR_BASE + SYSVAR_SIZE);
