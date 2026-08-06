@@ -5,6 +5,24 @@ All notable changes to WAFER are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-08-06
+
+### Fixed
+
+- **The search order is now authoritative** (Forth 2012 §16.3.3): a word
+  whose wordlist is not in the search order is no longer findable.
+  Previously lookup fell back to the newest entry across all wordlists,
+  making word hiding impossible. Verified against gforth and SwiftForth,
+  and guarded by a cross-engine corpus program.
+- **Host words validate their stack arguments.** Around 40 host-implemented
+  words (`RND-SEED`, `ACCEPT`, `RESIZE`, `ALLOCATE`, `FREE`, `SEARCH`,
+  `SUBSTITUTE`, `ROLL`, `M*`, `UM/MOD`, `SF@ SF! DF@ DF!`, `F. FE. FS. F~`,
+  `2R@`, and friends) performed raw stack-pointer arithmetic with no
+  underflow check — calling them on an empty stack silently corrupted the
+  stack pointer (the compiled-code guards from 0.2.0 do not cover host
+  words). All argument-taking host words now fail with a clean, CATCHable
+  underflow error, enforced by a class-wide regression test.
+
 ## [0.2.0] - 2026-08-06
 
 The usability release: introspection, source files, honest errors, and a
@@ -86,5 +104,6 @@ compliance suite, `CONSOLIDATE` whole-program recompilation, `wafer build`
 AOT export (WASM / native / JS loader), browser REPL, SHA-1/256/512 words,
 and cross-engine benchmark lanes against gforth and SwiftForth.
 
+[0.2.1]: https://github.com/ok2/wafer/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/ok2/wafer/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/ok2/wafer/releases/tag/v0.1.0
