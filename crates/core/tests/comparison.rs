@@ -453,6 +453,21 @@ fn programs() -> Vec<Program> {
             expected: "99 \n",
             category: Category::Definitions,
         },
+        Program {
+            name: "search-order-hides",
+            code: "WORDLIST CONSTANT MY-WL\n\
+                   MY-WL SET-CURRENT\n\
+                   : SECRET 42 ;\n\
+                   FORTH-WORDLIST SET-CURRENT\n\
+                   [UNDEFINED] SECRET . CR\n\
+                   GET-ORDER MY-WL SWAP 1+ SET-ORDER\n\
+                   [DEFINED] SECRET . CR\n\
+                   SECRET . CR\n\
+                   -1 SET-ORDER\n\
+                   [UNDEFINED] SECRET . CR",
+            expected: "-1 \n-1 \n42 \n-1 \n",
+            category: Category::Definitions,
+        },
         // -- Strings --
         Program {
             name: "s-quote-type",

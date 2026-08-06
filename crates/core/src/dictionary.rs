@@ -192,10 +192,9 @@ impl Dictionary {
                     }
                 }
             }
-            // Fallback: return newest entry across all wordlists
-            if let Some(&(_wid, word_addr, fn_index, is_immediate)) = entries.last() {
-                return Some((word_addr, WordId(fn_index), is_immediate));
-            }
+            // In no wordlist of the search order: not findable
+            // (Forth 2012 §16.3.3 — the order is authoritative).
+            return None;
         }
 
         // Fallback: linked-list walk (for words not yet in the index)
