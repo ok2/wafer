@@ -139,6 +139,7 @@ fn cmd_build(
 
     // Exported modules are production artifacts: no stack guards by default
     let mut vm = ForthVM::<NativeRuntime>::new_with_config(vm_config(false))?;
+    vm.set_source_loader(fs_loader());
     vm.set_recording(true);
     vm.evaluate(&source)?;
 
@@ -273,18 +274,26 @@ fn vm_config(default_guards: bool) -> wafer_core::config::WaferConfig {
     cfg
 }
 
+/// Filesystem source loader for INCLUDE/INCLUDED.
+fn fs_loader() -> Box<dyn Fn(&str) -> anyhow::Result<String> + Send + Sync> {
+    Box::new(|path| Ok(std::fs::read_to_string(path)?))
+}
+
 /// `wafer` (REPL) or `wafer program.fth` (evaluate and exit)
 fn cmd_eval_or_repl(file: Option<&str>) -> anyhow::Result<()> {
     let mut vm = ForthVM::<NativeRuntime>::new_with_config(vm_config(true))?;
+    vm.set_source_loader(fs_loader());
 
     match file {
         Some(file) => {
-            let source = std::fs::read_to_string(file)?;
-            vm.evaluate(&source)?;
+            // Through the include machinery: file:line error context and a
+            // base directory for nested INCLUDEs.
+            let result = vm.include(file);
             let output = vm.take_output();
             if !output.is_empty() {
                 print!("{output}");
             }
+            result?;
         }
         None => {
             if !stdin_is_tty() {
@@ -303,7 +312,7 @@ fn cmd_eval_or_repl(file: Option<&str>) -> anyhow::Result<()> {
                             }
                         }
                         Err(e) => {
-                            eprintln!("Error: {e}");
+                            eprintln!("Error: {e:#}");
                         }
                     }
                 }
@@ -459,7 +468,7 @@ fn run_repl(vm: &mut ForthVM<NativeRuntime>) -> anyhow::Result<()> {
                         }
                     }
                     Err(e) => {
-                        eprintln!("Error: {e}");
+                        eprintln!("Error: {e:#}");
                     }
                 }
                 // New definitions may have appeared: refresh completion

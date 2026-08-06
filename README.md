@@ -95,7 +95,7 @@ Times in microseconds. WAFER/gf < 1.0 means WAFER is faster. CONSOL = after `CON
 ## Testing
 
 ```bash
-# All tests (~550 currently passing)
+# All tests (~570 currently passing)
 cargo test --workspace
 
 # Forth 2012 compliance suite
@@ -185,7 +185,7 @@ Over 200 words are implemented across the following categories:
 | Strings      | `COMPARE SEARCH SLITERAL REPLACES SUBSTITUTE UNESCAPE`                                                          |
 | Floating-Pt  | `F+ F- F* F/ FABS FNEGATE FSQRT FSIN FCOS FTAN FEXP FLOG FMIN FMAX` and 55+ more                                |
 | Case         | `CASE OF ENDOF ENDCASE`                                                                                         |
-| Tools        | `WORDS SEE SEE-IR HELP .S F.S ? DUMP MARKER REMEMBER EMPTY GILD BYE`                                            |
+| Tools        | `WORDS SEE SEE-IR HELP INCLUDE INCLUDED .S F.S ? DUMP MARKER REMEMBER EMPTY GILD BYE`                           |
 
 ## Web REPL
 

@@ -124,6 +124,8 @@ pub const WORD_DOCS: &[(&str, &str, &str)] = &[
         "Move back items stored by N>R.",
     ),
     ("SP@", "( -- addr )", "Current data-stack pointer."),
+    ("RP@", "( -- addr )", "Current return-stack pointer."),
+    ("RDEPTH", "( -- n )", "Number of cells on the return stack."),
     // -- Core: arithmetic --
     ("+", "( n1 n2 -- n3 )", "Add: n3 = n1 + n2."),
     ("-", "( n1 n2 -- n3 )", "Subtract: n3 = n1 - n2."),
@@ -1003,7 +1005,7 @@ pub const WORD_DOCS: &[(&str, &str, &str)] = &[
     (
         "WORDS",
         "( \"filter\"? -- )",
-        "List visible words; optional substring filter.",
+        "List words; optional substring filter; ALL = grouped view.",
     ),
     (
         "SEE",
@@ -1022,6 +1024,7 @@ pub const WORD_DOCS: &[(&str, &str, &str)] = &[
     ),
     (".S", "( -- )", "Print the data stack, respecting BASE."),
     ("F.S", "( -- )", "Print the float stack."),
+    (".RS", "( -- )", "Print the return stack, respecting BASE."),
     ("?", "( addr -- )", "Fetch and print the cell at addr."),
     (
         "DUMP",
@@ -1047,6 +1050,16 @@ pub const WORD_DOCS: &[(&str, &str, &str)] = &[
         "GILD",
         "( -- )",
         "Make the current state the EMPTY baseline.",
+    ),
+    (
+        "INCLUDED",
+        "( c-addr u -- )",
+        "Interpret the named source file (nestable).",
+    ),
+    (
+        "INCLUDE",
+        "( \"name\" -- )",
+        "Interpret the source file named in the input.",
     ),
     // -- WAFER-specific --
     (

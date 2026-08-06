@@ -420,18 +420,33 @@ impl Dictionary {
     /// Return names of all visible (non-hidden) words, newest first.
     /// With `include_internal` false, words flagged INTERNAL are skipped.
     pub fn visible_words(&self, include_internal: bool) -> Vec<String> {
-        let mut names = Vec::new();
+        self.visible_entries()
+            .into_iter()
+            .filter(|(_, _, internal)| include_internal || !internal)
+            .map(|(name, _, _)| name)
+            .collect()
+    }
+
+    /// All visible (non-hidden) entries, newest first:
+    /// (name, wordlist id, INTERNAL flag). The wid comes from the hash
+    /// index (entries themselves store no wid); words missing from the
+    /// index default to wid 1 (FORTH).
+    pub fn visible_entries(&self) -> Vec<(String, u32, bool)> {
+        let mut entries = Vec::new();
         let mut addr = self.latest;
         while addr != 0 {
             let flags_byte = self.memory[(addr + 4) as usize];
-            let skip = flags_byte & flags::HIDDEN != 0
-                || (!include_internal && flags_byte & flags::INTERNAL != 0);
-            if !skip {
+            if flags_byte & flags::HIDDEN == 0 {
                 let name_len = (flags_byte & flags::LENGTH_MASK) as usize;
                 let name_start = (addr + 5) as usize;
                 let name = String::from_utf8_lossy(&self.memory[name_start..name_start + name_len])
                     .to_string();
-                names.push(name);
+                let wid = self
+                    .index
+                    .get(&name)
+                    .and_then(|es| es.iter().find(|e| e.1 == addr))
+                    .map_or(1, |e| e.0);
+                entries.push((name, wid, flags_byte & flags::INTERNAL != 0));
             }
             let link = self.read_u32_unchecked(addr);
             if link == addr {
@@ -439,7 +454,7 @@ impl Dictionary {
             }
             addr = link;
         }
-        names
+        entries
     }
 
     /// Get a reference to the raw memory buffer.

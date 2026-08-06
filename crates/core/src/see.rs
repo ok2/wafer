@@ -194,6 +194,7 @@ fn write_op(out: &mut String, op: &IrOp, depth: usize, resolve: &dyn Fn(WordId) 
         // -- System --
         IrOp::Execute => "execute".into(),
         IrOp::SpFetch => "sp@".into(),
+        IrOp::RpFetch => "rp@".into(),
 
         // -- Float stack --
         IrOp::FDup => "fdup".into(),
@@ -342,6 +343,7 @@ mod tests {
             IrOp::Type,
             IrOp::Execute,
             IrOp::SpFetch,
+            IrOp::RpFetch,
             IrOp::FDup,
             IrOp::FDrop,
             IrOp::FSwap,

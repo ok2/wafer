@@ -899,6 +899,15 @@ fn emit_op(f: &mut Function, op: &IrOp, ctx: &mut EmitCtx) {
                 .instruction(&Instruction::I32Store(MEM4));
         }
 
+        IrOp::RpFetch => {
+            // Push the current return-stack pointer onto the data stack.
+            // `$rsp` lives in a global (not cached), so no writeback needed.
+            dsp_dec(f);
+            f.instruction(&Instruction::LocalGet(CACHED_DSP_LOCAL))
+                .instruction(&Instruction::GlobalGet(RSP))
+                .instruction(&Instruction::I32Store(MEM4));
+        }
+
         // -- Compound operations -----------------------------------------------
         IrOp::TwoDup => {
             // ( a b -- a b a b )
@@ -1242,7 +1251,9 @@ fn is_promotable(ops: &[IrOp]) -> bool {
 fn is_promotable_body(ops: &[IrOp]) -> bool {
     for op in ops {
         match op {
-            IrOp::Call(_) | IrOp::TailCall(_) | IrOp::Execute | IrOp::SpFetch => return false,
+            IrOp::Call(_) | IrOp::TailCall(_) | IrOp::Execute | IrOp::SpFetch | IrOp::RpFetch => {
+                return false;
+            }
             IrOp::ToR | IrOp::FromR | IrOp::Exit => return false,
             IrOp::ForthLocalGet(_) | IrOp::ForthLocalSet(_) => return false,
             IrOp::ForthFLocalGet(_) | IrOp::ForthFLocalSet(_) => return false,
@@ -2306,6 +2317,9 @@ fn body_needs_return_stack(ops: &[IrOp]) -> bool {
         match op {
             IrOp::Call(_) | IrOp::TailCall(_) | IrOp::Execute => return true,
             IrOp::ToR | IrOp::FromR => return true,
+            // RP@ observes the return stack, so loop params must be there
+            // (otherwise inlined RDEPTH/.RS would report an empty stack).
+            IrOp::RpFetch => return true,
             // RFetch (I) is handled by loop locals in the fast path — not a problem.
             // LoopJ is also handled by loop locals.
             // Only explicit >R / R> / calls force the slow path.
@@ -2518,7 +2532,7 @@ fn count_forth_f_locals(ops: &[IrOp]) -> u32 {
 /// This is the JIT path: each word gets its own module that imports
 /// shared memory, globals, and function table from the host.
 pub fn compile_word(
-    _name: &str,
+    name: &str,
     body: &[IrOp],
     config: &CodegenConfig,
 ) -> WaferResult<CompiledModule> {
@@ -2684,6 +2698,16 @@ pub fn compile_word(
     let mut code = CodeSection::new();
     code.function(&func);
     module.section(&code);
+
+    // -- Name section: carries the Forth word name into wasmtime trap
+    // backtraces (best-effort symbolication, WS-008).
+    let mut names = wasm_encoder::NameSection::new();
+    names.module(name);
+    let mut fn_names = wasm_encoder::NameMap::new();
+    fn_names.append(0, "emit");
+    fn_names.append(WORD_FUNC, name);
+    names.functions(&fn_names);
+    module.section(&names);
 
     let bytes = module.finish();
 

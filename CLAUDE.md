@@ -79,7 +79,7 @@ Handle in `interpret_token_immediate()` or `compile_token()` as a special case.
 
 ## Testing
 
-- Run `cargo test --workspace` before committing (currently 524 unit + 1 benchmark + 11 compliance + 9 comparison + 5 crypto)
+- Run `cargo test --workspace` before committing (currently 542 unit + 1 benchmark + 11 compliance + 9 comparison + 5 crypto)
 - Forth 2012 compliance: `cargo test -p wafer-core --test compliance`
 - Cross-engine comparison (vs gforth): `cargo test -p wafer-core --test comparison`
 - Performance benchmarks (release mode): `cargo test -p wafer-core --test comparison -- --nocapture --ignored`

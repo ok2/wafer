@@ -251,6 +251,25 @@ pub(crate) const INTERPRETER_TOKENS: &[&str] = &[
     "POSTPONE",
 ];
 
+/// Source loader injected for INCLUDE/INCLUDED: resolved path -> text.
+pub type SourceLoader = Box<dyn Fn(&str) -> anyhow::Result<String> + Send + Sync>;
+
+/// Append names space-separated, wrapped at 78 columns, ending with a
+/// newline (also when the list is empty -- WORDS' historic shape).
+fn push_wrapped(out: &mut String, names: &[&str]) {
+    let mut col = 0usize;
+    for name in names {
+        if col + name.len() + 1 > 78 && col > 0 {
+            out.push('\n');
+            col = 0;
+        }
+        out.push_str(name);
+        out.push(' ');
+        col += name.len() + 1;
+    }
+    out.push('\n');
+}
+
 /// Saved VM state for a MARKER word.
 #[derive(Clone)]
 struct MarkerState {
@@ -303,6 +322,12 @@ pub struct ForthVM<R: Runtime> {
     source_capture_from: Option<usize>,
     last_token_start: usize,
     word_sources: HashMap<WordId, String>,
+    // INCLUDE machinery: injected source loader (CLI: filesystem; web:
+    // virtual or absent) and the stack of files being included --
+    // (resolved path, current 1-based line) -- for cycle/depth checks,
+    // relative-path resolution, and file:line error context.
+    source_loader: Option<SourceLoader>,
+    include_frames: Vec<(String, usize)>,
     // Output buffer
     output: Arc<Mutex<String>>,
     // Next table index (mirrors dictionary.next_fn_index conceptually,
@@ -333,7 +358,8 @@ pub struct ForthVM<R: Runtime> {
     // 5 = WORD, 6 = FIND, 7 = PARSE, 8 = PARSE-NAME, 9 = 2CONSTANT,
     // 10 = 2VARIABLE, 11 = DEFER, 12 = IMMEDIATE, 20 = GET-CURRENT,
     // 21 = SET-CURRENT, 25 = SEARCH-WORDLIST, 33 = DEFINITIONS,
-    // 40 = WORDS, 41 = SEE, 42 = SEE-IR, 43 = HELP
+    // 40 = WORDS, 41 = SEE, 42 = SEE-IR, 43 = HELP, 44 = INCLUDED,
+    // 45 = INCLUDE
     pending_define: Arc<Mutex<Vec<i32>>>,
     /// Pending actions from host functions (COMPILE,, CS-PICK, CS-ROLL, POSTPONE of control words).
     pending_actions: Arc<Mutex<Vec<PendingAction>>>,
@@ -547,6 +573,8 @@ impl<R: Runtime> ForthVM<R> {
             source_capture_from: None,
             last_token_start: 0,
             word_sources: HashMap::new(),
+            source_loader: None,
+            include_frames: Vec::new(),
             output,
             next_table_index: 0,
             host_word_names: HashMap::new(),
@@ -698,14 +726,17 @@ impl<R: Runtime> ForthVM<R> {
     fn describe_uncaught(&mut self, e: anyhow::Error) -> anyhow::Error {
         let code = self.throw_code.lock().unwrap().take();
         let text = self.abort_message.lock().unwrap().take();
-        match (code, text) {
-            (Some(-2), Some(t)) => anyhow::anyhow!("{t}"),
+        let (code, message) = match (code, text) {
+            (Some(-2), Some(t)) => (-2, t),
             (Some(code), _) => match throw_message(code) {
-                Some(m) => anyhow::anyhow!("{m} (throw {code})"),
-                None => anyhow::anyhow!("Catch = {code}"),
+                Some(m) => (code, format!("{m} (throw {code})")),
+                None => (code, format!("Catch = {code}")),
             },
-            (None, _) => e,
-        }
+            (None, _) => return e,
+        };
+        // Typed carrier: display text unchanged, THROW code reachable via
+        // downcast_ref::<WaferError>() for CLI/web consumers.
+        anyhow::Error::new(crate::error::WaferError::UncaughtThrow { code, message })
     }
 
     /// Get and clear the output buffer.
@@ -3002,6 +3033,8 @@ impl<R: Runtime> ForthVM<R> {
         // -- Priority 6: System/compiler --
         self.register_primitive("EXECUTE", false, vec![IrOp::Execute])?;
         self.register_primitive("SP@", false, vec![IrOp::SpFetch])?;
+        self.register_primitive("RP@", false, vec![IrOp::RpFetch])?;
+        // RDEPTH, .RS: defined in boot.fth (use RP@ IR op)
         self.register_immediate_word()?;
         self.register_decimal()?;
         self.register_hex()?;
@@ -4437,13 +4470,7 @@ impl<R: Runtime> ForthVM<R> {
         self.rt.mem_write_i32(crate::memory::SYSVAR_SOURCE_ID, -1);
 
         // Sync input buffer, >IN, and #TIB to WASM (for SOURCE and WORD)
-        {
-            let bytes = self.input_buffer.as_bytes();
-            let len = bytes.len().min(INPUT_BUFFER_SIZE as usize);
-            self.rt.mem_write_slice(INPUT_BUFFER_BASE, &bytes[..len]);
-            self.rt.mem_write_i32(SYSVAR_TO_IN, 0);
-            self.rt.mem_write_i32(SYSVAR_NUM_TIB, len as i32);
-        }
+        self.sync_full_input_to_wasm();
 
         // Interpret with >IN sync (supports >IN manipulation)
         while let Some(token) = self.next_token() {
@@ -4477,17 +4504,118 @@ impl<R: Runtime> ForthVM<R> {
         if capture_open {
             self.source_capture_from = Some(self.input_pos);
         }
-        {
-            let bytes = self.input_buffer.as_bytes();
-            let len = bytes.len().min(INPUT_BUFFER_SIZE as usize);
-            self.rt.mem_write_slice(INPUT_BUFFER_BASE, &bytes[..len]);
-            self.rt.mem_write_i32(SYSVAR_TO_IN, self.input_pos as i32);
-            self.rt.mem_write_i32(SYSVAR_NUM_TIB, len as i32);
-            self.rt
-                .mem_write_i32(crate::memory::SYSVAR_SOURCE_ID, saved_source_id);
-        }
+        self.sync_full_input_to_wasm();
+        self.rt
+            .mem_write_i32(crate::memory::SYSVAR_SOURCE_ID, saved_source_id);
 
         Ok(())
+    }
+
+    /// Write the current input buffer, >IN, and #TIB to WASM memory
+    /// (for SOURCE, WORD, and >IN manipulation from Forth code).
+    fn sync_full_input_to_wasm(&mut self) {
+        let bytes = self.input_buffer.as_bytes();
+        let len = bytes.len().min(INPUT_BUFFER_SIZE as usize);
+        self.rt.mem_write_slice(INPUT_BUFFER_BASE, &bytes[..len]);
+        self.rt.mem_write_i32(SYSVAR_TO_IN, self.input_pos as i32);
+        self.rt.mem_write_i32(SYSVAR_NUM_TIB, len as i32);
+    }
+
+    /// Register the loader that INCLUDE/INCLUDED use to read source files.
+    /// The CLI installs a filesystem reader; the web REPL leaves it unset,
+    /// which makes INCLUDE a defined error.
+    pub fn set_source_loader(&mut self, loader: SourceLoader) {
+        self.source_loader = Some(loader);
+    }
+
+    /// Run a source file through the include machinery (also used by the
+    /// CLI file mode, so `wafer prog.fth` gets `file:line` error context and
+    /// a base directory for nested INCLUDEs).
+    pub fn include(&mut self, path: &str) -> anyhow::Result<()> {
+        self.include_file(path)
+    }
+
+    /// INCLUDED's engine: resolve the path, load, and feed the file
+    /// line-by-line through `evaluate` with the parent input saved around
+    /// it. Compile state and SEE source capture already span `evaluate`
+    /// calls, so multi-line definitions inside files just work.
+    fn include_file(&mut self, path: &str) -> anyhow::Result<()> {
+        const MAX_INCLUDE_DEPTH: usize = 16;
+        // Relative paths resolve against the including file's directory.
+        let resolved = match self.include_frames.last() {
+            Some((parent, _)) if std::path::Path::new(path).is_relative() => {
+                match std::path::Path::new(parent).parent() {
+                    Some(dir) if dir != std::path::Path::new("") => {
+                        dir.join(path).to_string_lossy().into_owned()
+                    }
+                    _ => path.to_string(),
+                }
+            }
+            _ => path.to_string(),
+        };
+        if self.include_frames.iter().any(|(p, _)| *p == resolved) {
+            anyhow::bail!("INCLUDE: cycle: {resolved}");
+        }
+        if self.include_frames.len() >= MAX_INCLUDE_DEPTH {
+            anyhow::bail!("INCLUDE: nesting deeper than {MAX_INCLUDE_DEPTH}");
+        }
+        let Some(loader) = self.source_loader.as_ref() else {
+            anyhow::bail!("INCLUDE: no source loader registered");
+        };
+        let text = loader(&resolved).map_err(|e| anyhow::anyhow!("INCLUDE: {resolved}: {e}"))?;
+
+        // Save the parent input source; SOURCE-ID becomes a synthetic
+        // positive id per nesting level (0 = terminal, -1 = string).
+        let saved_buffer = std::mem::take(&mut self.input_buffer);
+        let saved_pos = self.input_pos;
+        let saved_source_id = self.rt.mem_read_i32(crate::memory::SYSVAR_SOURCE_ID);
+        self.rt.mem_write_i32(
+            crate::memory::SYSVAR_SOURCE_ID,
+            self.include_frames.len() as i32 + 1,
+        );
+        self.include_frames.push((resolved, 0));
+
+        let mut result = Ok(());
+        for (i, line) in text.lines().enumerate() {
+            if let Some(frame) = self.include_frames.last_mut() {
+                frame.1 = i + 1;
+            }
+            if let Err(e) = self.evaluate(line) {
+                let (p, n) = self.include_frames.last().cloned().unwrap_or_default();
+                result = Err(e.context(format!("{p}:{n}")));
+                break;
+            }
+            if self.bye.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+        }
+
+        // Restore the parent input on every path (success, error, BYE).
+        self.include_frames.pop();
+        self.input_buffer = saved_buffer;
+        self.input_pos = saved_pos;
+        // Re-anchor an open definition's capture at the parent resume point.
+        if self.state != 0 && self.source_capture_from.is_some() {
+            self.source_capture_from = Some(self.input_pos);
+        }
+        self.sync_full_input_to_wasm();
+        self.rt
+            .mem_write_i32(crate::memory::SYSVAR_SOURCE_ID, saved_source_id);
+        result
+    }
+
+    /// INCLUDED ( c-addr u -- ) -- include the named source file.
+    fn do_included(&mut self) -> anyhow::Result<()> {
+        let len = self.pop_data_stack()? as u32;
+        let addr = self.pop_data_stack()? as u32;
+        let path = String::from_utf8_lossy(&self.rt.mem_read_slice(addr, len as usize)).to_string();
+        self.include_file(&path)
+    }
+
+    /// INCLUDE <name> -- parsing form of INCLUDED.
+    fn do_include(&mut self) -> anyhow::Result<()> {
+        let path = self.parse_name_arg("INCLUDE")?;
+        self.include_file(&path)
     }
 
     // -----------------------------------------------------------------------
@@ -5460,6 +5588,8 @@ impl<R: Runtime> ForthVM<R> {
                 41 => self.do_see()?,
                 42 => self.do_see_ir()?,
                 43 => self.do_help()?,
+                44 => self.do_included()?,
+                45 => self.do_include()?,
                 _ => {}
             }
         }
@@ -6176,31 +6306,71 @@ impl<R: Runtime> ForthVM<R> {
     /// (case-insensitive). Internal (underscore-prefixed) words are
     /// skipped. Output wraps at 78 columns and ends with a count.
     fn do_words(&mut self) {
-        // In interpret mode an optional token on the same line is a filter.
+        // In interpret mode an optional token on the same line is a filter;
+        // the special filter ALL switches to the grouped full view.
         let filter = if self.state == 0 {
             self.next_token().map(|t| t.to_ascii_uppercase())
         } else {
             None
         };
-        let names = self.dictionary.visible_words(false);
-        let mut out = self.output.lock().unwrap();
-        let mut shown = 0usize;
-        let mut col = 0usize;
-        for name in names.iter().filter(|n| {
-            filter
-                .as_ref()
-                .is_none_or(|f| n.to_ascii_uppercase().contains(f))
-        }) {
-            if col + name.len() + 1 > 78 && col > 0 {
-                out.push('\n');
-                col = 0;
-            }
-            out.push_str(name);
-            out.push(' ');
-            col += name.len() + 1;
-            shown += 1;
+        if filter.as_deref() == Some("ALL") {
+            self.do_words_all();
+            return;
         }
-        out.push_str(&format!("\n{shown} words\n"));
+        let names = self.dictionary.visible_words(false);
+        let shown: Vec<&str> = names
+            .iter()
+            .filter(|n| {
+                filter
+                    .as_ref()
+                    .is_none_or(|f| n.to_ascii_uppercase().contains(f))
+            })
+            .map(String::as_str)
+            .collect();
+        let mut out = self.output.lock().unwrap();
+        push_wrapped(&mut out, &shown);
+        out.push_str(&format!("{} words\n", shown.len()));
+    }
+
+    /// `WORDS ALL` -- grouped full view: one section per wordlist (search
+    /// order first, then any other populated wids), then internal words.
+    fn do_words_all(&mut self) {
+        let entries = self.dictionary.visible_entries();
+        let mut wids: Vec<u32> = self.search_order.lock().unwrap().clone();
+        for (_, wid, _) in &entries {
+            if !wids.contains(wid) {
+                wids.push(*wid);
+            }
+        }
+        let wid_name = |wid: u32| {
+            if wid == 1 {
+                "FORTH".to_string()
+            } else {
+                format!("wid#{wid}")
+            }
+        };
+        let mut out = self.output.lock().unwrap();
+        for wid in wids {
+            let names: Vec<&str> = entries
+                .iter()
+                .filter(|(_, w, internal)| *w == wid && !internal)
+                .map(|(n, _, _)| n.as_str())
+                .collect();
+            if names.is_empty() {
+                continue;
+            }
+            out.push_str(&format!("-- {} ({} words)\n", wid_name(wid), names.len()));
+            push_wrapped(&mut out, &names);
+        }
+        let internals: Vec<&str> = entries
+            .iter()
+            .filter(|(_, _, internal)| *internal)
+            .map(|(n, _, _)| n.as_str())
+            .collect();
+        if !internals.is_empty() {
+            out.push_str(&format!("-- internal ({} words)\n", internals.len()));
+            push_wrapped(&mut out, &internals);
+        }
     }
 
     /// Map function-table index -> word name via a dictionary walk.
@@ -6610,7 +6780,14 @@ impl<R: Runtime> ForthVM<R> {
     /// Each runs Rust-side via `pending_define` so it can parse arguments
     /// with `next_token()` and write to `self.output`.
     fn register_words(&mut self) -> anyhow::Result<()> {
-        for (name, code) in [("WORDS", 40), ("SEE", 41), ("SEE-IR", 42), ("HELP", 43)] {
+        for (name, code) in [
+            ("WORDS", 40),
+            ("SEE", 41),
+            ("SEE-IR", 42),
+            ("HELP", 43),
+            ("INCLUDED", 44),
+            ("INCLUDE", 45),
+        ] {
             let pending = Arc::clone(&self.pending_define);
             let func: HostFn = Box::new(move |_ctx: &mut dyn HostAccess| {
                 pending.lock().unwrap().push(code);
@@ -9345,10 +9522,211 @@ mod tests {
     }
 
     #[test]
+    fn test_words_all_grouped() {
+        let output = eval_output("WORDS ALL");
+        assert!(output.contains("-- FORTH ("), "{output}");
+        assert!(output.contains("-- internal ("), "{output}");
+        // Internals are visible in the ALL view.
+        assert!(output.contains("_STACK_FAULT_"), "{output}");
+    }
+
+    #[test]
+    fn test_words_all_groups_other_wordlists() {
+        let output =
+            eval_output("WORDLIST SET-CURRENT : INSIDE 1 ; FORTH-WORDLIST SET-CURRENT WORDS ALL");
+        assert!(output.contains("-- wid#2 (1 words)"), "{output}");
+        let wid2_section = output.split("-- wid#2").nth(1).unwrap();
+        assert!(
+            wid2_section.lines().nth(1).unwrap().contains("INSIDE"),
+            "{output}"
+        );
+    }
+
+    #[test]
     fn test_words_hides_internal() {
         let output = eval_output("WORDS");
         assert!(!output.contains("_ABORT_Q_"));
         assert!(!output.contains("__CTRL__"));
+    }
+
+    // -- Error reporting (WS-008) --
+
+    #[test]
+    fn test_uncaught_throw_is_typed() {
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        let err = vm.evaluate("-4 THROW").unwrap_err();
+        assert_eq!(err.to_string(), "Stack underflow (throw -4)");
+        match err.downcast_ref::<crate::error::WaferError>() {
+            Some(crate::error::WaferError::UncaughtThrow { code, .. }) => assert_eq!(*code, -4),
+            other => panic!("expected UncaughtThrow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_uncaught_abort_quote_is_typed() {
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        let err = vm.evaluate(": F ABORT\" bad input\" ; -1 F").unwrap_err();
+        assert_eq!(err.to_string(), "bad input");
+        match err.downcast_ref::<crate::error::WaferError>() {
+            Some(crate::error::WaferError::UncaughtThrow { code, .. }) => assert_eq!(*code, -2),
+            other => panic!("expected UncaughtThrow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_trap_names_faulting_word() {
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        // Out-of-bounds fetch traps inside the compiled word; the name
+        // section + backtrace naming must identify CRASHER.
+        vm.evaluate(": CRASHER 999999999 @ ;").unwrap();
+        let err = vm.evaluate("CRASHER").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("CRASHER"), "{msg}");
+        assert!(msg.contains("out of bounds"), "{msg}");
+    }
+
+    // -- INCLUDE / INCLUDED --
+
+    /// VM with a virtual source loader over the given (path, text) pairs.
+    fn vm_with_files(files: &[(&str, &str)]) -> ForthVM<NativeRuntime> {
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        let map: HashMap<String, String> = files
+            .iter()
+            .map(|(p, t)| (p.to_string(), t.to_string()))
+            .collect();
+        vm.set_source_loader(Box::new(move |p| {
+            map.get(p)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("file not found"))
+        }));
+        vm
+    }
+
+    #[test]
+    fn test_include_defines_words_and_resumes_parent_line() {
+        let mut vm = vm_with_files(&[("lib.fth", ": DOUBLE 2 * ;\n: TRIPLE 3 * ;\n")]);
+        // The 5 after INCLUDE proves the parent input buffer resumes.
+        vm.evaluate("INCLUDE lib.fth 5 DOUBLE .").unwrap();
+        assert_eq!(vm.take_output(), "10 ");
+    }
+
+    #[test]
+    fn test_included_string_form() {
+        let mut vm = vm_with_files(&[("lib.fth", ": Q 7 ;")]);
+        vm.evaluate("S\" lib.fth\" INCLUDED Q .").unwrap();
+        assert_eq!(vm.take_output(), "7 ");
+    }
+
+    #[test]
+    fn test_include_multiline_definition_and_see() {
+        let mut vm = vm_with_files(&[("lib.fth", ": TRI\n  DUP DUP ;\n")]);
+        vm.evaluate("INCLUDE lib.fth SEE TRI").unwrap();
+        assert_eq!(vm.take_output(), ": TRI\n  DUP DUP ;\n");
+    }
+
+    #[test]
+    fn test_include_nested_relative_path() {
+        let mut vm = vm_with_files(&[
+            ("dir/a.fth", "INCLUDE b.fth : A B 1 + ;"),
+            ("dir/b.fth", ": B 41 ;"),
+        ]);
+        vm.evaluate("INCLUDE dir/a.fth A .").unwrap();
+        assert_eq!(vm.take_output(), "42 ");
+    }
+
+    #[test]
+    fn test_include_cycle_detected() {
+        let mut vm = vm_with_files(&[("a.fth", "INCLUDE b.fth"), ("b.fth", "INCLUDE a.fth")]);
+        let err = vm.evaluate("INCLUDE a.fth").unwrap_err();
+        assert!(format!("{err:#}").contains("cycle"), "{err:#}");
+    }
+
+    #[test]
+    fn test_include_depth_bounded() {
+        let files: Vec<(String, String)> = (0..20)
+            .map(|i| (format!("f{i}.fth"), format!("INCLUDE f{}.fth", i + 1)))
+            .collect();
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(p, t)| (p.as_str(), t.as_str()))
+            .collect();
+        let mut vm = vm_with_files(&refs);
+        let err = vm.evaluate("INCLUDE f0.fth").unwrap_err();
+        assert!(format!("{err:#}").contains("nesting deeper"), "{err:#}");
+    }
+
+    #[test]
+    fn test_include_missing_file_and_no_loader() {
+        let mut vm = vm_with_files(&[]);
+        let err = vm.evaluate("INCLUDE nosuch.fth").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("INCLUDE: nosuch.fth"),
+            "{err:#}"
+        );
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        let err = vm.evaluate("INCLUDE x.fth").unwrap_err();
+        assert!(err.to_string().contains("no source loader"), "{err}");
+    }
+
+    #[test]
+    fn test_include_error_carries_file_and_line() {
+        let mut vm = vm_with_files(&[("lib.fth", "1 2 +\nNOSUCHWORD\n3 4 +")]);
+        let err = vm.evaluate("INCLUDE lib.fth").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("lib.fth:2"), "{msg}");
+        assert!(msg.contains("NOSUCHWORD"), "{msg}");
+        // Parent VM stays usable, compile state clean.
+        vm.evaluate(": OK 1 ; OK .").unwrap();
+        assert_eq!(vm.take_output(), "1 ");
+    }
+
+    #[test]
+    fn test_include_nested_error_context_chains() {
+        let mut vm = vm_with_files(&[("outer.fth", "INCLUDE inner.fth"), ("inner.fth", "BOOM")]);
+        let err = vm.evaluate("INCLUDE outer.fth").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("outer.fth:1"), "{msg}");
+        assert!(msg.contains("inner.fth:1"), "{msg}");
+    }
+
+    #[test]
+    fn test_include_throw_propagates_vm_usable() {
+        let mut vm = vm_with_files(&[("t.fth", ": BAD -4 THROW ;\nBAD")]);
+        let err = vm.evaluate("INCLUDE t.fth").unwrap_err();
+        assert!(format!("{err:#}").contains("Stack underflow"), "{err:#}");
+        vm.evaluate("6 7 * .").unwrap();
+        assert_eq!(vm.take_output(), "42 ");
+    }
+
+    #[test]
+    fn test_include_remember_reload_loop() {
+        let mut vm = vm_with_files(&[("app.fth", "REMEMBER -WORK\n: APP 1 ;")]);
+        vm.evaluate("INCLUDE app.fth").unwrap();
+        vm.evaluate("-WORK INCLUDE app.fth APP .").unwrap();
+        assert_eq!(vm.take_output(), "1 ");
+        // Only one APP in the dictionary after the reload.
+        let names = vm.word_names();
+        assert_eq!(names.iter().filter(|n| *n == "APP").count(), 1);
+    }
+
+    #[test]
+    fn test_include_bye_stops_file() {
+        let mut vm = vm_with_files(&[("b.fth", "1 .\nBYE\n2 .")]);
+        vm.evaluate("INCLUDE b.fth").unwrap();
+        assert_eq!(vm.take_output(), "1 ");
+        assert!(vm.bye_requested());
+    }
+
+    #[test]
+    fn test_include_source_id_nested_and_restored() {
+        let mut vm = vm_with_files(&[
+            ("a.fth", "SOURCE-ID N1 ! INCLUDE b.fth"),
+            ("b.fth", "SOURCE-ID N2 !"),
+        ]);
+        vm.evaluate("VARIABLE N1 VARIABLE N2").unwrap();
+        vm.evaluate("INCLUDE a.fth N1 @ . N2 @ . SOURCE-ID .")
+            .unwrap();
+        assert_eq!(vm.take_output(), "1 2 0 ");
     }
 
     // -- HELP --
@@ -9649,6 +10027,58 @@ mod tests {
     fn test_f_dot_s() {
         let output = eval_output("1.5E0 2.5E0 F.S");
         assert!(output.starts_with("F:<2> 1.5 2.5"));
+    }
+
+    #[test]
+    fn test_spaces_negative_prints_nothing() {
+        assert_eq!(eval_output("-1 SPACES"), "");
+        // width smaller than the number: no padding at all
+        assert_eq!(eval_output("123 0 .R"), "123");
+    }
+
+    #[test]
+    fn test_rdepth_empty() {
+        assert_eq!(eval_stack("RDEPTH"), vec![0]);
+    }
+
+    #[test]
+    fn test_rdepth_counts_r_items() {
+        assert_eq!(
+            eval_stack(": TRD 10 >R 20 >R RDEPTH 2R> 2DROP ; TRD"),
+            vec![2]
+        );
+    }
+
+    #[test]
+    fn test_dot_rs_empty() {
+        assert_eq!(eval_output(".RS"), "R:<0> ");
+    }
+
+    #[test]
+    fn test_dot_rs_bottom_to_top() {
+        assert_eq!(
+            eval_output(": TRS 10 >R 20 >R .RS 2R> 2DROP ; TRS"),
+            "R:<2> 10 20 "
+        );
+    }
+
+    #[test]
+    fn test_dot_rs_honors_base() {
+        assert_eq!(
+            eval_output("HEX : TRS16 FF >R .RS R> DROP ; TRS16"),
+            "R:<1> FF "
+        );
+    }
+
+    #[test]
+    fn test_rdepth_sees_loop_params() {
+        // Inside DO/LOOP the return stack holds the loop parameters,
+        // so RDEPTH must be > 0 there and 0 again after the loop.
+        // eval_stack returns top-first: [after-loop RDEPTH, inside-loop RDEPTH]
+        let stack = eval_stack(": TRL 0 3 1 DO DROP RDEPTH LOOP RDEPTH ; TRL");
+        assert_eq!(stack.len(), 2);
+        assert!(stack[1] > 0, "inside loop: expected non-empty return stack");
+        assert_eq!(stack[0], 0, "after loop: return stack must be empty");
     }
 
     #[test]

@@ -197,8 +197,8 @@
 \ TYPE ( c-addr u -- )  output u characters
 : TYPE  0 ?DO DUP C@ EMIT 1+ LOOP DROP ;
 
-\ SPACES ( n -- )  output n spaces
-: SPACES  0 ?DO SPACE LOOP ;
+\ SPACES ( n -- )  output n spaces (nothing for n <= 0, per 6.1.2230)
+: SPACES  0 MAX 0 ?DO SPACE LOOP ;
 
 \ Pictured numeric output constants
 \ PICT_BUF_TOP = 0x05C0 = 1472, SYSVAR_HLD = 28
@@ -257,6 +257,21 @@
 
 \ D.R ( d width -- )  print right-justified signed double
 : D.R  >R SWAP OVER DABS <# #S ROT SIGN #> R> OVER - SPACES TYPE ;
+
+\ ---------------------------------------------------------------
+\ Return-stack introspection (debug aids)
+\ ---------------------------------------------------------------
+
+\ RDEPTH ( -- n )  number of cells on the return stack
+\ RETURN_STACK_TOP = 9728 (0x2600). Only >R temps and loop params
+\ live there; return addresses are on the WASM call stack.
+: RDEPTH  9728 RP@ - 2 RSHIFT ;
+
+\ .RS ( -- )  print the return stack bottom-to-top, like .S
+\ Walks with BEGIN/WHILE (not DO) so the walk itself never pushes
+\ onto the return stack it is printing.
+: .RS  ." R:<" RDEPTH 0 .R ." > "
+   9728 BEGIN DUP RP@ > WHILE 4 - DUP @ . REPEAT DROP ;
 
 \ ---------------------------------------------------------------
 \ Phase 6: DEFER support

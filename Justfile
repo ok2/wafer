@@ -47,6 +47,10 @@ bench-opts:
 bench-compare:
     CARGO_PROFILE_RELEASE_STRIP=none cargo test -p wafer-core --release --test comparison -- --nocapture --ignored performance_report
 
+# Cross-engine correctness lanes: program corpus vs gforth + sf64 oracles
+compare-correctness:
+    cargo test -p wafer-core --test comparison -- --nocapture --ignored compare_all_programs
+
 # Check dependency licenses and advisories
 deny:
     cargo deny check
