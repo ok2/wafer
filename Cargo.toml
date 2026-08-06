@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/ok2/wafer"
@@ -51,3 +51,11 @@ insta = "1"
 sha1 = "0.10"
 sha2 = "0.10"
 send_wrapper = "0.6"
+
+# Cargo strips debuginfo from release artifacts by default, and on macOS that
+# also strips the metadata proc-macro dylibs need to be loadable — release
+# builds then fail with "can't find crate" for every proc-macro (rustversion,
+# thiserror_impl, ...). Build scripts and proc-macros gain nothing from
+# stripping, so exempt them; the release binaries stay stripped.
+[profile.release.build-override]
+strip = false
