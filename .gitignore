@@ -3,3 +3,6 @@
 *.swp
 .DS_Store
 *.bk
+
+# Local planning notes — never tracked
+/plans/
