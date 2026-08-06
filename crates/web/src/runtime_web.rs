@@ -38,6 +38,23 @@ impl WebHostAccess {
     }
 }
 
+/// An exception on its way back out of compiled code. Host words rethrow the
+/// Forth message (`Stack underflow`, an `ABORT"` text, a `THROW` description),
+/// so surface exactly that and nothing else — the JS `Error` carries the whole
+/// engine stack in its message, which is noise to a Forth programmer. Anything
+/// without a message is a genuine runtime fault and keeps the call context.
+fn call_error(fn_index: u32, e: &JsValue) -> anyhow::Error {
+    match Reflect::get(e, &"message".into())
+        .ok()
+        .and_then(|m| m.as_string())
+        .and_then(|m| m.lines().next().map(str::trim).map(str::to_string))
+        .filter(|m| !m.is_empty())
+    {
+        Some(msg) => anyhow::anyhow!("{msg}"),
+        None => anyhow::anyhow!("call_func({fn_index}) failed: {e:?}"),
+    }
+}
+
 impl HostAccess for WebHostAccess {
     fn mem_read_i32(&mut self, addr: u32) -> i32 {
         let view = js_sys::Int32Array::new(&self.buffer());
@@ -134,7 +151,7 @@ impl HostAccess for WebHostAccess {
             .dyn_into()
             .map_err(|_| anyhow::anyhow!("table entry {fn_index} is not a function"))?;
         func.call0(&JsValue::NULL)
-            .map_err(|e| anyhow::anyhow!("call_func({fn_index}) failed: {e:?}"))?;
+            .map_err(|e| call_error(fn_index, &e))?;
         Ok(())
     }
 }
@@ -406,7 +423,7 @@ impl Runtime for WebRuntime {
             .dyn_into()
             .map_err(|_| anyhow::anyhow!("table entry {fn_index} is not callable"))?;
         func.call0(&JsValue::NULL)
-            .map_err(|e| anyhow::anyhow!("call_func({fn_index}) failed: {e:?}"))?;
+            .map_err(|e| call_error(fn_index, &e))?;
         Ok(())
     }
 

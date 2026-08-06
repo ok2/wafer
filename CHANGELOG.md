@@ -5,6 +5,22 @@ All notable changes to WAFER are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.4] - 2026-08-06
+
+### Fixed
+
+- **Errors from host words in the browser build read like Forth errors
+  again.** A host word signals failure by throwing across the JS
+  boundary, and the browser runtime reported the exception with its
+  `Debug` form, so an empty-stack `RESIZE` came back as
+  `call_func(134) failed: JsValue(Error: Stack underflow ...)` trailed by
+  an engine stack trace. The thrown message is the Forth message, so it
+  is now surfaced verbatim — `Stack underflow`, exactly what the native
+  CLI prints. Exceptions that carry no message keep the call context,
+  since those are genuine runtime faults rather than Forth throws.
+  `CATCH` was never affected: it reads the throw code from its own
+  channel, not from the message.
+
 ## [0.2.3] - 2026-08-06
 
 ### Fixed
