@@ -5,6 +5,24 @@ All notable changes to WAFER are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.3] - 2026-08-06
+
+### Fixed
+
+- **Release builds of `wafer-web` no longer fail on proc-macro loading.**
+  Cargo strips debuginfo from release artifacts by default, and on macOS
+  that also strips the metadata proc-macro dylibs need to be loadable, so
+  `wasm-pack build --release` died with `can't find crate` for
+  `rustversion`, `thiserror_impl` and every other proc-macro. Build
+  scripts and proc-macros gain nothing from stripping, so
+  `[profile.release.build-override]` now exempts them; release binaries
+  stay stripped. Debug builds were never affected, which is why the test
+  suite stayed green while the browser REPL could not be built for
+  production.
+- `wafer-web` and `wafer-cli` requested `wafer-core` version `0.2.1`
+  while the workspace had moved to `0.2.2`. The caret requirement still
+  resolved, so nothing broke, but the pin is now kept in step.
+
 ## [0.2.2] - 2026-08-06
 
 ### Added
