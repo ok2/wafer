@@ -34,10 +34,10 @@ use crate::optimizer::optimize;
 // Number conversion
 // ---------------------------------------------------------------------------
 
-/// Characters that force double-cell conversion when they appear after the
-/// leftmost digit, following `SwiftForth`'s input number conversion rules.
+/// Characters that force double-cell conversion, following `SwiftForth`'s
+/// input number conversion rules.
 ///
-/// A leading `-` or `+` is a sign rather than punctuation, which keeps `-1`
+/// A leading `-` is the one exception: it binds as a sign, which keeps `-1`
 /// a single-cell number while `1-2` converts as a double.
 const DOUBLE_PUNCTUATION: [u8; 6] = *b",.+-/:";
 
@@ -2779,10 +2779,10 @@ impl<R: Runtime> ForthVM<R> {
     /// Try to convert a token to a number, following `SwiftForth`'s input
     /// number conversion rules.
     ///
-    /// Punctuation (`,` `.` `+` `-` `/` `:`) anywhere after the leftmost digit
-    /// forces double-cell conversion, so `12.34`, `1,234`, `12:30:45` and
-    /// `2026-08-06` all convert as doubles. A leading `-` or `+` is a sign, not
-    /// punctuation, which keeps `-1` single-cell.
+    /// Punctuation (`,` `.` `+` `-` `/` `:`) forces double-cell conversion, so
+    /// `12.34`, `1,234`, `12:30:45` and `2026-08-06` all convert as doubles.
+    /// Only a leading `-` escapes this and binds as a sign, which keeps `-1`
+    /// single-cell; a leading `+` stays punctuation, so `+7` is the double 7.
     ///
     /// `DPL` counts up once per digit from [`DPL_INIT`] and resets to zero at
     /// every punctuation character, so it ends up holding the digit count right
