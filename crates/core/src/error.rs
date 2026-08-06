@@ -61,6 +61,13 @@ pub enum WaferError {
 
     #[error("{0}")]
     Abort(String),
+
+    /// An uncaught Forth THROW as reported to the user. `message` is the
+    /// full display text (standard message or ABORT" payload); `code`
+    /// carries the THROW code for typed consumers (CLI exit paths, web
+    /// REPL styling) via `Error::downcast_ref`.
+    #[error("{message}")]
+    UncaughtThrow { code: i32, message: String },
 }
 
 /// Result type alias for WAFER operations.

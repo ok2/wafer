@@ -137,7 +137,9 @@ fn cmd_build(
 ) -> anyhow::Result<()> {
     let source = std::fs::read_to_string(file)?;
 
-    let mut vm = ForthVM::<NativeRuntime>::new()?;
+    // Exported modules are production artifacts: no stack guards by default
+    let mut vm = ForthVM::<NativeRuntime>::new_with_config(vm_config(false))?;
+    vm.set_source_loader(fs_loader());
     vm.set_recording(true);
     vm.evaluate(&source)?;
 
@@ -260,18 +262,38 @@ fn cmd_run(file: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `WaferConfig` for CLI-created VMs. `WAFER_STACK_GUARDS=0|1` overrides
+/// the per-command default (REPL/file execution on, build off).
+fn vm_config(default_guards: bool) -> wafer_core::config::WaferConfig {
+    let mut cfg = wafer_core::config::WaferConfig::all();
+    cfg.codegen.stack_guards = match std::env::var("WAFER_STACK_GUARDS").ok().as_deref() {
+        Some("0") => false,
+        Some(_) => true,
+        None => default_guards,
+    };
+    cfg
+}
+
+/// Filesystem source loader for INCLUDE/INCLUDED.
+fn fs_loader() -> Box<dyn Fn(&str) -> anyhow::Result<String> + Send + Sync> {
+    Box::new(|path| Ok(std::fs::read_to_string(path)?))
+}
+
 /// `wafer` (REPL) or `wafer program.fth` (evaluate and exit)
 fn cmd_eval_or_repl(file: Option<&str>) -> anyhow::Result<()> {
-    let mut vm = ForthVM::<NativeRuntime>::new()?;
+    let mut vm = ForthVM::<NativeRuntime>::new_with_config(vm_config(true))?;
+    vm.set_source_loader(fs_loader());
 
     match file {
         Some(file) => {
-            let source = std::fs::read_to_string(file)?;
-            vm.evaluate(&source)?;
+            // Through the include machinery: file:line error context and a
+            // base directory for nested INCLUDEs.
+            let result = vm.include(file);
             let output = vm.take_output();
             if !output.is_empty() {
                 print!("{output}");
             }
+            result?;
         }
         None => {
             if !stdin_is_tty() {
@@ -285,66 +307,17 @@ fn cmd_eval_or_repl(file: Option<&str>) -> anyhow::Result<()> {
                             if !output.is_empty() {
                                 print!("{output}");
                             }
+                            if vm.bye_requested() {
+                                break;
+                            }
                         }
                         Err(e) => {
-                            eprintln!("Error: {e}");
+                            eprintln!("Error: {e:#}");
                         }
                     }
                 }
             } else {
-                // Interactive REPL
-                println!(
-                    "WAFER v{} - WebAssembly Forth Engine in Rust",
-                    env!("CARGO_PKG_VERSION")
-                );
-                println!("Type BYE to exit.");
-
-                let mut rl = rustyline::DefaultEditor::new()?;
-                loop {
-                    let prompt = if vm.is_compiling() { "  ] " } else { "> " };
-                    match rl.readline(prompt) {
-                        Ok(line) => {
-                            let trimmed = line.trim();
-                            if trimmed.eq_ignore_ascii_case("BYE") {
-                                break;
-                            }
-                            let _ = rl.add_history_entry(&line);
-                            match vm.evaluate(&line) {
-                                Ok(()) => {
-                                    let output = vm.take_output();
-                                    // PAGE (form feed) clears the terminal
-                                    if output.contains('\x0C') {
-                                        print!("\x1b[2J\x1b[H");
-                                    }
-                                    let output = output.replace('\x0C', "");
-                                    if !vm.is_compiling() {
-                                        // Move cursor back up to end of input line so
-                                        // output appears inline, like traditional Forth:
-                                        //   > 2 2 + . 4  ok
-                                        let col = prompt.len() + line.len() + 1;
-                                        print!("\x1b[A\x1b[{col}G {output} ok");
-                                        println!();
-                                    } else if !output.is_empty() {
-                                        print!("{output}");
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!("Error: {e}");
-                                }
-                            }
-                        }
-                        Err(
-                            rustyline::error::ReadlineError::Interrupted
-                            | rustyline::error::ReadlineError::Eof,
-                        ) => {
-                            break;
-                        }
-                        Err(e) => {
-                            eprintln!("Readline error: {e}");
-                            break;
-                        }
-                    }
-                }
+                run_repl(&mut vm)?;
             }
         }
     }
@@ -356,4 +329,163 @@ fn cmd_eval_or_repl(file: Option<&str>) -> anyhow::Result<()> {
 fn stdin_is_tty() -> bool {
     use std::io::IsTerminal;
     std::io::stdin().is_terminal()
+}
+
+/// Completes the token under the cursor against the live dictionary.
+struct WaferHelper {
+    words: Vec<String>,
+}
+
+impl rustyline::completion::Completer for WaferHelper {
+    type Candidate = String;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &rustyline::Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<String>)> {
+        let start = line[..pos]
+            .rfind(|c: char| c.is_whitespace())
+            .map_or(0, |i| i + 1);
+        let prefix = line[start..pos].to_ascii_uppercase();
+        let mut matches: Vec<String> = self
+            .words
+            .iter()
+            .filter(|w| w.to_ascii_uppercase().starts_with(&prefix))
+            .cloned()
+            .collect();
+        matches.sort();
+        matches.dedup();
+        Ok((start, matches))
+    }
+}
+
+impl rustyline::hint::Hinter for WaferHelper {
+    type Hint = String;
+}
+impl rustyline::highlight::Highlighter for WaferHelper {}
+impl rustyline::validate::Validator for WaferHelper {}
+impl rustyline::Helper for WaferHelper {}
+
+/// History file: `$WAFER_HISTORY`, else `$XDG_STATE_HOME/wafer/history`,
+/// else `~/.local/state/wafer/history`.
+fn history_path() -> Option<std::path::PathBuf> {
+    if let Some(p) = std::env::var_os("WAFER_HISTORY") {
+        return Some(p.into());
+    }
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/state"))
+        })?;
+    Some(base.join("wafer/history"))
+}
+
+/// Interactive REPL: line editing, persistent history with prefix search
+/// on Up/Down, and Tab completion over the live dictionary.
+fn run_repl(vm: &mut ForthVM<NativeRuntime>) -> anyhow::Result<()> {
+    use rustyline::{Cmd, Editor, EventHandler, KeyCode, KeyEvent, Modifiers};
+
+    println!(
+        "WAFER v{} - WebAssembly Forth Engine in Rust",
+        env!("CARGO_PKG_VERSION")
+    );
+    println!("Type BYE to exit.");
+
+    let config = rustyline::Config::builder()
+        .completion_type(rustyline::CompletionType::List)
+        .history_ignore_dups(true)?
+        .build();
+    let mut rl: Editor<WaferHelper, rustyline::history::DefaultHistory> =
+        Editor::with_config(config)?;
+    rl.set_helper(Some(WaferHelper {
+        words: vm.word_names(),
+    }));
+    // Up/Down recall only entries starting with the typed prefix
+    rl.bind_sequence(
+        KeyEvent(KeyCode::Up, Modifiers::NONE),
+        EventHandler::Simple(Cmd::HistorySearchBackward),
+    );
+    rl.bind_sequence(
+        KeyEvent(KeyCode::Down, Modifiers::NONE),
+        EventHandler::Simple(Cmd::HistorySearchForward),
+    );
+
+    let history = history_path();
+    if let Some(path) = &history {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = rl.load_history(path);
+    }
+    let save_history = |rl: &mut Editor<WaferHelper, rustyline::history::DefaultHistory>| {
+        if let Some(path) = &history {
+            let _ = rl.save_history(path);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+    };
+
+    loop {
+        let prompt = if vm.is_compiling() { "  ] " } else { "> " };
+        match rl.readline(prompt) {
+            Ok(line) => {
+                let _ = rl.add_history_entry(&line);
+                match vm.evaluate(&line) {
+                    Ok(()) => {
+                        let output = vm.take_output();
+                        if vm.bye_requested() {
+                            break;
+                        }
+                        // PAGE (form feed) clears the terminal
+                        if output.contains('\x0C') {
+                            print!("\x1b[2J\x1b[H");
+                        }
+                        let output = output.replace('\x0C', "");
+                        if !vm.is_compiling() {
+                            if output.contains('\n') {
+                                // Multi-line output (DUMP, WORDS, ...):
+                                // print as a block, then ok on its own line
+                                print!("{output}");
+                                if !output.ends_with('\n') {
+                                    println!();
+                                }
+                                println!(" ok");
+                            } else {
+                                // Move cursor back up to end of input line so
+                                // output appears inline, like traditional Forth:
+                                //   > 2 2 + . 4  ok
+                                let col = prompt.len() + line.len() + 1;
+                                print!("\x1b[A\x1b[{col}G {output} ok");
+                                println!();
+                            }
+                        } else if !output.is_empty() {
+                            print!("{output}");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Error: {e:#}");
+                    }
+                }
+                // New definitions may have appeared: refresh completion
+                if let Some(h) = rl.helper_mut() {
+                    h.words = vm.word_names();
+                }
+                save_history(&mut rl);
+            }
+            // Ctrl-C abandons the current line, Ctrl-D exits
+            Err(rustyline::error::ReadlineError::Interrupted) => {}
+            Err(rustyline::error::ReadlineError::Eof) => break,
+            Err(e) => {
+                eprintln!("Readline error: {e}");
+                break;
+            }
+        }
+    }
+    save_history(&mut rl);
+    Ok(())
 }

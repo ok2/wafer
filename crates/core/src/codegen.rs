@@ -19,7 +19,10 @@ use wasm_encoder::{
 use crate::dictionary::WordId;
 use crate::error::{WaferError, WaferResult};
 use crate::ir::IrOp;
-use crate::memory::{CELL_SIZE, SYSVAR_LEAVE_FLAG};
+use crate::memory::{
+    CELL_SIZE, DATA_STACK_BASE, DATA_STACK_TOP, FLOAT_STACK_BASE, FLOAT_STACK_TOP,
+    RETURN_STACK_BASE, RETURN_STACK_TOP, SYSVAR_FAULT_CODE, SYSVAR_LEAVE_FLAG,
+};
 
 // ---------------------------------------------------------------------------
 // Import indices (order matters: imports numbered sequentially by kind)
@@ -94,6 +97,9 @@ pub struct CodegenConfig {
     pub table_size: u32,
     /// Enable stack-to-local promotion for straight-line words.
     pub stack_to_local_promotion: bool,
+    /// Table index of the `_STACK_FAULT_` host word; `Some` enables
+    /// stack under/overflow guards in the emitted code.
+    pub stack_guards: Option<u32>,
 }
 
 /// Result of compiling a word to WASM.
@@ -109,16 +115,73 @@ pub struct CompiledModule {
 // Instruction-level helpers (free functions that take &mut Function)
 // ---------------------------------------------------------------------------
 
-/// Decrement the cached `$dsp` local by `CELL_SIZE`.
+// Stack-guard emission. The fault word's table index is stashed in a
+// thread-local by `compile_word` (None = guards off) so the low-level
+// push/pop helpers can stay plain `&mut Function` free functions
+// without threading config through every emitter.
+thread_local! {
+    static GUARD_FAULT: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// With guards on: emit `if <cond> { mem[SYSVAR_FAULT_CODE] = code;
+/// call _STACK_FAULT_ }`. `cond` must leave an i32 boolean on the
+/// operand stack. The fault host word throws, so the `if` never falls
+/// through on the failure path.
+fn emit_guard(f: &mut Function, code: i32, cond: impl FnOnce(&mut Function)) {
+    let Some(fault_idx) = GUARD_FAULT.get() else {
+        return;
+    };
+    cond(f);
+    f.instruction(&Instruction::If(BlockType::Empty))
+        .instruction(&Instruction::I32Const(SYSVAR_FAULT_CODE as i32))
+        .instruction(&Instruction::I32Const(code))
+        .instruction(&Instruction::I32Store(MEM4))
+        .instruction(&Instruction::I32Const(fault_idx as i32))
+        .instruction(&Instruction::CallIndirect {
+            type_index: TYPE_VOID,
+            table_index: TABLE,
+        })
+        .instruction(&Instruction::End);
+}
+
+/// Guard: data stack has at least `n` cells (else throw -4).
+fn guard_dsp_underflow(f: &mut Function, n: u32) {
+    emit_guard(f, -4, |f| {
+        f.instruction(&Instruction::LocalGet(CACHED_DSP_LOCAL))
+            .instruction(&Instruction::I32Const((n * CELL_SIZE) as i32))
+            .instruction(&Instruction::I32Add)
+            .instruction(&Instruction::I32Const(DATA_STACK_TOP as i32))
+            .instruction(&Instruction::I32GtU);
+    });
+}
+
+/// Guard: data stack has room for `n` more cells (else throw -3).
+fn guard_dsp_overflow(f: &mut Function, n: u32) {
+    emit_guard(f, -3, |f| {
+        f.instruction(&Instruction::LocalGet(CACHED_DSP_LOCAL))
+            .instruction(&Instruction::I32Const(
+                (DATA_STACK_BASE + n * CELL_SIZE) as i32,
+            ))
+            .instruction(&Instruction::I32LtU);
+    });
+}
+
+/// Decrement the cached `$dsp` local by `CELL_SIZE` (allocate one cell).
+/// This is the single choke point for data-stack pushes, so the
+/// overflow guard lives here.
 fn dsp_dec(f: &mut Function) {
+    guard_dsp_overflow(f, 1);
     f.instruction(&Instruction::LocalGet(CACHED_DSP_LOCAL))
         .instruction(&Instruction::I32Const(CELL_SIZE as i32))
         .instruction(&Instruction::I32Sub)
         .instruction(&Instruction::LocalSet(CACHED_DSP_LOCAL));
 }
 
-/// Increment the cached `$dsp` local by `CELL_SIZE`.
+/// Increment the cached `$dsp` local by `CELL_SIZE` (free one cell).
+/// Single choke point for data-stack pops (`DROP` never loads the
+/// value, so the underflow guard must sit here, not in `pop`).
 fn dsp_inc(f: &mut Function) {
+    guard_dsp_underflow(f, 1);
     f.instruction(&Instruction::LocalGet(CACHED_DSP_LOCAL))
         .instruction(&Instruction::I32Const(CELL_SIZE as i32))
         .instruction(&Instruction::I32Add)
@@ -160,6 +223,7 @@ fn pop_to(f: &mut Function, local: u32) {
 
 /// Read the top of the data stack without popping (value on operand stack).
 fn peek(f: &mut Function) {
+    guard_dsp_underflow(f, 1);
     f.instruction(&Instruction::LocalGet(CACHED_DSP_LOCAL))
         .instruction(&Instruction::I32Load(MEM4));
 }
@@ -182,6 +246,13 @@ fn dsp_reload(f: &mut Function) {
 
 /// Push a value from the WASM operand stack onto the return stack via `tmp`.
 fn rpush_via_local(f: &mut Function, tmp: u32) {
+    emit_guard(f, -5, |f| {
+        f.instruction(&Instruction::GlobalGet(RSP))
+            .instruction(&Instruction::I32Const(
+                (RETURN_STACK_BASE + CELL_SIZE) as i32,
+            ))
+            .instruction(&Instruction::I32LtU);
+    });
     f.instruction(&Instruction::LocalSet(tmp));
     // rsp -= CELL_SIZE
     f.instruction(&Instruction::GlobalGet(RSP))
@@ -194,8 +265,18 @@ fn rpush_via_local(f: &mut Function, tmp: u32) {
         .instruction(&Instruction::I32Store(MEM4));
 }
 
+/// Guard: return stack is non-empty (else throw -6).
+fn guard_rsp_underflow(f: &mut Function) {
+    emit_guard(f, -6, |f| {
+        f.instruction(&Instruction::GlobalGet(RSP))
+            .instruction(&Instruction::I32Const(RETURN_STACK_TOP as i32))
+            .instruction(&Instruction::I32GeU);
+    });
+}
+
 /// Pop the return stack onto the WASM operand stack.
 fn rpop(f: &mut Function) {
+    guard_rsp_underflow(f);
     f.instruction(&Instruction::GlobalGet(RSP))
         .instruction(&Instruction::I32Load(MEM4));
     // rsp += CELL_SIZE
@@ -207,6 +288,7 @@ fn rpop(f: &mut Function) {
 
 /// Peek at the top of the return stack (no pop).
 fn rpeek(f: &mut Function) {
+    guard_rsp_underflow(f);
     f.instruction(&Instruction::GlobalGet(RSP))
         .instruction(&Instruction::I32Load(MEM4));
 }
@@ -253,7 +335,9 @@ struct EmitCtx {
 }
 
 /// Decrement the FSP global by 8 (allocate space for one f64).
+/// Single choke point for float pushes: overflow guard lives here.
 fn fsp_dec(f: &mut Function) {
+    guard_fsp_overflow(f);
     f.instruction(&Instruction::GlobalGet(FSP))
         .instruction(&Instruction::I32Const(8))
         .instruction(&Instruction::I32Sub)
@@ -261,7 +345,10 @@ fn fsp_dec(f: &mut Function) {
 }
 
 /// Increment the FSP global by 8 (free space for one f64).
+/// Single choke point for float pops (`FDROP` never loads the value):
+/// underflow guard lives here.
 fn fsp_inc(f: &mut Function) {
+    guard_fsp_underflow(f);
     f.instruction(&Instruction::GlobalGet(FSP))
         .instruction(&Instruction::I32Const(8))
         .instruction(&Instruction::I32Add)
@@ -276,6 +363,24 @@ fn fpush_via_local(f: &mut Function, tmp: u32) {
     f.instruction(&Instruction::GlobalGet(FSP))
         .instruction(&Instruction::LocalGet(tmp))
         .instruction(&Instruction::F64Store(MEM8));
+}
+
+/// Guard: float stack has room for one more f64 (else throw -44).
+fn guard_fsp_overflow(f: &mut Function) {
+    emit_guard(f, -44, |f| {
+        f.instruction(&Instruction::GlobalGet(FSP))
+            .instruction(&Instruction::I32Const((FLOAT_STACK_BASE + 8) as i32))
+            .instruction(&Instruction::I32LtU);
+    });
+}
+
+/// Guard: float stack is non-empty (else throw -45).
+fn guard_fsp_underflow(f: &mut Function) {
+    emit_guard(f, -45, |f| {
+        f.instruction(&Instruction::GlobalGet(FSP))
+            .instruction(&Instruction::I32Const(FLOAT_STACK_TOP as i32))
+            .instruction(&Instruction::I32GeU);
+    });
 }
 
 /// Decrement FSP, then store the f64 from local `src` at [FSP].
@@ -295,6 +400,7 @@ fn fpop(f: &mut Function) {
 
 /// Load f64 from [FSP] onto the WASM operand stack without popping.
 fn fpeek(f: &mut Function) {
+    guard_fsp_underflow(f);
     f.instruction(&Instruction::GlobalGet(FSP))
         .instruction(&Instruction::F64Load(MEM8));
 }
@@ -793,9 +899,20 @@ fn emit_op(f: &mut Function, op: &IrOp, ctx: &mut EmitCtx) {
                 .instruction(&Instruction::I32Store(MEM4));
         }
 
+        IrOp::RpFetch => {
+            // Push the current return-stack pointer onto the data stack.
+            // `$rsp` lives in a global (not cached), so no writeback needed.
+            dsp_dec(f);
+            f.instruction(&Instruction::LocalGet(CACHED_DSP_LOCAL))
+                .instruction(&Instruction::GlobalGet(RSP))
+                .instruction(&Instruction::I32Store(MEM4));
+        }
+
         // -- Compound operations -----------------------------------------------
         IrOp::TwoDup => {
             // ( a b -- a b a b )
+            guard_dsp_underflow(f, 2);
+            guard_dsp_overflow(f, 2);
             f.instruction(&Instruction::LocalGet(CACHED_DSP_LOCAL))
                 .instruction(&Instruction::I32Load(MEM4)); // b
             f.instruction(&Instruction::LocalSet(SCRATCH_BASE));
@@ -822,6 +939,7 @@ fn emit_op(f: &mut Function, op: &IrOp, ctx: &mut EmitCtx) {
 
         IrOp::TwoDrop => {
             // ( a b -- )
+            guard_dsp_underflow(f, 2);
             f.instruction(&Instruction::LocalGet(CACHED_DSP_LOCAL))
                 .instruction(&Instruction::I32Const((CELL_SIZE * 2) as i32))
                 .instruction(&Instruction::I32Add)
@@ -1133,7 +1251,9 @@ fn is_promotable(ops: &[IrOp]) -> bool {
 fn is_promotable_body(ops: &[IrOp]) -> bool {
     for op in ops {
         match op {
-            IrOp::Call(_) | IrOp::TailCall(_) | IrOp::Execute | IrOp::SpFetch => return false,
+            IrOp::Call(_) | IrOp::TailCall(_) | IrOp::Execute | IrOp::SpFetch | IrOp::RpFetch => {
+                return false;
+            }
             IrOp::ToR | IrOp::FromR | IrOp::Exit => return false,
             IrOp::ForthLocalGet(_) | IrOp::ForthLocalSet(_) => return false,
             IrOp::ForthFLocalGet(_) | IrOp::ForthFLocalSet(_) => return false,
@@ -1545,6 +1665,11 @@ impl StackSim {
 /// Emit the promoted prologue: load `preload` items from the memory stack
 /// into WASM locals.
 fn emit_promoted_prologue(f: &mut Function, preload: u32, sim: &mut StackSim) {
+    // One entry check covers the whole promoted word: the caller must
+    // have at least `preload` cells on the data stack.
+    if preload > 0 {
+        guard_dsp_underflow(f, preload);
+    }
     // Load items: mem[dsp] = top of stack, mem[dsp+4] = second, etc.
     // We load them top-first, then reverse the sim stack so that
     // sim.stack[0] = deepest loaded, sim.stack[last] = top.
@@ -1575,6 +1700,7 @@ fn emit_promoted_prologue(f: &mut Function, preload: u32, sim: &mut StackSim) {
 fn emit_promoted_epilogue(f: &mut Function, sim: &mut StackSim) {
     let remaining = sim.stack.len() as u32;
     if remaining > 0 {
+        guard_dsp_overflow(f, remaining);
         // Decrement cached DSP for the items we're pushing back
         f.instruction(&Instruction::LocalGet(CACHED_DSP_LOCAL));
         f.instruction(&Instruction::I32Const((remaining * CELL_SIZE) as i32));
@@ -2191,6 +2317,9 @@ fn body_needs_return_stack(ops: &[IrOp]) -> bool {
         match op {
             IrOp::Call(_) | IrOp::TailCall(_) | IrOp::Execute => return true,
             IrOp::ToR | IrOp::FromR => return true,
+            // RP@ observes the return stack, so loop params must be there
+            // (otherwise inlined RDEPTH/.RS would report an empty stack).
+            IrOp::RpFetch => return true,
             // RFetch (I) is handled by loop locals in the fast path — not a problem.
             // LoopJ is also handled by loop locals.
             // Only explicit >R / R> / calls force the slow path.
@@ -2403,10 +2532,13 @@ fn count_forth_f_locals(ops: &[IrOp]) -> u32 {
 /// This is the JIT path: each word gets its own module that imports
 /// shared memory, globals, and function table from the host.
 pub fn compile_word(
-    _name: &str,
+    name: &str,
     body: &[IrOp],
     config: &CodegenConfig,
 ) -> WaferResult<CompiledModule> {
+    // Arm (or disarm) stack-guard emission for this compilation.
+    GUARD_FAULT.set(config.stack_guards);
+
     let mut module = Module::new();
 
     // -- Type section --
@@ -2566,6 +2698,16 @@ pub fn compile_word(
     let mut code = CodeSection::new();
     code.function(&func);
     module.section(&code);
+
+    // -- Name section: carries the Forth word name into wasmtime trap
+    // backtraces (best-effort symbolication, WS-008).
+    let mut names = wasm_encoder::NameSection::new();
+    names.module(name);
+    let mut fn_names = wasm_encoder::NameMap::new();
+    fn_names.append(0, "emit");
+    fn_names.append(WORD_FUNC, name);
+    names.functions(&fn_names);
+    module.section(&names);
 
     let bytes = module.finish();
 
@@ -2871,8 +3013,9 @@ pub fn compile_consolidated_module(
     words: &[(WordId, Vec<IrOp>)],
     local_fn_map: &HashMap<WordId, u32>,
     table_size: u32,
+    stack_guards: Option<u32>,
 ) -> WaferResult<Vec<u8>> {
-    compile_multi_word_module(words, local_fn_map, table_size, None)
+    compile_multi_word_module(words, local_fn_map, table_size, None, stack_guards)
 }
 
 /// Compile an exportable WASM module with embedded memory and metadata.
@@ -2885,8 +3028,9 @@ pub fn compile_exportable_module(
     local_fn_map: &HashMap<WordId, u32>,
     table_size: u32,
     export: &ExportSections<'_>,
+    stack_guards: Option<u32>,
 ) -> WaferResult<Vec<u8>> {
-    compile_multi_word_module(words, local_fn_map, table_size, Some(export))
+    compile_multi_word_module(words, local_fn_map, table_size, Some(export), stack_guards)
 }
 
 /// Internal: build a multi-word WASM module. When `export` is `Some`, adds
@@ -2896,7 +3040,11 @@ fn compile_multi_word_module(
     local_fn_map: &HashMap<WordId, u32>,
     table_size: u32,
     export: Option<&ExportSections<'_>>,
+    stack_guards: Option<u32>,
 ) -> WaferResult<Vec<u8>> {
+    // Arm (or disarm) stack-guard emission for this module.
+    GUARD_FAULT.set(stack_guards);
+
     let has_data = export.is_some_and(|e| !e.memory_snapshot.is_empty());
     let mut module = Module::new();
 
@@ -3125,6 +3273,7 @@ mod tests {
             base_fn_index: 0,
             table_size: 16,
             stack_to_local_promotion: true,
+            stack_guards: None,
         }
     }
 
@@ -3349,6 +3498,7 @@ mod tests {
             base_fn_index: 7,
             table_size: 16,
             stack_to_local_promotion: true,
+            stack_guards: None,
         };
         let m = compile_word("t", &[IrOp::PushI32(1)], &cfg).unwrap();
         assert_eq!(m.fn_index, 7);

@@ -98,8 +98,26 @@ impl HostAccess for CallerHostAccess<'_, '_> {
         let func = *func_ref
             .unwrap_func()
             .ok_or_else(|| anyhow::anyhow!("call_func: null funcref {fn_index}"))?;
-        func.call(&mut *self.caller, &[], &mut [])?;
+        func.call(&mut *self.caller, &[], &mut [])
+            .map_err(name_trap_frame)?;
         Ok(())
+    }
+}
+
+/// Prefix a wasmtime trap error with the innermost named WASM frame.
+/// Compiled words carry their Forth name in the module name section, so a
+/// genuine trap reads "in <WORD>: wasm trap: ...". THROW-driven unwinds
+/// also pass through here, but CATCH and `describe_uncaught` key on the
+/// shared `throw_code` cell, never on the message, so the wrap is inert
+/// for them.
+fn name_trap_frame(e: wasmtime::Error) -> wasmtime::Error {
+    let name = e
+        .downcast_ref::<wasmtime::WasmBacktrace>()
+        .and_then(|bt| bt.frames().iter().find_map(|f| f.func_name()))
+        .map(str::to_string);
+    match name {
+        Some(n) => e.context(format!("in {n}")),
+        None => e,
     }
 }
 
@@ -293,7 +311,8 @@ impl Runtime for NativeRuntime {
         let func = *r
             .unwrap_func()
             .ok_or_else(|| anyhow::anyhow!("word {fn_index} is null funcref"))?;
-        func.call(&mut self.store, &[], &mut [])?;
+        func.call(&mut self.store, &[], &mut [])
+            .map_err(name_trap_frame)?;
         Ok(())
     }
 

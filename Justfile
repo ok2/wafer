@@ -47,6 +47,10 @@ bench-opts:
 bench-compare:
     CARGO_PROFILE_RELEASE_STRIP=none cargo test -p wafer-core --release --test comparison -- --nocapture --ignored performance_report
 
+# Cross-engine correctness lanes: program corpus vs gforth + sf64 oracles
+compare-correctness:
+    cargo test -p wafer-core --test comparison -- --nocapture --ignored compare_all_programs
+
 # Check dependency licenses and advisories
 deny:
     cargo deny check
@@ -61,6 +65,13 @@ ci: fmt clippy deny test
 # Check compilation without running
 check:
     cargo check --workspace
+
+# Install the wafer CLI (release build) and bat syntax highlighting.
+# STRIP=none: Cargo's release default (strip = "debuginfo") emits dylibs that
+# macOS 27's dyld rejects ("mis-aligned LINKEDIT string pool"), so proc macros
+# fail to load during the build itself.
+install: install-syntax
+    CARGO_PROFILE_RELEASE_STRIP=none cargo install --path crates/cli --locked
 
 # Install bat syntax highlighting for WAFER / Forth
 install-syntax:

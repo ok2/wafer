@@ -93,6 +93,8 @@ fn find_sf64() -> Option<&'static str> {
 /// Spawn `binary`, write `input` to its stdin, and collect the output.
 fn run_via_stdin(binary: &str, input: &str) -> Option<std::process::Output> {
     Command::new(binary)
+        // Perf lanes measure unguarded code (only the wafer binary reads this)
+        .env("WAFER_STACK_GUARDS", "0")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -618,6 +620,81 @@ fn compare_all_programs() {
     }
     eprintln!(
         "\nBehavioral comparison: {passed} passed, {skipped} skipped (of {})",
+        progs.len()
+    );
+}
+
+// -----------------------------------------------------------------------
+// Cross-engine behavioral comparison (requires SwiftForth sf64) -- WS-003
+// -----------------------------------------------------------------------
+
+/// Run Forth code through `SwiftForth`. Piped sf64 is quiet (no banner, no
+/// `ok` echo), truncates input lines at ~256 chars, and exits 243 after an
+/// error, so statements are fed one per line with a final `bye`.
+fn run_sf64_code(sf64: &str, code: &str) -> Option<EngineResult> {
+    let mut input = String::new();
+    for line in code.lines() {
+        let t = line.trim();
+        if !t.is_empty() {
+            input.push_str(t);
+            input.push('\n');
+        }
+    }
+    input.push_str("bye\n");
+    let out = run_via_stdin(sf64, &input)?;
+    Some(EngineResult {
+        output: String::from_utf8_lossy(&out.stdout).to_string(),
+        success: out.status.success(),
+    })
+}
+
+/// Correctness lane against `SwiftForth`: the same program corpus as the
+/// gforth comparison, sf64 as the oracle. Skips gracefully when sf64 is
+/// not installed (CI/linux). Programs listed in `SF64_SKIP` use words or
+/// output conventions `SwiftForth` does not share.
+#[test]
+#[ignore = "requires SwiftForth sf64 (run with -- --ignored)"]
+fn compare_all_programs_sf64() {
+    // dot-quote: `."` outside a definition is a no-op in SwiftForth
+    // (compile-only); WAFER supports the interpret-mode extension.
+    const SF64_SKIP: &[&str] = &["dot-quote"];
+    let Some(sf64) = find_sf64() else {
+        eprintln!("SKIP: sf64 not found");
+        return;
+    };
+    let progs = programs();
+    let mut passed = 0;
+    let mut skipped = 0;
+    for prog in &progs {
+        if SF64_SKIP.contains(&prog.name) {
+            skipped += 1;
+            continue;
+        }
+        let wafer = run_wafer(prog.code);
+        assert!(wafer.success, "{}: WAFER execution failed", prog.name);
+        let Some(sf) = run_sf64_code(sf64, prog.code) else {
+            skipped += 1;
+            continue;
+        };
+        if !sf.success {
+            eprintln!("  WARN {}: sf64 execution failed, skipping", prog.name);
+            skipped += 1;
+            continue;
+        }
+        // SwiftForth prints numbers space-prefixed and echoes piped input
+        // lines, so byte-exact comparison is meaningless; compare the
+        // whitespace-token stream (the printed values and strings).
+        let wafer_tokens: Vec<&str> = wafer.output.split_whitespace().collect();
+        let sf_tokens: Vec<&str> = sf.output.split_whitespace().collect();
+        assert_eq!(
+            wafer_tokens, sf_tokens,
+            "{}: output differs\n  WAFER: {:?}\n  sf64:  {:?}",
+            prog.name, wafer.output, sf.output
+        );
+        passed += 1;
+    }
+    eprintln!(
+        "\nsf64 behavioral comparison: {passed} passed, {skipped} skipped (of {})",
         progs.len()
     );
 }

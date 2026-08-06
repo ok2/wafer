@@ -159,6 +159,8 @@ pub enum IrOp {
     Execute,
     /// Push the current data-stack pointer: ( -- addr )
     SpFetch,
+    /// Push the current return-stack pointer: ( -- addr )
+    RpFetch,
 
     // -- Float stack manipulation --
     /// Float duplicate: ( F: r -- r r )

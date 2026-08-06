@@ -120,8 +120,14 @@ pub fn export_module(
         metadata_json: metadata_json.as_bytes(),
     };
 
-    let wasm_bytes = compile_exportable_module(&words, &local_fn_map, table_size, &export_sections)
-        .map_err(|e| anyhow::anyhow!("export codegen error: {e}"))?;
+    let wasm_bytes = compile_exportable_module(
+        &words,
+        &local_fn_map,
+        table_size,
+        &export_sections,
+        vm.stack_guard_param(),
+    )
+    .map_err(|e| anyhow::anyhow!("export codegen error: {e}"))?;
 
     Ok((wasm_bytes, metadata))
 }

@@ -1,8 +1,11 @@
 import init, { WaferRepl } from './pkg/wafer_web.js';
 
 let repl = null;
-const history = [];
-let historyIdx = -1;
+const HISTORY_KEY = 'wafer-history';
+const HISTORY_MAX = 200;
+const history = JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]');
+let historyIdx = history.length;
+let builtinWords = null;
 
 const WORD_CATEGORIES = {
   'Stack': 'DUP DROP SWAP OVER ROT NIP TUCK 2DUP 2DROP 2SWAP 2OVER PICK ROLL DEPTH .S'.split(' '),
@@ -39,10 +42,12 @@ function updateStack() {
   if (!repl) return;
   try {
     const stack = repl.data_stack();
+    const base = repl.base();
+    const suffix = base !== 10 ? `  [base ${base}]` : '';
     if (stack.length === 0) {
-      stackBar.textContent = 'Stack: (empty)';
+      stackBar.textContent = `Stack: (empty)${suffix}`;
     } else {
-      stackBar.textContent = `Stack <${stack.length}> ${stack.join(' ')}`;
+      stackBar.textContent = `Stack <${stack.length}> ${stack.join(' ')}${suffix}`;
     }
   } catch {
     stackBar.textContent = 'Stack: (error)';
@@ -50,19 +55,25 @@ function updateStack() {
 }
 
 function updateUserWords() {
-  const cat = document.getElementById('cat-user');
-  if (!cat) return;
-  // We'll track user words by checking what the REPL evaluates
-  // For now, just show the category
+  const list = document.getElementById('user-word-list');
+  if (!list || !repl || !builtinWords) return;
+  list.innerHTML = '';
+  for (const w of repl.words()) {
+    if (!builtinWords.has(w)) list.appendChild(wordChip(w));
+  }
 }
 
-function evaluate(line) {
+function evaluate(line, record = true) {
   if (!repl) return;
   const trimmed = line.trim();
   if (!trimmed) return;
 
-  // Add to history
-  history.push(trimmed);
+  // Add to history (user-typed lines only; skip consecutive duplicates)
+  if (record && history[history.length - 1] !== trimmed) {
+    history.push(trimmed);
+    if (history.length > HISTORY_MAX) history.splice(0, history.length - HISTORY_MAX);
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(history));
+  }
   historyIdx = history.length;
 
   try {
@@ -83,6 +94,7 @@ function evaluate(line) {
 
   updatePrompt();
   updateStack();
+  updateUserWords();
 }
 
 // Input handling
@@ -116,6 +128,18 @@ document.getElementById('btn-toggle-words').addEventListener('click', () => {
   document.getElementById('word-panel').classList.toggle('collapsed');
 });
 
+function wordChip(w) {
+  const chip = document.createElement('span');
+  chip.className = 'word-chip';
+  chip.textContent = w;
+  chip.title = w;
+  chip.addEventListener('click', () => {
+    input.value += (input.value.length > 0 ? ' ' : '') + w;
+    input.focus();
+  });
+  return chip;
+}
+
 function buildWordPanel() {
   const container = document.getElementById('word-categories');
   container.innerHTML = '';
@@ -129,15 +153,7 @@ function buildWordPanel() {
     const list = document.createElement('div');
     list.className = 'word-list';
     for (const w of words) {
-      const chip = document.createElement('span');
-      chip.className = 'word-chip';
-      chip.textContent = w;
-      chip.title = w;
-      chip.addEventListener('click', () => {
-        input.value += (input.value.length > 0 ? ' ' : '') + w;
-        input.focus();
-      });
-      list.appendChild(chip);
+      list.appendChild(wordChip(w));
     }
     cat.appendChild(list);
     container.appendChild(cat);
@@ -179,7 +195,7 @@ document.getElementById('btn-run-init').addEventListener('click', () => {
   if (code.trim()) {
     // Run each line separately
     for (const line of code.split('\n')) {
-      if (line.trim()) evaluate(line);
+      if (line.trim()) evaluate(line, false);
     }
   }
   localStorage.setItem('wafer-init-code', code);
@@ -214,6 +230,7 @@ document.getElementById('btn-reset').addEventListener('click', () => {
     appendLine('WAFER reset.', 'line-ok');
     updatePrompt();
     updateStack();
+    updateUserWords();
   } catch (e) {
     appendLine(`Reset error: ${e.message}`, 'line-error');
   }
@@ -225,6 +242,8 @@ async function boot() {
   try {
     await init();
     repl = new WaferRepl();
+    // Everything defined at boot is "builtin"; later definitions are user words
+    builtinWords = new Set(repl.words());
     output.innerHTML = '';
     appendLine('WAFER — WebAssembly Forth Engine in Rust', 'line-output');
     appendLine(`Type Forth at the > prompt. Press ? for help.`, 'line-output');
@@ -241,7 +260,7 @@ async function boot() {
     const initCode = document.getElementById('init-code').value;
     if (initCode.trim()) {
       for (const line of initCode.split('\n')) {
-        if (line.trim()) evaluate(line);
+        if (line.trim()) evaluate(line, false);
       }
       localStorage.setItem('wafer-init-code', initCode);
     }
@@ -252,7 +271,7 @@ async function boot() {
         const code = atob(location.hash.slice(1));
         document.getElementById('init-code').value = code;
         for (const line of code.split('\n')) {
-          if (line.trim()) evaluate(line);
+          if (line.trim()) evaluate(line, false);
         }
       } catch { /* ignore bad hash */ }
     }

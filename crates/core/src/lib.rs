@@ -24,6 +24,8 @@ pub mod ir;
 pub mod memory;
 pub mod optimizer;
 pub mod runtime;
+pub mod see;
+pub mod wordhelp;
 
 // Outer interpreter: runtime-agnostic, works with any Runtime impl
 #[allow(trivial_numeric_casts, clippy::unnecessary_cast)]

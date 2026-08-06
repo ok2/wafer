@@ -105,8 +105,13 @@ fn expected_load_failures(path: &str) -> u32 {
     // TRAVERSE-WORDLIST / NAME>COMPILE / NAME>INTERPRET blocks leak as
     // unknown-word errors. Fix the SOURCE/`>IN` interaction with
     // line-mode input and drop this to 0.
+    //
+    // The 38th: line 368 `R> DROP TRUE` runs interpreted (its enclosing
+    // definition aborted on the missing NAME?), and the bare `R>` used
+    // to underflow the return stack silently; stack guards now report
+    // it as "Return stack underflow (throw -6)".
     if path.ends_with("/toolstest.fth") {
-        return 37;
+        return 38;
     }
     0
 }

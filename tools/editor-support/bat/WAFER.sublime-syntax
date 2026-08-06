@@ -33,7 +33,10 @@ contexts:
     - include: compare
     - include: memory
     - include: io
+    - include: pictured
+    - include: string_ops
     - include: float
+    - include: tools
     - include: dictionary
     - include: exception
     - include: parsing
@@ -95,27 +98,31 @@ contexts:
     # Quotations (Core-Ext 6.2.0455): [: ... ;] compiles an anonymous word.
     - match: '(?i)(?:^|(?<=\s))(\[:|;\]){{ident_break}}'
       scope: keyword.other.definition.forth
-    - match: '(?i)(?:^|(?<=\s))(VARIABLE|2VARIABLE|CONSTANT|2CONSTANT|VALUE|CREATE|DEFER|MARKER|BUFFER:|FCONSTANT|FVARIABLE)(\s+)(\S+)?'
+    - match: '(?i)(?:^|(?<=\s))(VARIABLE|2VARIABLE|CONSTANT|2CONSTANT|VALUE|CREATE|DEFER|MARKER|REMEMBER|BUFFER:|FCONSTANT|FVARIABLE)(\s+)(\S+)?'
       captures:
         1: keyword.other.defining.forth
         3: entity.name.constant.forth
-    - match: '(?i)(?:^|(?<=\s))(DOES>|IMMEDIATE|RECURSE|POSTPONE|COMPILE,|LITERAL|2LITERAL|FLITERAL|SLITERAL){{ident_break}}'
+    - match: '(?i)(?:^|(?<=\s))(DOES>|IMMEDIATE|RECURSE|POSTPONE|COMPILE,|LITERAL|2LITERAL|FLITERAL|SLITERAL|DEFER!|DEFER@){{ident_break}}'
       scope: keyword.other.defining.forth
 
   control:
     - match: '(?i)(?:^|(?<=\s))(IF|THEN|ELSE|BEGIN|UNTIL|WHILE|REPEAT|AGAIN|DO|\?DO|LOOP|\+LOOP|LEAVE|UNLOOP|EXIT|CASE|OF|ENDOF|ENDCASE|QUIT){{ident_break}}'
       scope: keyword.control.forth
+    # Conditional compilation (Tools-ext 15.6.2).
+    - match: '(?i)(?:^|(?<=\s))(\[IF\]|\[ELSE\]|\[THEN\]|\[DEFINED\]|\[UNDEFINED\]){{ident_break}}'
+      scope: keyword.control.conditional-compilation.forth
 
   stack_ops:
     - match: '(?i)(?:^|(?<=\s))(DUP|\?DUP|DROP|SWAP|OVER|ROT|-ROT|NIP|TUCK|PICK|ROLL|2DUP|2DROP|2SWAP|2OVER|2ROT|DEPTH|SP@){{ident_break}}'
       scope: support.function.stack.forth
 
   return_stack:
-    - match: '(?i)(?:^|(?<=\s))(>R|R>|R@|2>R|2R>|2R@|N>R|NR>|I|J|CS-PICK|CS-ROLL){{ident_break}}'
+    # RP@ / RDEPTH are WAFER extensions (gforth-style return-stack access).
+    - match: '(?i)(?:^|(?<=\s))(>R|R>|R@|2>R|2R>|2R@|N>R|NR>|I|J|CS-PICK|CS-ROLL|RP@|RDEPTH){{ident_break}}'
       scope: support.function.return-stack.forth
 
   arithmetic:
-    - match: '(?i)(?:^|(?<=\s))(\+|-|\*|/|MOD|/MOD|\*/|\*/MOD|NEGATE|ABS|MIN|MAX|1\+|1-|2\*|2/|M\*|M\+|M\*/|UM\*|UM/MOD|FM/MOD|SM/REM|S>D|D>S){{ident_break}}'
+    - match: '(?i)(?:^|(?<=\s))(\+|-|\*|/|MOD|/MOD|\*/|\*/MOD|NEGATE|ABS|MIN|MAX|1\+|1-|2\*|2/|M\*|M\+|M\*/|UM\*|UM/MOD|FM/MOD|SM/REM|S>D|D>S|D\+|D-|DNEGATE|DABS|DMAX|DMIN|D2\*|D2/){{ident_break}}'
       scope: keyword.operator.arithmetic.forth
 
   logic:
@@ -123,20 +130,35 @@ contexts:
       scope: keyword.operator.logical.forth
 
   compare:
-    - match: '(?i)(?:^|(?<=\s))(=|<>|<|>|<=|>=|U<|U>|0=|0<>|0<|0>){{ident_break}}'
+    - match: '(?i)(?:^|(?<=\s))(=|<>|<|>|<=|>=|U<|U>|0=|0<>|0<|0>|D<|D=|D0<|D0=|DU<|WITHIN){{ident_break}}'
       scope: keyword.operator.comparison.forth
 
   memory:
-    - match: '(?i)(?:^|(?<=\s))(@|!|C@|C!|\+!|2@|2!|ALLOT|HERE|ALIGN|ALIGNED|CELL\+|CELLS|CHAR\+|CHARS|UNUSED|MOVE|CMOVE|CMOVE>|FILL|ERASE|BLANK|ALLOCATE|FREE|RESIZE|PAD){{ident_break}}'
+    - match: '(?i)(?:^|(?<=\s))(@|!|C@|C!|\+!|2@|2!|C,|ALLOT|HERE|ALIGN|ALIGNED|CELL\+|CELLS|CHAR\+|CHARS|UNUSED|MOVE|CMOVE|CMOVE>|FILL|ERASE|BLANK|ALLOCATE|FREE|RESIZE|PAD){{ident_break}}'
       scope: support.function.memory.forth
 
   io:
-    - match: '(?i)(?:^|(?<=\s))(EMIT|CR|SPACE|SPACES|TYPE|\.|U\.|\.R|U\.R|D\.|D\.R|\?|KEY|KEY\?|PAGE|AT-XY|ACCEPT|EXPECT|\.S){{ident_break}}'
+    - match: '(?i)(?:^|(?<=\s))(EMIT|CR|SPACE|SPACES|TYPE|\.|U\.|\.R|U\.R|D\.|D\.R|\?|KEY|KEY\?|PAGE|AT-XY|ACCEPT|EXPECT|\.S|F\.S|\.RS){{ident_break}}'
       scope: support.function.io.forth
 
+  # Pictured numeric output (6.1: <# # #S #> HOLD SIGN; HOLDS is Core-Ext).
+  pictured:
+    - match: '(?i)(?:^|(?<=\s))(<#|#>|#S|#|HOLD|HOLDS|SIGN){{ident_break}}'
+      scope: support.function.pictured.forth
+
+  # String word set (17.6).
+  string_ops:
+    - match: '(?i)(?:^|(?<=\s))(COUNT|COMPARE|-TRAILING|/STRING){{ident_break}}'
+      scope: support.function.string.forth
+
   float:
-    - match: '(?i)(?:^|(?<=\s))(F\+|F-|F\*|F/|FNEGATE|FABS|FMAX|FMIN|FSQRT|FFLOOR|FROUND|FSINCOS|F=|F<|F0=|F0<|F~|FDUP|FDROP|FSWAP|FOVER|FROT|FNIP|FTUCK|FDEPTH|F@|F!|FE\.|FS\.|F\.|F>D|D>F|F>S|S>F|>FLOAT|REPRESENT|PRECISION|SET-PRECISION|FALIGNED|DFALIGNED|SFALIGNED|DF@|DF!|SF@|SF!){{ident_break}}'
+    - match: '(?i)(?:^|(?<=\s))(F\+|F-|F\*\*|F\*|F/|FNEGATE|FABS|FMAX|FMIN|FSQRT|FFLOOR|FROUND|FLOOR|FSINCOS|FSINH|FSIN|FCOSH|FCOS|FTANH|FTAN|FASINH|FASIN|FACOSH|FACOS|FATANH|FATAN2|FATAN|FEXPM1|FEXP|FLNP1|FLN|FLOG|FALOG|F=|F<|F0=|F0<|F~|FDUP|FDROP|FSWAP|FOVER|FROT|FNIP|FTUCK|FDEPTH|F@|F!|FE\.|FS\.|F\.|F>D|D>F|F>S|S>F|>FLOAT|REPRESENT|PRECISION|SET-PRECISION|FALIGN|FALIGNED|DFALIGN|DFALIGNED|SFALIGN|SFALIGNED|FLOAT\+|FLOATS|DFLOAT\+|DFLOATS|SFLOAT\+|SFLOATS|DF@|DF!|SF@|SF!){{ident_break}}'
       scope: support.function.float.forth
+
+  # Interactive/debug tools (Tools word set + WAFER REPL additions).
+  tools:
+    - match: '(?i)(?:^|(?<=\s))(SEE-IR|SEE|DUMP|BYE|HELP){{ident_break}}'
+      scope: support.function.tools.forth
 
   dictionary:
     - match: "(?i)(?:^|(?<=\\s))('|\\[']|,|>BODY|FIND|WORDS|ONLY|ALSO|PREVIOUS|DEFINITIONS|FORTH|GET-ORDER|SET-ORDER|GET-CURRENT|SET-CURRENT|WORDLIST|SEARCH-WORDLIST|FORTH-WORDLIST|ENVIRONMENT\\?|EXECUTE){{ident_break}}"
@@ -147,7 +169,7 @@ contexts:
       scope: keyword.control.exception.forth
 
   parsing:
-    - match: '(?i)(?:^|(?<=\s))(PARSE|PARSE-NAME|WORD|REFILL|EVALUATE|SOURCE|SOURCE-ID|>IN|BASE|STATE|>NUMBER|SEARCH|SUBSTITUTE|UNESCAPE|REPLACES|S){{ident_break}}'
+    - match: '(?i)(?:^|(?<=\s))(PARSE|PARSE-NAME|WORD|REFILL|EVALUATE|INCLUDE|INCLUDED|SOURCE|SOURCE-ID|>IN|BASE|DECIMAL|HEX|STATE|>NUMBER|SEARCH|SUBSTITUTE|UNESCAPE|REPLACES|S){{ident_break}}'
       scope: support.function.parsing.forth
 
   literals:
@@ -185,5 +207,5 @@ contexts:
   wafer_extras:
     # WAFER-specific extensions beyond the Forth 2012 standard.
     # When the language grows new user-facing non-standard words, add them here.
-    - match: '(?i)(?:^|(?<=\s))(CONSOLIDATE|RANDOM|RND-SEED|UTIME|READ-PASSWORD){{ident_break}}'
+    - match: '(?i)(?:^|(?<=\s))(CONSOLIDATE|RANDOM|RND-SEED|UTIME|READ-PASSWORD|EMPTY|GILD){{ident_break}}'
       scope: support.function.wafer-extra.forth
