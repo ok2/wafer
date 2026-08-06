@@ -78,7 +78,7 @@ safety net under every compiled word.
 ### Fixed
 
 - Multi-line command output in the CLI REPL starts on its own line
-  (inline ` ok` echo only for single-line output).
+  (inline `ok` echo only for single-line output).
 - `.S` printed in decimal regardless of `BASE`.
 - A bare interpreted `R>` underflowed silently (exposed by the new stack
   guards; compliance baseline updated).

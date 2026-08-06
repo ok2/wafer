@@ -18,11 +18,11 @@ confidence-threshold = 0.8
 [bans]
 multiple-versions = "deny"
 wildcards = "deny"
-# Transitive duplicates from wasmtime v31 -- will resolve when upgrading
+# Transitive duplicates from wasmtime v47 dependencies
 skip = [
     "getrandom",
+    "syn",
     "hashbrown",
-    "r-efi",
     "thiserror",
     "thiserror-impl",
     "wasm-encoder",
