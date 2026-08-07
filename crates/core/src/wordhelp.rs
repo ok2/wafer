@@ -717,6 +717,11 @@ pub const WORD_DOCS: &[(&str, &str, &str)] = &[
     ),
     ("ABORT", "( i*x -- )", "Empty the stacks and abort."),
     (
+        "QUIT",
+        "( -- ) ( R: i*x -- )",
+        "Empty the return stack, return to the interpreter; data stack kept.",
+    ),
+    (
         "ABORT\"",
         "( flag -- )",
         "If flag is nonzero, abort with a message.",

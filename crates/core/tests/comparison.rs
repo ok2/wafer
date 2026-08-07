@@ -468,6 +468,11 @@ fn programs() -> Vec<Program> {
             expected: "-1 \n-1 \n42 \n-1 \n",
             category: Category::Definitions,
         },
+        // QUIT is deliberately absent from this corpus: what it abandons is
+        // "the input source", and each engine here is fed differently (wafer
+        // line by line, gforth from a file, sf64 from a prompting stdin), so
+        // a comparison would measure the harness. Its semantics are pinned by
+        // the QUIT tests in outer.rs, checked by hand against both engines.
         // -- Strings --
         Program {
             name: "s-quote-type",
