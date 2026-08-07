@@ -180,6 +180,10 @@ enum PendingAction {
     DeclareLocalEnd,
 }
 
+/// Forth 2012 throw code for QUIT (table 9.1). Unlike every other code it is
+/// not an exception: CATCH lets it through and the interpreter reports nothing.
+const QUIT_THROW: i32 = -56;
+
 // Control-flow action codes for PendingAction::CompileControl
 const CTRL_IF: i32 = 1;
 const CTRL_ELSE: i32 = 2;
@@ -758,6 +762,20 @@ impl<R: Runtime> ForthVM<R> {
                     self.compile_frames.clear();
                     self.compiling_source.clear();
                     self.source_capture_from = None;
+                    // QUIT is not an error: the wipe above IS its "enter
+                    // interpretation state", and the standard asks for the
+                    // user input device back and no message at all. The rest
+                    // of this input -- and any EVALUATE / INCLUDE frame it
+                    // unwound through -- is abandoned by returning here.
+                    let mut tc = self.throw_code.lock().unwrap();
+                    if *tc == Some(QUIT_THROW) {
+                        *tc = None;
+                        drop(tc);
+                        self.rt.mem_write_i32(crate::memory::SYSVAR_SOURCE_ID, 0);
+                        self.include_frames.clear();
+                        return Ok(());
+                    }
+                    drop(tc);
                     return Err(self.describe_uncaught(e));
                 }
             }
@@ -4442,6 +4460,20 @@ impl<R: Runtime> ForthVM<R> {
         });
         self.register_host_primitive("_ABORT_Q_", false, func)?;
 
+        // QUIT ( -- ) ( R: i*x -- ) empty the return stack and return to the
+        // interpreter. The data stack is deliberately untouched -- that is the
+        // whole difference to ABORT, which is specified as "empty the data
+        // stack, then QUIT". Unwinding rides the throw plumbing so nested
+        // EVALUATE / INCLUDE frames are abandoned on the way out; the standard
+        // code -56 tells `evaluate` and CATCH what this is.
+        let throw_code = Arc::clone(&self.throw_code);
+        let func: HostFn = Box::new(move |ctx: &mut dyn HostAccess| {
+            ctx.set_rsp((RETURN_STACK_TOP as i32) as u32);
+            *throw_code.lock().unwrap() = Some(QUIT_THROW);
+            Err(anyhow::anyhow!("forth-throw"))
+        });
+        self.register_host_primitive("QUIT", false, func)?;
+
         // BYE ( -- ) request REPL/driver exit.
         let bye = Arc::clone(&self.bye);
         let func: HostFn = Box::new(move |_ctx: &mut dyn HostAccess| {
@@ -4519,9 +4551,16 @@ impl<R: Runtime> ForthVM<R> {
                     ctx.set_dsp((new_sp as i32) as u32);
                     Ok(())
                 }
-                Err(_) => {
+                Err(e) => {
                     // Check if this was a THROW (vs some other trap)
                     let mut tc = throw_code_for_catch.lock().unwrap();
+                    // QUIT is not an exception: it unwinds past CATCH straight
+                    // to the interpreter, leaving both stacks as it found them
+                    // (verified against gforth and SwiftForth).
+                    if *tc == Some(QUIT_THROW) {
+                        drop(tc);
+                        return Err(e);
+                    }
                     let code = tc.take().unwrap_or(-1);
                     drop(tc);
 
@@ -9338,6 +9377,65 @@ mod tests {
         let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
         let result = vm.evaluate(": TEST -1 ABORT\" oops\" 42 . ; TEST");
         assert!(result.is_err());
+    }
+
+    // ===================================================================
+    // QUIT — Forth 2012 6.1.2050. Semantics checked against gforth 0.7.3
+    // and SwiftForth sf64: the data stack survives, nothing is printed,
+    // the rest of the input is abandoned, and CATCH does not see it.
+    // ===================================================================
+
+    #[test]
+    fn test_quit_keeps_data_stack_and_abandons_the_rest() {
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        vm.evaluate("1 2 QUIT 99 .").unwrap(); // not an error, and 99 never runs
+        assert_eq!(vm.take_output(), "");
+        assert_eq!(vm.data_stack(), vec![2, 1]);
+    }
+
+    #[test]
+    fn test_quit_from_inside_a_definition() {
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        vm.evaluate(": T 7 QUIT 8 . ; 5 T 6 .").unwrap();
+        assert_eq!(vm.take_output(), "");
+        assert_eq!(vm.data_stack(), vec![7, 5]);
+    }
+
+    #[test]
+    fn test_quit_empties_the_return_stack() {
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        vm.evaluate(": T 1 >R 2 >R QUIT ; T").unwrap();
+        vm.evaluate("RDEPTH .").unwrap();
+        assert_eq!(vm.take_output(), "0 ");
+    }
+
+    #[test]
+    fn test_quit_is_not_caught_by_catch() {
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        vm.evaluate("1 2 ' QUIT CATCH .").unwrap();
+        assert_eq!(vm.take_output(), "", "CATCH must not report QUIT");
+        assert_eq!(vm.data_stack(), vec![2, 1]);
+    }
+
+    #[test]
+    fn test_quit_leaves_compile_mode_when_it_executes() {
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        vm.evaluate(": BOOM QUIT ; IMMEDIATE").unwrap();
+        vm.evaluate("9 : FOO 1 2 BOOM").unwrap();
+        assert!(!vm.is_compiling(), "QUIT enters interpretation state");
+        assert_eq!(vm.data_stack(), vec![9], "the data stack is left alone");
+        vm.evaluate(": SQ DUP * ; 9 SQ .").unwrap(); // the VM is usable again
+        assert_eq!(vm.take_output(), "81 ");
+    }
+
+    #[test]
+    fn test_quit_inside_evaluate_restores_user_input_source() {
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        vm.evaluate("S\" 5 QUIT 6 .\" EVALUATE 7 .").unwrap();
+        assert_eq!(vm.take_output(), "", "both the string and the line stop");
+        assert_eq!(vm.data_stack(), vec![5]);
+        vm.evaluate("SOURCE-ID .").unwrap();
+        assert_eq!(vm.take_output(), "0 ", "back to the user input device");
     }
 
     // ===================================================================

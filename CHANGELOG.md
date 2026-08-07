@@ -5,6 +5,36 @@ All notable changes to WAFER are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.5] - 2026-08-06
+
+### Added
+
+- **`QUIT`** ( -- ) ( R: i\*x -- ), the CORE word that was missing: empty
+  the return stack, enter interpretation state, hand the input source
+  back to the user input device and return to the interpreter without a
+  message. The data stack is deliberately left alone — that is the whole
+  difference to `ABORT`, which the standard defines as "empty the data
+  stack, then `QUIT`". It unwinds through nested `EVALUATE` and
+  `INCLUDE`, abandoning them, and `SOURCE-ID` is restored to 0.
+
+  `CATCH` does **not** report it: `QUIT` rides throw code -56, which the
+  interpreter treats as a return to the prompt rather than an exception.
+  Both behaviours were checked against gforth 0.7.3 and SwiftForth
+  `sf64`, which agree — `1 2 ' QUIT CATCH .` prints nothing and leaves
+  `1 2` on the stack in all three engines.
+
+  The gap had gone unnoticed because the Forth 2012 test suite skips it
+  by its own admission ("I HAVEN'T FIGURED OUT HOW TO TEST KEY, QUIT,
+  ABORT, OR ABORT\""), and because `HELP`'s coverage lint compares the
+  dictionary against the docs — a word absent from both looks complete.
+  `docs/wafer-anki.txt` had been documenting `QUIT` as if it existed.
+
+  Note that `ABORT` was already correct: executing it while a definition
+  is open does clear both stacks and return to interpretation state.
+  Typing `ABORT` (or `QUIT`) into an unfinished definition compiles it
+  rather than running it, exactly as in every other Forth; `[` is the
+  word that gets you out.
+
 ## [0.2.4] - 2026-08-06
 
 ### Fixed
