@@ -184,6 +184,11 @@ enum PendingAction {
 /// not an exception: CATCH lets it through and the interpreter reports nothing.
 const QUIT_THROW: i32 = -56;
 
+/// Forth 2012 throw code for ABORT. CATCH sees it like any other exception,
+/// but an uncaught one prints nothing: ABORT is specified as "empty the data
+/// stack and perform the function of QUIT", and QUIT displays no message.
+const ABORT_THROW: i32 = -1;
+
 // Control-flow action codes for PendingAction::CompileControl
 const CTRL_IF: i32 = 1;
 const CTRL_ELSE: i32 = 2;
@@ -762,13 +767,15 @@ impl<R: Runtime> ForthVM<R> {
                     self.compile_frames.clear();
                     self.compiling_source.clear();
                     self.source_capture_from = None;
-                    // QUIT is not an error: the wipe above IS its "enter
-                    // interpretation state", and the standard asks for the
-                    // user input device back and no message at all. The rest
+                    // QUIT and ABORT are not errors: the wipe above IS their
+                    // "enter interpretation state", and the standard asks for
+                    // the user input device back and no message at all (ABORT
+                    // is defined as emptying the data stack and then doing
+                    // QUIT; only ABORT" prints, and that is code -2). The rest
                     // of this input -- and any EVALUATE / INCLUDE frame it
                     // unwound through -- is abandoned by returning here.
                     let mut tc = self.throw_code.lock().unwrap();
-                    if *tc == Some(QUIT_THROW) {
+                    if matches!(*tc, Some(QUIT_THROW | ABORT_THROW)) {
                         *tc = None;
                         drop(tc);
                         self.rt.mem_write_i32(crate::memory::SYSVAR_SOURCE_ID, 0);
@@ -1287,6 +1294,14 @@ impl<R: Runtime> ForthVM<R> {
                 self.toplevel_ir.push(IrOp::PushF64(f));
             }
             return Ok(());
+        }
+
+        // Constructs the outer interpreter only knows how to compile. Forth
+        // 2012 leaves their interpretation semantics undefined and both gforth
+        // and SwiftForth name the standard condition, so say what is wrong
+        // instead of claiming the word does not exist.
+        if INTERPRETER_TOKENS.contains(&token.to_uppercase().as_str()) {
+            anyhow::bail!("interpreting a compile-only word: {token} (throw -14)");
         }
 
         anyhow::bail!("unknown word: {token}");
@@ -9436,6 +9451,55 @@ mod tests {
         assert_eq!(vm.data_stack(), vec![5]);
         vm.evaluate("SOURCE-ID .").unwrap();
         assert_eq!(vm.take_output(), "0 ", "back to the user input device");
+    }
+
+    // ===================================================================
+    // ABORT reporting — gforth and sf64 both print nothing for an uncaught
+    // ABORT: it is specified as "empty the data stack and perform the
+    // function of QUIT", and QUIT displays no message. Only ABORT" prints.
+    // ===================================================================
+
+    #[test]
+    fn test_abort_is_silent_and_abandons_the_rest() {
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        vm.evaluate("1 2 ABORT 99 .").unwrap();
+        assert_eq!(vm.take_output(), "");
+        assert!(vm.data_stack().is_empty(), "ABORT empties the data stack");
+    }
+
+    #[test]
+    fn test_abort_is_still_catchable() {
+        // Unlike QUIT: CATCH reports -1 and restores the stack depth.
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        vm.evaluate("1 2 ' ABORT CATCH .").unwrap();
+        assert_eq!(vm.take_output(), "-1 ");
+        assert_eq!(vm.data_stack(), vec![2, 1]);
+    }
+
+    #[test]
+    fn test_abort_quote_still_reports_its_text() {
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        let err = vm.evaluate(": T -1 ABORT\" oops\" ; T").unwrap_err();
+        assert_eq!(err.to_string(), "oops");
+    }
+
+    #[test]
+    fn test_compile_only_words_say_so_in_interpret_mode() {
+        for word in ["ABORT\"", "IF", "THEN", "LOOP", "LITERAL", "RECURSE"] {
+            let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+            let err = vm.evaluate(word).unwrap_err().to_string();
+            assert!(
+                err.contains("compile-only word"),
+                "{word}: expected the standard condition, got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_compile_only_check_does_not_swallow_typos() {
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        let err = vm.evaluate("NOSUCHWORD").unwrap_err().to_string();
+        assert!(err.contains("unknown word"), "{err}");
     }
 
     // ===================================================================
