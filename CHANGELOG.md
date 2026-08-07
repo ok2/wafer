@@ -5,6 +5,24 @@ All notable changes to WAFER are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.6] - 2026-08-07
+
+### Fixed
+
+- **An uncaught `ABORT` no longer prints anything.** It used to report
+  `ABORT (throw -1)`, but the standard defines `ABORT` as "empty the data
+  stack and perform the function of `QUIT`", and `QUIT` displays no
+  message. gforth and SwiftForth are both silent here. `CATCH` still
+  reports -1 as before, and `ABORT"` still prints its text — that is a
+  different word with a different code (-2).
+- **Compile-only words used in interpretation state name the condition.**
+  `ABORT"`, `IF`, `THEN`, `LOOP`, `LITERAL`, `RECURSE` and the rest of
+  the compile-time constructs claimed to be an `unknown word`, which is
+  actively misleading for a word the system obviously knows. They now
+  report `interpreting a compile-only word: <name> (throw -14)`, the
+  standard condition both reference engines give. A genuine typo still
+  reports `unknown word`.
+
 ## [0.2.5] - 2026-08-06
 
 ### Added
