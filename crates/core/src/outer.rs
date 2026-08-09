@@ -8255,6 +8255,88 @@ mod tests {
         assert_eq!(stack, vec![1, 0]);
     }
 
+    // -- Region promotion (a hot loop inside an unpromotable word) -----
+
+    #[test]
+    fn test_loop_in_an_unpromotable_word_still_computes() {
+        // `.` keeps MIXED off the register path as a whole, but the loop
+        // inside it is promoted as its own region. Values checked against
+        // gforth 0.7.3.
+        assert_eq!(
+            eval_output(": MIXED 0 1000 0 DO 1+ LOOP . ; MIXED"),
+            "1000 "
+        );
+    }
+
+    #[test]
+    fn test_j_in_a_promoted_region_reads_the_right_loop() {
+        // A region may only use `I` / `J` when the DO loops they name are
+        // inside the region itself -- otherwise the simulator resolves them
+        // against its own empty loop stack. gforth prints 9.
+        assert_eq!(
+            eval_output(": JT 0 3 0 DO 3 0 DO J + LOOP LOOP . ; JT"),
+            "9 "
+        );
+        assert_eq!(eval_output(": IT 0 5 0 DO I + LOOP . ; IT"), "10 ");
+    }
+
+    #[test]
+    fn test_promoted_loop_body_that_permutes_the_stack() {
+        // The values a loop body leaves have to reach the loop-top locals all
+        // at once. Copying them in index order writes the top into the second
+        // slot and then reads that slot back, so both come out equal -- this
+        // printed "4 4" and "3 2 3" before. gforth: "4 3" and "2 1 3".
+        assert_eq!(eval_output(": C 3 4 2 0 DO SWAP LOOP . . ; C"), "4 3 ");
+        assert_eq!(eval_output(": D 1 2 3 2 0 DO ROT LOOP . . . ; D"), "2 1 3 ");
+    }
+
+    #[test]
+    fn test_promoted_begin_loops() {
+        // BEGIN loops promote too, so these run entirely in locals.
+        assert_eq!(
+            eval_output(": GCD BEGIN DUP WHILE TUCK MOD REPEAT DROP . ; 1071 462 GCD"),
+            "21 "
+        );
+        assert_eq!(
+            eval_output(": CD BEGIN 1 - DUP 0= UNTIL DROP 42 . ; 5 CD"),
+            "42 "
+        );
+        // A WHILE test that permutes: the loop is left between test and body,
+        // so that exit needs the loop-top locals straightened out as well.
+        assert_eq!(
+            eval_output(": W BEGIN SWAP DUP WHILE 1 - SWAP REPEAT . . ; 9 3 W"),
+            "0 3 "
+        );
+    }
+
+    #[test]
+    fn test_begin_loop_with_an_unbalanced_body_is_not_promoted() {
+        // `BEGIN DUP 1+ SWAP DUP 5 > UNTIL` leaves one extra cell per pass, so
+        // there is no fixed promoted stack shape. It has to keep working.
+        assert_eq!(
+            eval_output(": U 0 BEGIN 1 + DUP DUP 3 > UNTIL DROP . . . . ; U"),
+            "4 3 2 1 "
+        );
+    }
+
+    #[test]
+    fn test_several_regions_in_one_word() {
+        // Two loops separated by a `.`: each is its own region, and the
+        // stack has to survive the hand-off through memory between them.
+        assert_eq!(
+            eval_output(": M2 0 10 0 DO I + LOOP DUP . 5 0 DO 1+ LOOP . ; M2"),
+            "45 50 "
+        );
+    }
+
+    #[test]
+    fn test_region_hands_results_back_to_the_memory_stack() {
+        // The region computes in locals; what it leaves has to be visible to
+        // the interpreter afterwards.
+        let (stack, _) = eval(": R 7 4 0 DO 1+ LOOP ; 100 R");
+        assert_eq!(stack, vec![11, 100]);
+    }
+
     fn eval(input: &str) -> (Vec<i32>, String) {
         let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
         vm.evaluate(input).unwrap();

@@ -53,7 +53,12 @@ pub fn optimize(
 
     // Phase 2: inline then simplify again
     if config.inline {
-        ir = inline(ir, bodies, 8);
+        // A caller that can never leave the memory data stack would drag an
+        // inlined loop down with it, so leave those callees where they are:
+        // as their own word the loop keeps its registers, and one call is far
+        // cheaper than a loop's worth of memory traffic.
+        let keep_loops_out = !crate::codegen::promotable_modulo_calls(&ir);
+        ir = inline(ir, bodies, 8, keep_loops_out);
     }
     if config.peephole {
         ir = peephole(ir);
@@ -496,7 +501,12 @@ fn dce(ops: Vec<IrOp>) -> Vec<IrOp> {
 
 /// Inline small word bodies: replaces `Call(id)` with the word's IR body
 /// if the body is small enough and not recursive.
-fn inline(ops: Vec<IrOp>, bodies: &HashMap<WordId, Vec<IrOp>>, max_size: usize) -> Vec<IrOp> {
+fn inline(
+    ops: Vec<IrOp>,
+    bodies: &HashMap<WordId, Vec<IrOp>>,
+    max_size: usize,
+    keep_loops_out: bool,
+) -> Vec<IrOp> {
     let mut out = Vec::new();
     for op in ops {
         match &op {
@@ -505,6 +515,7 @@ fn inline(ops: Vec<IrOp>, bodies: &HashMap<WordId, Vec<IrOp>>, max_size: usize) 
                     && body.len() <= max_size
                     && !contains_call_to(body, *id)
                     && !contains_exit(body)
+                    && !(keep_loops_out && crate::codegen::contains_loop(body))
                 {
                     // Inline the body, recursively converting TailCall back to Call
                     // (tail position in the callee is not tail position in the caller).
@@ -517,7 +528,7 @@ fn inline(ops: Vec<IrOp>, bodies: &HashMap<WordId, Vec<IrOp>>, max_size: usize) 
             }
             _ => {
                 out.push(apply_to_bodies(op, &|inner| {
-                    inline(inner, bodies, max_size)
+                    inline(inner, bodies, max_size, keep_loops_out)
                 }));
             }
         }
@@ -1011,5 +1022,55 @@ mod tests {
         };
         let result = optimize(vec![IrOp::Call(WordId(5))], &config, &bodies);
         assert_eq!(result, vec![IrOp::Call(WordId(5))]);
+    }
+
+    #[test]
+    fn keeps_a_loop_out_of_a_caller_stuck_on_the_memory_stack() {
+        // The caller has a `.`, so it can never leave the memory data stack.
+        // Inlining the loop would drag it down too; as its own word the loop
+        // keeps its registers and the caller just pays one call.
+        let mut bodies = HashMap::new();
+        bodies.insert(
+            WordId(5),
+            vec![IrOp::DoLoop {
+                body: vec![IrOp::PushI32(1), IrOp::Add],
+                is_plus_loop: false,
+            }],
+        );
+        let result = opt_with_inline(vec![IrOp::Call(WordId(5)), IrOp::Dot], &bodies);
+        assert!(
+            matches!(result.first(), Some(IrOp::Call(WordId(5)))),
+            "loop should not have been inlined, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn still_inlines_a_loop_into_a_caller_that_can_be_promoted() {
+        let mut bodies = HashMap::new();
+        bodies.insert(
+            WordId(5),
+            vec![IrOp::DoLoop {
+                body: vec![IrOp::PushI32(1), IrOp::Add],
+                is_plus_loop: false,
+            }],
+        );
+        let result = opt_with_inline(vec![IrOp::Call(WordId(5)), IrOp::Dup], &bodies);
+        assert!(
+            !result.iter().any(|op| matches!(op, IrOp::Call(_))),
+            "loop should have been inlined, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn still_inlines_straight_line_words_anywhere() {
+        // Only loops are held back; a small straight-line word is still
+        // better off inlined even into an unpromotable caller.
+        let mut bodies = HashMap::new();
+        bodies.insert(WordId(5), vec![IrOp::Dup, IrOp::Mul]);
+        let result = opt_with_inline(vec![IrOp::Call(WordId(5)), IrOp::Dot], &bodies);
+        assert!(
+            !result.iter().any(|op| matches!(op, IrOp::Call(_))),
+            "straight-line word should still inline, got {result:?}"
+        );
     }
 }

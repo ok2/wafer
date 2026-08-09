@@ -746,37 +746,37 @@ fn perf_benchmarks() -> Vec<PerfBenchmark> {
             verify: "25 FIB",
             expected: 75025,
             samples: 5,
-            max_ratio: 0.65,
+            max_ratio: 0.17,
         },
         PerfBenchmark {
-            name: "Factorial(12)x10K",
+            name: "Factorial(12)x100K",
             define: ": FACT 1 SWAP 1+ 1 ?DO I * LOOP ; \
-                     : FACT-BENCH 10000 0 DO 12 FACT DROP LOOP ;",
+                     : FACT-BENCH 100000 0 DO 12 FACT DROP LOOP ;",
             run_code: "FACT-BENCH",
             verify: "12 FACT",
             expected: 479001600,
             samples: 5,
-            max_ratio: 0.75,
+            max_ratio: 0.12,
         },
         PerfBenchmark {
-            name: "GCD-bench(500)",
+            name: "GCD-bench(20K)",
             define: ": GCD BEGIN DUP WHILE TUCK MOD REPEAT DROP ; \
                      : GCD-BENCH 0 DO 10000 I 1+ GCD DROP LOOP ;",
-            run_code: "500 GCD-BENCH",
+            run_code: "20000 GCD-BENCH",
             verify: "48 36 GCD",
             expected: 12,
             samples: 5,
-            max_ratio: 0.70,
+            max_ratio: 0.45,
         },
         PerfBenchmark {
-            name: "NestedLoops(50)",
+            name: "NestedLoops(50)x1K",
             define: ": NESTED 0 SWAP 0 DO I 0 ?DO I J + DROP LOOP LOOP ; \
-                     : NESTED-BENCH 100 0 DO 50 NESTED DROP LOOP ;",
+                     : NESTED-BENCH 1000 0 DO 50 NESTED DROP LOOP ;",
             run_code: "NESTED-BENCH",
             verify: "5 NESTED",
             expected: 0,
-            samples: 3,
-            max_ratio: 0.20,
+            samples: 5,
+            max_ratio: 0.11,
         },
         PerfBenchmark {
             name: "Collatz(2K)",
@@ -788,7 +788,7 @@ fn perf_benchmarks() -> Vec<PerfBenchmark> {
             verify: "27 COLLATZ",
             expected: 111,
             samples: 3,
-            max_ratio: 0.45,
+            max_ratio: 0.08,
         },
     ]
 }

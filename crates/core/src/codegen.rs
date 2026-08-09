@@ -354,6 +354,9 @@ struct EmitCtx {
     /// Stack of open block labels for flat forward branches (CS-ROLL'd IF/THEN).
     /// Used by `BranchIfFalse` to compute `br_if` depth.
     open_blocks: Vec<u32>,
+    /// First WASM local a promoted region may allocate from. Regions run one
+    /// after another, so they all share this pool.
+    region_local_base: u32,
 }
 
 /// Decrement the FSP global by 8 (allocate space for one f64).
@@ -465,8 +468,148 @@ fn emit_float_cmp(f: &mut Function, ctx: &EmitCtx, wasm_cmp: &Instruction<'_>) {
 
 /// Emit all IR operations in `ops` into the WASM function body `f`.
 fn emit_body(f: &mut Function, ops: &[IrOp], ctx: &mut EmitCtx) {
+    let mut i = 0;
+    while i < ops.len() {
+        let run = promotable_run(&ops[i..]);
+        if run > 0 && region_is_worth_promoting(&ops[i..i + run]) {
+            emit_promoted_region(f, &ops[i..i + run], ctx);
+        } else {
+            let run = run.max(1);
+            for op in &ops[i..i + run] {
+                emit_op(f, op, ctx);
+            }
+        }
+        i += run.max(1);
+    }
+}
+
+/// Run the stack simulator over one stretch of a word that is otherwise on
+/// the memory path: load what the region reads into WASM locals, work there,
+/// write the results back.
+///
+/// This is what keeps a hot loop in registers inside a word that can never be
+/// promoted as a whole -- one `.` or one host call used to put the entire
+/// body, loops included, back on the memory data stack.
+fn emit_promoted_region(f: &mut Function, ops: &[IrOp], ctx: &mut EmitCtx) {
+    let (preload, _) = compute_stack_needs(ops);
+    let mut sim = StackSim::new(ctx.region_local_base).with_move_scratch();
+    emit_promoted_prologue(f, preload, &mut sim);
     for op in ops {
-        emit_op(f, op, ctx);
+        emit_promoted_op(f, op, &mut sim);
+    }
+    emit_promoted_epilogue(f, &mut sim);
+}
+
+/// Length of the longest prefix of `ops` that can run as a promoted region.
+fn promotable_run(ops: &[IrOp]) -> usize {
+    ops.iter()
+        .take_while(|op| {
+            let one = std::slice::from_ref(*op);
+            is_promotable_body(one, PromoteMode::Memory) && region_loop_refs_resolved(one, 0)
+        })
+        .count()
+}
+
+/// Is a region worth the load/store either side of it?
+///
+/// A loop always is -- that is the whole point. Otherwise the prologue and
+/// epilogue have to be amortised over enough operations to beat leaving them
+/// on the memory stack, which costs roughly two or three accesses each.
+fn region_is_worth_promoting(ops: &[IrOp]) -> bool {
+    ops.len() >= MIN_PROMOTED_REGION || ops.iter().any(is_loop_op)
+}
+
+/// Smallest straight-line region worth promoting.
+const MIN_PROMOTED_REGION: usize = 3;
+
+fn is_loop_op(op: &IrOp) -> bool {
+    matches!(
+        op,
+        IrOp::DoLoop { .. }
+            | IrOp::BeginUntil { .. }
+            | IrOp::BeginAgain { .. }
+            | IrOp::BeginWhileRepeat { .. }
+            | IrOp::BeginDoubleWhileRepeat { .. }
+    )
+}
+
+/// Does every `I` / `J` in `ops` refer to a DO loop that is inside `ops`?
+///
+/// The promoted emitter resolves them against its own loop stack, so a region
+/// that borrows the index of a loop emitted around it would read the wrong
+/// local -- or, for `J` below two levels, silently emit nothing.
+fn region_loop_refs_resolved(ops: &[IrOp], depth: u32) -> bool {
+    ops.iter().all(|op| match op {
+        IrOp::RFetch => depth >= 1,
+        IrOp::LoopJ => depth >= 2,
+        IrOp::DoLoop { body, .. } => region_loop_refs_resolved(body, depth + 1),
+        IrOp::If {
+            then_body,
+            else_body,
+        } => {
+            region_loop_refs_resolved(then_body, depth)
+                && else_body
+                    .as_deref()
+                    .is_none_or(|eb| region_loop_refs_resolved(eb, depth))
+        }
+        IrOp::BeginUntil { body } | IrOp::BeginAgain { body } => {
+            region_loop_refs_resolved(body, depth)
+        }
+        IrOp::BeginWhileRepeat { test, body } => {
+            region_loop_refs_resolved(test, depth) && region_loop_refs_resolved(body, depth)
+        }
+        _ => true,
+    })
+}
+
+/// Locals needed by the largest single promoted region in `ops`, walking the
+/// body exactly the way [`emit_body`] partitions it.
+fn region_local_budget(ops: &[IrOp]) -> u32 {
+    let mut max = 0;
+    let mut i = 0;
+    while i < ops.len() {
+        let run = promotable_run(&ops[i..]);
+        if run > 0 && region_is_worth_promoting(&ops[i..i + run]) {
+            let region = &ops[i..i + run];
+            let (preload, _) = compute_stack_needs(region);
+            max = max.max(count_promoted_locals(region, preload));
+        } else {
+            for op in &ops[i..i + run.max(1)] {
+                max = max.max(region_local_budget_of_children(op));
+            }
+        }
+        i += run.max(1);
+    }
+    max
+}
+
+/// Largest region budget among an operation's nested bodies.
+fn region_local_budget_of_children(op: &IrOp) -> u32 {
+    match op {
+        IrOp::If {
+            then_body,
+            else_body,
+        } => {
+            region_local_budget(then_body).max(else_body.as_deref().map_or(0, region_local_budget))
+        }
+        IrOp::DoLoop { body, .. } | IrOp::BeginUntil { body } | IrOp::BeginAgain { body } => {
+            region_local_budget(body)
+        }
+        IrOp::BeginWhileRepeat { test, body } => {
+            region_local_budget(test).max(region_local_budget(body))
+        }
+        IrOp::BeginDoubleWhileRepeat {
+            outer_test,
+            inner_test,
+            body,
+            after_repeat,
+            else_body,
+        } => region_local_budget(outer_test)
+            .max(region_local_budget(inner_test))
+            .max(region_local_budget(body))
+            .max(region_local_budget(after_repeat))
+            .max(else_body.as_deref().map_or(0, region_local_budget)),
+        _ => 0,
     }
 }
 
@@ -1281,6 +1424,30 @@ enum PromoteMode {
     Typed,
 }
 
+/// Can this body be promoted once its calls are accounted for?
+///
+/// True when the only things standing between it and the register path are
+/// calls and `EXIT` -- i.e. the word either gets a typed entry or, failing
+/// that, promotes region by region. False means it is stuck on the memory
+/// data stack whatever happens, which is what the inliner needs to know.
+pub(crate) fn promotable_modulo_calls(ops: &[IrOp]) -> bool {
+    is_promotable_body(ops, PromoteMode::Typed)
+}
+
+/// Does this body contain a loop at any nesting depth?
+pub(crate) fn contains_loop(ops: &[IrOp]) -> bool {
+    ops.iter().any(|op| {
+        is_loop_op(op)
+            || match op {
+                IrOp::If {
+                    then_body,
+                    else_body,
+                } => contains_loop(then_body) || else_body.as_deref().is_some_and(contains_loop),
+                _ => false,
+            }
+    })
+}
+
 /// Recursive check for promotable ops.
 fn is_promotable_body(ops: &[IrOp], mode: PromoteMode) -> bool {
     let typed = mode == PromoteMode::Typed;
@@ -1367,11 +1534,46 @@ fn is_promotable_body(ops: &[IrOp], mode: PromoteMode) -> bool {
                     }
                 }
             }
-            // BEGIN loops, BeginDoubleWhileRepeat, flat forward blocks: not promoted
-            IrOp::BeginUntil { .. }
-            | IrOp::BeginAgain { .. }
-            | IrOp::BeginWhileRepeat { .. }
-            | IrOp::BeginDoubleWhileRepeat { .. }
+            // BEGIN loops: the construct as a whole is stack-neutral, which is
+            // what lets the next iteration reuse the loop-top locals. A body
+            // that is not neutral has no single promoted stack shape, and an
+            // EXIT out of one would have to unwind the join -- the same rule
+            // DO/LOOP already follows.
+            IrOp::BeginUntil { body } | IrOp::BeginAgain { body } => {
+                if !is_promotable_body(body, mode) || body_has_exit(body) {
+                    return false;
+                }
+                if !typed {
+                    // UNTIL consumes a flag the body leaves, AGAIN consumes nothing.
+                    let expected = i32::from(matches!(op, IrOp::BeginUntil { .. }));
+                    let (_, body_net) = compute_stack_needs(body);
+                    if body_net != expected {
+                        return false;
+                    }
+                }
+            }
+            IrOp::BeginWhileRepeat { test, body } => {
+                if !is_promotable_body(test, mode)
+                    || !is_promotable_body(body, mode)
+                    || body_has_exit(test)
+                    || body_has_exit(body)
+                {
+                    return false;
+                }
+                if !typed {
+                    // WHILE leaves the loop between test and body, so the two
+                    // have to be neutral separately: a net that only balances
+                    // over the pair would give the two exits different shapes.
+                    let (_, test_net) = compute_stack_needs(test);
+                    let (_, body_net) = compute_stack_needs(body);
+                    if test_net != 1 || body_net != 0 {
+                        return false;
+                    }
+                }
+            }
+            // BeginDoubleWhileRepeat has a promoted emitter, but one without a
+            // loop fixup and never exercised; flat forward blocks have none.
+            IrOp::BeginDoubleWhileRepeat { .. }
             | IrOp::Block(_)
             | IrOp::BranchIfFalse(_)
             | IrOp::EndBlock(_)
@@ -1759,21 +1961,34 @@ fn compute_stack_needs_rec(ops: &[IrOp], st: &mut Needs<'_>) {
             IrOp::BeginUntil { body } => {
                 let saved = st.depth;
                 compute_stack_needs_rec(body, st);
-                // Body produces flag, consumed by UNTIL: net 0 for the whole construct
+                // Body produces the flag UNTIL consumes: net 0 for the whole
+                // construct, and anything else has no promoted stack shape.
+                if st.depth != saved + 1 {
+                    st.consistent = false;
+                }
                 st.depth = saved;
             }
             IrOp::BeginAgain { body } => {
                 let saved = st.depth;
                 compute_stack_needs_rec(body, st);
+                if st.depth != saved {
+                    st.consistent = false;
+                }
                 st.depth = saved;
             }
             IrOp::BeginWhileRepeat { test, body } => {
                 let saved = st.depth;
                 compute_stack_needs_rec(test, st);
-                // WHILE consumes flag
+                // WHILE consumes the flag, and leaves the loop right here, so
+                // test and body have to balance separately rather than as a pair.
+                if st.depth != saved + 1 {
+                    st.consistent = false;
+                }
                 st.depth -= 1;
                 compute_stack_needs_rec(body, st);
-                // Whole construct is stack-neutral
+                if st.depth != saved {
+                    st.consistent = false;
+                }
                 st.depth = saved;
             }
             IrOp::BeginDoubleWhileRepeat {
@@ -1821,7 +2036,8 @@ fn compute_stack_needs_rec(ops: &[IrOp], st: &mut Needs<'_>) {
 /// DSP and scratch locals). This is an upper bound -- we allocate a fresh
 /// local for each value-producing operation.
 fn count_promoted_locals(ops: &[IrOp], preload: u32) -> u32 {
-    let mut count = preload;
+    // +1 for the simulator's cycle-breaking scratch (`with_move_scratch`).
+    let mut count = preload + 1;
     count_promoted_locals_body(ops, &mut count);
     count
 }
@@ -1913,6 +2129,10 @@ struct StackSim {
     /// True once the code emitted so far cannot fall through (an `EXIT` ran).
     /// The join after an `IF` uses it to take the surviving branch's state.
     diverged: bool,
+    /// Spare local reserved for breaking a cycle in `emit_parallel_move`.
+    /// Reserved before any value local so that the `IF` join, which rewinds
+    /// `next_local` for the else arm, can never hand it out twice.
+    move_scratch: Option<u32>,
 }
 
 /// What the typed emitter needs beyond the simulator itself.
@@ -1932,13 +2152,22 @@ impl StackSim {
             loop_index_stack: Vec::new(),
             typed: None,
             diverged: false,
+            move_scratch: None,
         }
+    }
+
+    /// Reserve the cycle-breaking local. Every simulator that emits promoted
+    /// operations needs this; the typed wrapper, which only shuffles the
+    /// memory stack, does not. `count_promoted_locals` budgets for it.
+    fn with_move_scratch(mut self) -> Self {
+        self.move_scratch = Some(self.alloc());
+        self
     }
 
     /// Simulator for a typed fast entry: params occupy locals `0..params`,
     /// so fresh locals start above them.
     fn new_typed(params: u32, results: u32, callees: &Rc<HashMap<WordId, TypedFn>>) -> Self {
-        let mut sim = Self::new(params);
+        let mut sim = Self::new(params).with_move_scratch();
         sim.stack = (0..params).collect();
         sim.typed = Some(TypedCtx {
             results,
@@ -2313,14 +2542,10 @@ fn emit_promoted_op(f: &mut Function, op: &IrOp, sim: &mut StackSim) {
                 // join state is the else state, already in sim.stack
             } else {
                 if !else_diverged {
-                    let else_stack = &sim.stack;
-                    let min_len = then_stack.len().min(else_stack.len());
-                    for i in 0..min_len {
-                        if then_stack[i] != else_stack[i] {
-                            f.instruction(&Instruction::LocalGet(else_stack[i]));
-                            f.instruction(&Instruction::LocalSet(then_stack[i]));
-                        }
-                    }
+                    let min_len = then_stack.len().min(sim.stack.len());
+                    let dsts = then_stack[..min_len].to_vec();
+                    let srcs = sim.stack[..min_len].to_vec();
+                    emit_parallel_move(f, sim, &dsts, &srcs);
                 }
                 sim.stack = then_stack;
             }
@@ -2438,6 +2663,12 @@ fn emit_promoted_op(f: &mut Function, op: &IrOp, sim: &mut StackSim) {
             let cond = sim.pop();
             f.instruction(&Instruction::LocalGet(cond));
             f.instruction(&Instruction::I32Eqz);
+            // WHILE leaves the loop here, so the loop-top locals have to hold
+            // the right values on the way out too -- a test that permutes
+            // (`BEGIN SWAP DUP WHILE`) would otherwise leave them crossed.
+            // The flag is already on the operand stack, so moving locals
+            // between it and the `br_if` is safe.
+            emit_promoted_loop_fixup(f, sim, &loop_top_stack);
             f.instruction(&Instruction::BrIf(1)); // break to outer block
             emit_promoted_body(f, body, sim);
 
@@ -2623,14 +2854,67 @@ fn emit_promoted_loop_fixup(f: &mut Function, sim: &mut StackSim, loop_top_stack
         sim.stack.len(),
         loop_top_stack.len()
     );
-    for (i, &top_local) in loop_top_stack.iter().enumerate() {
-        if sim.stack[i] != top_local {
-            f.instruction(&Instruction::LocalGet(sim.stack[i]));
-            f.instruction(&Instruction::LocalSet(top_local));
-        }
-    }
+    let srcs = sim.stack.clone();
+    emit_parallel_move(f, sim, loop_top_stack, &srcs);
     // Reset sim to loop-top state
     sim.stack = loop_top_stack.to_vec();
+}
+
+/// Emit `dsts[i] := srcs[i]` for every `i`, all at once.
+///
+/// Copying them in index order is wrong as soon as a destination is also a
+/// later source: `BEGIN ... SWAP ... UNTIL` would write the top into the
+/// second slot and then read that slot back, so both end up holding the same
+/// value. The moves are ordered so that every source is read before it is
+/// overwritten, and a cycle -- which has no such order -- is broken by
+/// stashing one source in `sim.move_scratch`.
+///
+/// One scratch local is enough for any number of cycles: the loop only breaks
+/// a new cycle once nothing else can be emitted, and by then the previous
+/// cycle has drained and released it.
+fn emit_parallel_move(f: &mut Function, sim: &mut StackSim, dsts: &[u32], srcs: &[u32]) {
+    let mut pending: Vec<(u32, u32)> = dsts
+        .iter()
+        .zip(srcs)
+        .filter(|(d, s)| d != s)
+        .map(|(d, s)| (*d, *s))
+        .collect();
+
+    while !pending.is_empty() {
+        let before = pending.len();
+        let mut i = 0;
+        while i < pending.len() {
+            let (dst, src) = pending[i];
+            // Safe to write `dst` now only if nothing still has to read it.
+            if pending
+                .iter()
+                .enumerate()
+                .all(|(j, (_, s))| j == i || *s != dst)
+            {
+                f.instruction(&Instruction::LocalGet(src));
+                f.instruction(&Instruction::LocalSet(dst));
+                pending.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+        if pending.len() == before {
+            // Everything left is a cycle. Lift one source out of it, which
+            // frees its local and turns the cycle into a chain.
+            let (dst, src) = pending.remove(0);
+            let tmp = sim
+                .move_scratch
+                .expect("promoted simulator without a move scratch local");
+            f.instruction(&Instruction::LocalGet(src));
+            f.instruction(&Instruction::LocalSet(tmp));
+            for p in &mut pending {
+                if p.1 == src {
+                    p.1 = tmp;
+                }
+            }
+            pending.push((dst, tmp));
+        }
+    }
 }
 
 /// Emit a promoted binary operation (commutative).
@@ -3114,13 +3398,20 @@ pub fn compile_word(
     let forth_local_count = count_forth_locals(body);
     let loop_depth = count_loop_depth(body);
     let loop_local_count = loop_depth * 2; // 2 locals per nesting level (index, limit)
+    // Words on the memory path still promote what they can, region by
+    // region, so they need a pool of locals for that on top of everything else.
+    let region_locals = if promoted {
+        0
+    } else {
+        region_local_budget(body)
+    };
     let num_locals = if promoted {
         let (preload, _) = compute_stack_needs(body);
         let promoted_count = count_promoted_locals(body, preload);
         // 1 (cached DSP) + promoted locals (scratch locals not needed in promoted path)
         1 + promoted_count + forth_local_count + loop_local_count
     } else {
-        1 + scratch_count + forth_local_count + loop_local_count
+        1 + scratch_count + forth_local_count + loop_local_count + region_locals
     };
     let forth_f_local_count = count_forth_f_locals(body);
     // F: locals need f64 storage, which also implies the f64 scratch pair.
@@ -3143,6 +3434,7 @@ pub fn compile_word(
         1 + scratch_count
     };
     let loop_local_base = forth_local_base + forth_local_count;
+    let region_local_base = loop_local_base + loop_local_count;
     // f64 scratch pair first (indices num_locals, num_locals+1), then F: locals.
     let forth_f_local_base = num_locals + 2;
     let mut ctx = EmitCtx {
@@ -3155,6 +3447,7 @@ pub fn compile_word(
         fast_loop_depth: 0,
         self_word_id: Some(WordId(config.base_fn_index)),
         open_blocks: Vec::new(),
+        region_local_base,
     };
 
     // Prologue: cache $dsp global into local 0
@@ -3164,7 +3457,7 @@ pub fn compile_word(
     if promoted {
         let (preload, _) = compute_stack_needs(body);
         let first_promoted = SCRATCH_BASE; // promoted locals start right after cached_dsp
-        let mut sim = StackSim::new(first_promoted);
+        let mut sim = StackSim::new(first_promoted).with_move_scratch();
         emit_promoted_prologue(&mut func, preload, &mut sim);
         for op in body {
             emit_promoted_op(&mut func, op, &mut sim);
@@ -3715,12 +4008,17 @@ fn compile_multi_word_module(
         let forth_local_count = count_forth_locals(body);
         let loop_depth = count_loop_depth(body);
         let loop_local_count = loop_depth * 2;
+        let region_locals = if promoted {
+            0
+        } else {
+            region_local_budget(body)
+        };
         let num_locals = if promoted {
             let (preload, _) = compute_stack_needs(body);
             let promoted_count = count_promoted_locals(body, preload);
             1 + promoted_count + forth_local_count + loop_local_count
         } else {
-            1 + scratch_count + forth_local_count + loop_local_count
+            1 + scratch_count + forth_local_count + loop_local_count + region_locals
         };
         let forth_f_local_count = count_forth_f_locals(body);
         let has_floats = needs_f64_locals(body) || forth_f_local_count > 0;
@@ -3742,6 +4040,7 @@ fn compile_multi_word_module(
             1 + scratch_count
         };
         let loop_local_base = forth_local_base + forth_local_count;
+        let region_local_base = loop_local_base + loop_local_count;
         let forth_f_local_base = num_locals + 2;
         let mut ctx = EmitCtx {
             f64_local_0: num_locals,
@@ -3753,6 +4052,7 @@ fn compile_multi_word_module(
             fast_loop_depth: 0,
             self_word_id: None, // consolidated module uses direct calls via local_fn_map
             open_blocks: Vec::new(),
+            region_local_base,
         };
 
         // Prologue: cache $dsp global into local 0
@@ -3763,7 +4063,7 @@ fn compile_multi_word_module(
             // Use stack-to-local promotion (same as compile_word path)
             let (preload, _) = compute_stack_needs(body);
             let first_promoted = SCRATCH_BASE;
-            let mut sim = StackSim::new(first_promoted);
+            let mut sim = StackSim::new(first_promoted).with_move_scratch();
             emit_promoted_prologue(&mut func, preload, &mut sim);
             for op in body {
                 emit_promoted_op(&mut func, op, &mut sim);

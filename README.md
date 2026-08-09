@@ -7,7 +7,7 @@ An optimizing Forth 2012 compiler targeting WebAssembly. WAFER JIT-compiles each
 ## Highlights
 
 - **200+ words** across 12 Forth 2012 word sets, all at **100% compliance**
-- **Optimizing compiler** with 6 IR passes + stack-to-local promotion (loops + IF) + consolidation
+- **Optimizing compiler** with 6 IR passes + stack-to-local promotion (per region, so a hot loop keeps its registers even inside a word that does I/O; `DO` and `BEGIN` loops alike) + consolidation
 - **Faster than gforth** on all benchmarks in release mode (2-10x faster)
 - **JIT compilation** — each `:` definition compiles to its own WASM module
 - **Self-recursive direct calls** — RECURSE compiles to native `call` instead of `call_indirect`
@@ -85,14 +85,19 @@ reach of SwiftForth `sf64`, which compiles to native code:
 
 ```
 Benchmark                   WAFER     CONSOL     gforth       sf64    WAFER/gf   WAFER/sf
-Fibonacci(25)                 378        359       3238        296       0.11x      1.21x
-Factorial(12)x10K             335        320        633        183       0.51x      1.75x
-GCD-bench(500)                 14         15         29         31       0.48x      0.45x
-NestedLoops(50)                72         69        698        207       0.10x      0.33x
-Collatz(2K)                   994        997       3940        668       0.25x      1.49x
+Fibonacci(25)                 356        361       3389        287       0.11x      1.24x
+Factorial(12)x100K            479        495       6249       1650       0.08x      0.29x
+GCD-bench(20K)                540        559       1801        801       0.30x      0.67x
+NestedLoops(50)x1K            509        501       7023       1887       0.07x      0.27x
+Collatz(2K)                   185        213       3873        610       0.05x      0.30x
 ```
 
 Times in microseconds. WAFER/gf < 1.0 means WAFER is faster. CONSOL = after `CONSOLIDATE`.
+
+Two caveats on the `sf64` column. The SwiftForth build here is x86-64 running under Rosetta 2
+while WAFER and gforth are native arm64, so it is a native-vs-emulated comparison; and sf64
+uses 64-bit cells to WAFER's 32-bit. WAFER is ahead on the four loop-heavy benchmarks and
+behind on Fibonacci, which is one call per node with no loop to promote.
 
 A word whose stack effect is statically known gets a **typed entry point**: its stack items travel in and out
 as WASM values instead of through the memory data stack, so cranelift keeps them in registers across a call
