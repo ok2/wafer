@@ -109,7 +109,7 @@ Call-heavy code is what this pays for -- Fibonacci went from 4.3x slower than `s
 ## Testing
 
 ```bash
-# All tests (~620 currently passing)
+# All tests (~628 currently passing)
 cargo test --workspace
 
 # Forth 2012 compliance suite
@@ -142,7 +142,7 @@ Forth Source -> Outer Interpreter -> IR -> [Optimize] -> WASM Codegen (wasm-enco
   - `WebRuntime` — browser WebAssembly API via js-sys, for the browser REPL
 - **Subroutine threading** via WASM function tables (`call_indirect` for cross-word, direct `call` for self-recursion)
 - **JIT mode**: each new word compiles to a separate WASM module linked to shared memory/globals/table
-- **IR-based pipeline** with 6 optimization passes (peephole, constant folding, strength reduction, DCE, tail call detection, inlining) plus stack-to-local promotion (with loop and IF/ELSE support), DO/LOOP index locals, and consolidation
+- **IR-based pipeline** with 6 optimization passes (peephole, constant folding, strength reduction, DCE, tail call detection, inlining) plus per-region stack-to-local promotion (DO and BEGIN loops, IF/ELSE), DO/LOOP index locals, typed entry points for words with a known stack effect, and consolidation
 - **Dictionary**: linked-list word headers in simulated linear memory
 
 ## Project Structure

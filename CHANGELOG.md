@@ -5,7 +5,7 @@ All notable changes to WAFER are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.7] - 2026-08-09
 
 ### Added
 
@@ -340,6 +340,7 @@ compliance suite, `CONSOLIDATE` whole-program recompilation, `wafer build`
 AOT export (WASM / native / JS loader), browser REPL, SHA-1/256/512 words,
 and cross-engine benchmark lanes against gforth and SwiftForth.
 
+[0.2.7]: https://github.com/ok2/wafer/compare/v0.2.6...v0.2.7
 [0.2.1]: https://github.com/ok2/wafer/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/ok2/wafer/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/ok2/wafer/releases/tag/v0.1.0

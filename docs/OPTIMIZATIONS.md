@@ -14,7 +14,7 @@ This document describes every optimization that makes sense for WAFER, why it ma
 
 | #  | Optimization               | Level        | Status      | Impact  |
 | -- | -------------------------- | ------------ | ----------- | ------- |
-| 1  | Stack-to-Local Promotion   | Codegen      | Phase 2     | Highest |
+| 1  | Stack-to-Local Promotion   | Codegen      | Phase 4     | Highest |
 | 2  | Peephole Optimization      | IR pass      | Done        | High    |
 | 3  | Constant Folding           | IR pass      | Done        | High    |
 | 4  | Inlining                   | IR pass      | Done        | High    |
@@ -29,12 +29,18 @@ This document describes every optimization that makes sense for WAFER, why it ma
 | 13 | Startup Batching           | Architecture | Done        | Low     |
 | 14 | Self-Recursive Direct Call | Codegen      | Done        | High    |
 | 15 | Float / Double-Cell        | Codegen      | Not started | Future  |
+| 16 | Typed Calling Convention   | Codegen      | Done        | Highest |
 
 ## 1. Stack-to-Local Promotion
 
-**Status: Phase 2 done.** Words with straight-line code, DO/LOOP, and IF/ELSE use WASM locals instead of memory stack. Stack manipulation ops (Swap, Rot, Nip, Tuck, Dup, Drop) emit zero WASM instructions. Loop index/limit kept in WASM locals (zero return stack traffic). Switchable via `WaferConfig::codegen.stack_to_local_promotion`.
+**Status: Phase 4 done.** Straight-line code, DO/LOOP, IF/ELSE and the BEGIN loop family use WASM locals instead of the memory stack, per region rather than per word. Stack manipulation ops (Swap, Rot, Nip, Tuck, Dup, Drop) emit zero WASM instructions. Loop index/limit stay in WASM locals (zero return stack traffic). Switchable via `WaferConfig::codegen.stack_to_local_promotion`.
 
-Phase 1 covered straight-line code only. Phase 2 extends to DO/LOOP (with stack-neutrality check) and IF/ELSE/THEN (with equal-branch-effect check). BEGIN loops and BeginDoubleWhileRepeat are not yet promoted.
+- **Phase 1** — straight-line code.
+- **Phase 2** — DO/LOOP (stack-neutrality check) and IF/ELSE/THEN (equal-branch-effect check).
+- **Phase 3** — _per region instead of per word_. Promotion used to be all-or-nothing: one `.`, `CR`, `>R` or host call anywhere in a definition put the entire body on the memory stack, hot loops included, which costs 2.2 ns per loop-carried add instead of 0.31 — the accumulator round-trips through store-to-load forwarding rather than staying in a register. `emit_body` now partitions a body into maximal promotable stretches and runs the simulator over each, loading what a region reads and writing back what it leaves. A region may only use `I` / `J` when the DO loops naming them are inside it, and a straight-line region needs at least three operations to pay for its prologue and epilogue; a loop always does.
+- **Phase 4** — `BEGIN..UNTIL`, `BEGIN..AGAIN` and `BEGIN..WHILE..REPEAT`, when the construct is provably stack-neutral: UNTIL's body nets +1 (the flag it consumes), AGAIN's nets 0, and for WHILE..REPEAT the test and the body must balance _separately_, because WHILE leaves the loop between them and a net that only added up over the pair would give the two exits different stack shapes. Bodies containing an `EXIT` stay out, the same rule DO/LOOP follows.
+
+Still not promoted: `BeginDoubleWhileRepeat`, `>R`/`R>`, floats, `{: :}` locals, `SP@`/`DEPTH`/`EXECUTE`, and the flat forward-block IR ops.
 
 ### The Problem
 
@@ -452,33 +458,59 @@ Fibonacci(25) with ~243K recursive calls:
 
 The optimization is implemented in `emit_op` for `IrOp::Call`: when `ctx.self_word_id == Some(word_id)`, emit `call WORD_FUNC` (function index 1 in the word's own module). The `self_word_id` is derived from `CodegenConfig::base_fn_index`.
 
+The numbers above are the state before section 16: they measure the call instruction, and what dominated turned out to be the calling _convention_ around it. A self-recursive word that is also typed now calls its own fast entry instead, and Fibonacci(25) is 356 microseconds rather than 1.6 ms.
+
 ## 15. Float and Double-Cell Stack
 
 **Status: Not started.** `PushI64` and `PushF64` exist as IR ops but are stubs in codegen. Float stack operations are currently all host functions.
 
 The float stack lives in its own memory region (0x2540--0x2D40). Float operations will have the same memory-based overhead as integer operations, but worse: `f64` values are 8 bytes, doubling the memory traffic per push/pop. Stack-to-local promotion (section 1) is even more impactful for floats because WASM has native `f64` locals and operand stack support.
 
+## 16. Typed Calling Convention
+
+**Status: Done.** A word whose stack effect is statically known compiles to two entry points: a fast one with signature `(i32 x p) -> (i32 x q)`, carrying its stack items as WASM values, and the usual `( -- )` wrapper that moves those items on and off the memory data stack. The wrapper keeps the function-table slot, so `EXECUTE`, the outer interpreter, host words and `CATCH` see exactly the ABI they saw before; only direct calls inside a module take the fast entry. `WAFER_TYPED_CALLS=0` falls back.
+
+### The Problem
+
+This is what the SwiftForth gap was made of. sf64 keeps TOS in `RBX` and the stack pointer in `RBP`, and both survive a `CALL` untouched, so its `FIB` is 16 instructions and about 7 memory touches per node. WAFER kept the whole stack in linear memory and flushed its cached `$dsp` to an imported global before every call: about 36 touches. Section 1's simulator, which already promoted loop and `IF` bodies into locals, refused any body containing a call or an `EXIT` -- exactly the words where the convention cost the most.
+
+### The Effect Fixpoint
+
+Self-recursion makes the stack-effect equation circular (`d = k + m*d`), so the effect is solved by iterating a guess until it reproduces itself: `FIB` settles on `(1,1)` in two rounds, while `: F 1 RECURSE ;` never settles and stays untyped. `CONSOLIDATE` extends this across words, since it puts them all in one module: the effects are solved from the leaves outward, and 105 of 187 words in a booted dictionary end up typed.
+
+### Impact
+
+Fibonacci(25) went from 1035 to 366 microseconds, 4.3x slower than `sf64` to 1.2x. Stack guards became nearly free as a side effect -- they hang off the memory-stack push/pop choke points, and a typed word barely has any -- so the default guards-on configuration that the REPL and the web build use went from 1631 to 365 microseconds on the same benchmark.
+
+Untyped by design: anything using `SP@`, `DEPTH`, `EXECUTE`, `>R`/`R>`, floats or locals; anything calling a word that is itself untyped, which in the JIT path means every call except `RECURSE`; mutually recursive words; and words whose effect is not static -- branches that disagree on depth, `EXIT` at the wrong depth, a non-neutral loop body, or a recursion that grows the stack per level.
+
 ## Current Performance vs Gforth
 
 All optimizations enabled, release mode, measured with UTIME:
 
 ```
-Benchmark                   WAFER     CONSOL     gforth      WAFER/gf
-Fibonacci(25)                1629       1535       3422        0.45x
-Factorial(12)x10K             340        339        638        0.53x
-GCD-bench(500)                 18         15         30        0.50x
-NestedLoops(50)                84         73        720        0.10x
-Collatz(2K)                  1212       1202       3914        0.31x
+Benchmark                   WAFER     CONSOL     gforth       sf64    WAFER/gf   WAFER/sf
+Fibonacci(25)                 356        361       3389        287       0.11x      1.24x
+Factorial(12)x100K            479        495       6249       1650       0.08x      0.29x
+GCD-bench(20K)                540        559       1801        801       0.30x      0.67x
+NestedLoops(50)x1K            509        501       7023       1887       0.07x      0.27x
+Collatz(2K)                   185        213       3873        610       0.05x      0.30x
 ```
 
-Times in microseconds. WAFER/gf < 1.0 means WAFER is faster.
+Times in microseconds. WAFER/gf < 1.0 means WAFER is faster. `sf64` is SwiftForth,
+which compiles to native code; two caveats on that column. The install here is an
+x86-64 binary under Rosetta 2 while WAFER and gforth are native arm64, so it is a
+native-vs-emulated comparison and a native SwiftForth would be faster than these
+numbers; and sf64 uses 64-bit cells to WAFER's 32-bit. WAFER is ahead on the four
+loop-heavy benchmarks and behind on Fibonacci, which is one call per node with no
+loop to promote.
 
 ## Remaining Opportunities
 
-| Optimization                     | Status              | Potential Impact                                      |
-| -------------------------------- | ------------------- | ----------------------------------------------------- |
-| BEGIN loop promotion             | Not started         | Would speed up GCD-style tight loops further          |
-| BeginDoubleWhileRepeat promotion | Not started         | Rare pattern, low priority                            |
-| LEAVE as IR primitive            | Not started         | Would enable fast-path for loops with LEAVE           |
-| Float stack-to-local             | Not started         | Eliminate float stack memory traffic                  |
-| WASM tail calls proposal         | Waiting on wasmtime | Would eliminate stack growth for tail-recursive words |
+| Optimization                     | Status              | Potential Impact                                                                                                                                                                                                                                                                                            |
+| -------------------------------- | ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Bounded self-inlining            | Not started         | Measured 1.33x on Fibonacci, the last benchmark behind sf64. Blocked on `EXIT`: the inliner refuses any body containing one, and a recursive Forth word is `... IF EXIT THEN ... RECURSE`. Needs either a scoped exit (compile an inlined `EXIT` as a branch to the end of a block) or guard-only expansion |
+| BeginDoubleWhileRepeat promotion | Not started         | Rare pattern, low priority. Its promoted emitter exists but has no loop fixup and is unverified                                                                                                                                                                                                             |
+| LEAVE as IR primitive            | Not started         | Would enable fast-path for loops with LEAVE                                                                                                                                                                                                                                                                 |
+| Float stack-to-local             | Not started         | Eliminate float stack memory traffic                                                                                                                                                                                                                                                                        |
+| WASM tail calls proposal         | Waiting on wasmtime | Would eliminate stack growth for tail-recursive words                                                                                                                                                                                                                                                       |

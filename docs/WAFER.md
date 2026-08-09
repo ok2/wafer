@@ -282,11 +282,13 @@ When the compiler encounters a word reference during compilation, it emits:
 (call_indirect (type $void) (table 0))    ;; indirect call through the table
 ```
 
-**Self-recursive optimization**: When a word calls itself (RECURSE), the codegen detects this and emits a direct `call` instead of `call_indirect`, eliminating the table lookup and signature check (~3x faster for recursive words like Fibonacci).
+**Self-recursive optimization**: When a word calls itself (RECURSE), the codegen detects this and emits a direct `call` instead of `call_indirect`, eliminating the table lookup and signature check (~3x faster for recursive words like Fibonacci). When the word is also typed, that direct call goes to its fast entry -- see below.
 
 **After CONSOLIDATE**: All `call_indirect` between words in the consolidated module are replaced with direct `call` instructions, giving similar benefits for cross-word calls.
 
-At runtime, wasmtime resolves the table entry and calls the target function. Because all functions share the same memory, globals, and table, state passes between words through the data stack in linear memory. There are no function parameters or return values at the WASM level -- everything goes through the stack.
+At runtime, wasmtime resolves the table entry and calls the target function. Because all functions share the same memory, globals, and table, state passes between words through the data stack in linear memory.
+
+**Typed entry points**: that last sentence is the default, not the whole story. A word whose stack effect is statically known also gets a _fast_ entry with signature `(i32 x p) -> (i32 x q)`, which takes its arguments as WASM values and returns its results the same way, so they stay in registers across the call instead of round-tripping through linear memory. The `( -- )` function above is then a wrapper around it, and it is the wrapper that keeps the table slot -- so `EXECUTE`, the outer interpreter, host words and `CATCH` see the memory ABI unchanged. Only a direct call inside the same module takes the fast entry: `RECURSE` in the JIT path, and every resolvable call after `CONSOLIDATE`. See [OPTIMIZATIONS.md](OPTIMIZATIONS.md) section 16.
 
 This is subroutine threading: each word is a subroutine, and calling a word is an indirect function call.
 
