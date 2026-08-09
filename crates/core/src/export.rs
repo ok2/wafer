@@ -126,6 +126,7 @@ pub fn export_module(
         table_size,
         &export_sections,
         vm.stack_guard_param(),
+        vm.typed_calls(),
     )
     .map_err(|e| anyhow::anyhow!("export codegen error: {e}"))?;
 

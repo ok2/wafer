@@ -21,7 +21,7 @@ mod tests {
         // Empty word list should produce nothing (but we guard against this at call site)
         let words = vec![];
         let map = HashMap::new();
-        let result = compile_consolidated_module(&words, &map, 16, None);
+        let result = compile_consolidated_module(&words, &map, 16, None, true);
         // Empty is valid -- should produce a valid module with no functions
         assert!(result.is_ok());
     }
@@ -31,7 +31,7 @@ mod tests {
         let words = vec![(WordId(1), vec![IrOp::PushI32(42)])];
         let mut map = HashMap::new();
         map.insert(WordId(1), 1u32); // function index 1 (after emit import)
-        let result = compile_consolidated_module(&words, &map, 16, None);
+        let result = compile_consolidated_module(&words, &map, 16, None, true);
         assert!(result.is_ok());
     }
 
@@ -49,7 +49,7 @@ mod tests {
         map.insert(WordId(1), 1u32);
         map.insert(WordId(2), 2u32);
         map.insert(WordId(3), 3u32);
-        let result = compile_consolidated_module(&words, &map, 16, None);
+        let result = compile_consolidated_module(&words, &map, 16, None, true);
         assert!(result.is_ok());
     }
 
@@ -59,7 +59,7 @@ mod tests {
         let words = vec![(WordId(3), vec![IrOp::Call(WordId(99))])];
         let mut map = HashMap::new();
         map.insert(WordId(3), 1u32);
-        let result = compile_consolidated_module(&words, &map, 256, None);
+        let result = compile_consolidated_module(&words, &map, 256, None, true);
         assert!(result.is_ok());
     }
 
@@ -72,7 +72,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(WordId(1), 1u32);
         map.insert(WordId(2), 2u32);
-        let result = compile_consolidated_module(&words, &map, 16, None);
+        let result = compile_consolidated_module(&words, &map, 16, None, true);
         assert!(result.is_ok());
     }
 
@@ -95,7 +95,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(WordId(1), 1u32);
         map.insert(WordId(2), 2u32);
-        let result = compile_consolidated_module(&words, &map, 16, None);
+        let result = compile_consolidated_module(&words, &map, 16, None, true);
         assert!(result.is_ok());
     }
 
@@ -120,7 +120,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(WordId(1), 1u32);
         map.insert(WordId(2), 2u32);
-        let result = compile_consolidated_module(&words, &map, 16, None);
+        let result = compile_consolidated_module(&words, &map, 16, None, true);
         assert!(result.is_ok());
     }
 
@@ -141,7 +141,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(WordId(1), 1u32);
         map.insert(WordId(2), 2u32);
-        let result = compile_consolidated_module(&words, &map, 16, None);
+        let result = compile_consolidated_module(&words, &map, 16, None, true);
         assert!(result.is_ok());
     }
 
@@ -163,7 +163,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(WordId(1), 1u32);
         map.insert(WordId(2), 2u32);
-        let result = compile_consolidated_module(&words, &map, 16, None);
+        let result = compile_consolidated_module(&words, &map, 16, None, true);
         assert!(result.is_ok());
     }
 }

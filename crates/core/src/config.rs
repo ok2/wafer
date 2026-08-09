@@ -12,6 +12,11 @@ pub struct CodegenOpts {
     /// corrupting stack pointers. On by default; benchmarks and
     /// exported production modules turn it off.
     pub stack_guards: bool,
+    /// Compile words with a statically known stack effect to a typed entry
+    /// point that carries stack items in WASM values, so a call keeps them
+    /// in registers instead of round-tripping through the memory stack.
+    /// On by default; `WAFER_TYPED_CALLS=0` turns it off.
+    pub typed_calls: bool,
 }
 
 /// Master configuration for all WAFER optimizations.
@@ -38,6 +43,7 @@ impl WaferConfig {
             codegen: CodegenOpts {
                 stack_to_local_promotion: true,
                 stack_guards: true,
+                typed_calls: true,
             },
         }
     }
@@ -56,6 +62,7 @@ impl WaferConfig {
             codegen: CodegenOpts {
                 stack_to_local_promotion: false,
                 stack_guards: false,
+                typed_calls: false,
             },
         }
     }

@@ -2644,6 +2644,7 @@ impl<R: Runtime> ForthVM<R> {
             &local_fn_map,
             table_size,
             self.stack_guard_param(),
+            self.config.codegen.typed_calls,
         )
         .map_err(|e| anyhow::anyhow!("consolidation codegen error: {e}"))?;
 
@@ -2674,6 +2675,7 @@ impl<R: Runtime> ForthVM<R> {
             &local_fn_map,
             table_size,
             self.stack_guard_param(),
+            self.config.codegen.typed_calls,
         )
         .map_err(|e| anyhow::anyhow!("batch compile error: {e}"))?;
 
@@ -2966,6 +2968,11 @@ impl<R: Runtime> ForthVM<R> {
             .then_some(self.stack_fault_id)
     }
 
+    /// Whether words with a known stack effect get a typed entry point.
+    pub(crate) fn typed_calls(&self) -> bool {
+        self.config.codegen.typed_calls
+    }
+
     /// Codegen configuration for compiling one word.
     fn codegen_config(&mut self, base_fn_index: u32) -> CodegenConfig {
         CodegenConfig {
@@ -2973,6 +2980,7 @@ impl<R: Runtime> ForthVM<R> {
             table_size: self.table_size(),
             stack_to_local_promotion: self.config.codegen.stack_to_local_promotion,
             stack_guards: self.stack_guard_param(),
+            typed_calls: self.config.codegen.typed_calls,
         }
     }
 
@@ -8179,6 +8187,73 @@ fn represent_float(val: f64, buf_len: usize) -> (String, i32, bool, bool) {
 mod tests {
     use super::*;
     use crate::runtime_native::NativeRuntime;
+
+    // -- Typed calling convention -------------------------------------
+
+    #[test]
+    fn test_typed_word_recursion_matches_the_memory_convention() {
+        // FIB is the shape the typed entry exists for: self-recursive with
+        // an early EXIT, so it is compiled as WASM values in and out.
+        let (stack, _) = eval(
+            ": FIB DUP 2 < IF EXIT THEN DUP 1- RECURSE SWAP 2 - RECURSE + ; \
+             0 FIB 1 FIB 2 FIB 10 FIB 25 FIB",
+        );
+        assert_eq!(stack, vec![75025, 55, 1, 1, 0]);
+    }
+
+    #[test]
+    fn test_typed_word_keeps_the_items_below_its_arguments() {
+        // The wrapper may only move the cells the word declared; anything
+        // deeper has to still be there afterwards.
+        let (stack, _) = eval(": SQ DUP * ; 7 8 9 SQ");
+        assert_eq!(stack, vec![81, 8, 7]);
+    }
+
+    #[test]
+    fn test_typed_word_is_reachable_through_execute() {
+        // EXECUTE goes through the table, which holds the `( -- )` wrapper.
+        let (stack, _) = eval(": SQ DUP * ; 6 ' SQ EXECUTE");
+        assert_eq!(stack, vec![36]);
+    }
+
+    #[test]
+    fn test_catch_sees_a_typed_word_underflow() {
+        // A typed word's stack guards live in its wrapper, where the
+        // arguments come off the memory stack. They still THROW -4 rather
+        // than corrupting the stack pointer, and CATCH still reports it.
+        let (stack, _) = eval(": SQ DUP * ; : CHK ['] SQ CATCH ; CHK");
+        assert_eq!(stack, vec![-4]);
+    }
+
+    #[test]
+    fn test_catch_restores_the_stack_around_a_caller_of_typed_code() {
+        // T contains THROW, a host word, so T itself keeps the memory
+        // convention and reaches SQ through its wrapper. CATCH restores the
+        // depth it saved across that boundary -- not the contents, so the 3
+        // that SQ squared stays squared. gforth agrees: `1 2 9 5 4`.
+        let (stack, _) = eval(": SQ DUP * ; : T SQ 5 THROW ; : CHK 1 2 3 ['] T CATCH DEPTH ; CHK");
+        assert_eq!(stack, vec![4, 5, 9, 2, 1]);
+    }
+
+    #[test]
+    fn test_typed_word_underflow_still_throws() {
+        // The stack guards for a typed word live in its wrapper, where the
+        // arguments are taken off the memory stack.
+        let mut vm = ForthVM::<NativeRuntime>::new().unwrap();
+        vm.evaluate(": SQ DUP * ;").unwrap();
+        vm.take_output();
+        let err = vm.evaluate("SQ");
+        assert!(err.is_err(), "empty-stack SQ should throw, got {err:?}");
+    }
+
+    #[test]
+    fn test_deep_typed_recursion_unwinds_cleanly() {
+        // 10k levels of a typed self-call: results come back in WASM values,
+        // so nothing is left on the memory stack afterwards.
+        let (stack, _) =
+            eval(": COUNT-DOWN DUP 0= IF EXIT THEN 1- RECURSE ; 10000 COUNT-DOWN DEPTH");
+        assert_eq!(stack, vec![1, 0]);
+    }
 
     fn eval(input: &str) -> (Vec<i32>, String) {
         let mut vm = ForthVM::<NativeRuntime>::new().unwrap();

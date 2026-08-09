@@ -263,7 +263,8 @@ fn cmd_run(file: &str) -> anyhow::Result<()> {
 }
 
 /// `WaferConfig` for CLI-created VMs. `WAFER_STACK_GUARDS=0|1` overrides
-/// the per-command default (REPL/file execution on, build off).
+/// the per-command default (REPL/file execution on, build off);
+/// `WAFER_TYPED_CALLS=0` falls back to the memory-stack calling convention.
 fn vm_config(default_guards: bool) -> wafer_core::config::WaferConfig {
     let mut cfg = wafer_core::config::WaferConfig::all();
     cfg.codegen.stack_guards = match std::env::var("WAFER_STACK_GUARDS").ok().as_deref() {
@@ -271,6 +272,7 @@ fn vm_config(default_guards: bool) -> wafer_core::config::WaferConfig {
         Some(_) => true,
         None => default_guards,
     };
+    cfg.codegen.typed_calls = std::env::var("WAFER_TYPED_CALLS").ok().as_deref() != Some("0");
     cfg
 }
 

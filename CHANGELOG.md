@@ -5,6 +5,53 @@ All notable changes to WAFER are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **A typed calling convention for words with a known stack effect.** Such a
+  word now compiles to two entry points: a fast one whose signature is
+  `(i32 x p) -> (i32 x q)`, carrying its stack items as WASM values, and the
+  usual `( -- )` wrapper that moves those items on and off the memory data
+  stack. The wrapper keeps the function-table slot, so `EXECUTE`, the outer
+  interpreter, host words and `CATCH` see exactly the ABI they saw before;
+  only direct calls inside a module take the fast entry.
+
+  This is what the SwiftForth gap was made of. sf64 keeps TOS in `RBX` and
+  the stack pointer in `RBP`, and both survive a `CALL` untouched, so its
+  `FIB` is 16 instructions and ~7 memory touches per node. WAFER kept the
+  whole stack in linear memory and flushed its cached `$dsp` to an imported
+  global before every call: ~36 memory touches per node. The stack simulator
+  that already promoted loop and `IF` bodies into WASM locals refused any
+  body containing a call or an `EXIT` -- exactly the words where the
+  convention cost the most. It now handles both.
+
+  Fibonacci(25) goes from 1035 to 366 µs, 4.3x slower than `sf64` to 1.2x.
+  Loop-heavy benchmarks are unchanged (they were already promoted, and
+  already beat `sf64`). Words that keep the memory convention: anything
+  using `SP@`, `DEPTH`, `EXECUTE`, `>R`/`R>`, floats or locals; anything
+  calling a word that is itself untyped, which in the JIT path means every
+  call except `RECURSE`; mutually recursive words; and words whose effect is
+  not static -- branches that disagree on depth, `EXIT` at the wrong depth,
+  a non-neutral loop body, or a recursion that grows the stack per level.
+
+  `CONSOLIDATE` extends this across words, since it puts them all in one
+  module: the effects are solved to a fixpoint from the leaves outward, and
+  105 of 187 words in a booted dictionary end up typed.
+
+  Stack guards get cheap as a side effect -- they hang off the memory-stack
+  push/pop choke points, and a typed word barely has any. The default
+  guards-on configuration that the REPL and the web build use went from 1631
+  to 365 µs on the same benchmark.
+
+  `WAFER_TYPED_CALLS=0` falls back to the memory-stack convention.
+
+### Fixed
+
+- The Forth 2012 Core suite now also runs against consolidated code
+  (`compliance_core_after_consolidate`). `CONSOLIDATE` had no correctness
+  test at all before -- only benchmarks.
+
 ## [0.2.6] - 2026-08-07
 
 ### Fixed

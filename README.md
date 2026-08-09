@@ -11,6 +11,7 @@ An optimizing Forth 2012 compiler targeting WebAssembly. WAFER JIT-compiles each
 - **Faster than gforth** on all benchmarks in release mode (2-10x faster)
 - **JIT compilation** — each `:` definition compiles to its own WASM module
 - **Self-recursive direct calls** — RECURSE compiles to native `call` instead of `call_indirect`
+- **Typed calling convention** — a word with a statically known stack effect passes its stack items as WASM values, so a call keeps them in registers instead of round-tripping through memory
 - **Consolidation mode** — recompile all words into a single optimized WASM module
 - **Interactive REPL** with line editing (rustyline)
 - **Browser REPL** — runs entirely in the browser via wasm-pack + js-sys
@@ -79,23 +80,31 @@ git submodule update --init
 
 ## Performance
 
-WAFER beats gforth (the GNU Forth reference implementation) on all benchmarks in release mode:
+WAFER beats gforth (the GNU Forth reference implementation) on all benchmarks in release mode, and is within
+reach of SwiftForth `sf64`, which compiles to native code:
 
 ```
-Benchmark                   WAFER     CONSOL     gforth      WAFER/gf
-Fibonacci(25)                1629       1535       3422        0.45x
-Factorial(12)x10K             340        339        638        0.53x
-GCD-bench(500)                 18         15         30        0.50x
-NestedLoops(50)                84         73        720        0.10x
-Collatz(2K)                  1212       1202       3914        0.31x
+Benchmark                   WAFER     CONSOL     gforth       sf64    WAFER/gf   WAFER/sf
+Fibonacci(25)                 378        359       3238        296       0.11x      1.21x
+Factorial(12)x10K             335        320        633        183       0.51x      1.75x
+GCD-bench(500)                 14         15         29         31       0.48x      0.45x
+NestedLoops(50)                72         69        698        207       0.10x      0.33x
+Collatz(2K)                   994        997       3940        668       0.25x      1.49x
 ```
 
 Times in microseconds. WAFER/gf < 1.0 means WAFER is faster. CONSOL = after `CONSOLIDATE`.
 
+A word whose stack effect is statically known gets a **typed entry point**: its stack items travel in and out
+as WASM values instead of through the memory data stack, so cranelift keeps them in registers across a call
+the way a native Forth keeps TOS in one. The word also keeps a `( -- )` wrapper, which is what the function
+table, `EXECUTE` and the outer interpreter reach, so nothing about the memory ABI changes from the outside.
+Call-heavy code is what this pays for -- Fibonacci went from 4.3x slower than `sf64` to 1.2x. Set
+`WAFER_TYPED_CALLS=0` to fall back to the memory-stack convention.
+
 ## Testing
 
 ```bash
-# All tests (~570 currently passing)
+# All tests (~620 currently passing)
 cargo test --workspace
 
 # Forth 2012 compliance suite

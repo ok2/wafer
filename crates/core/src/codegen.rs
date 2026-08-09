@@ -8,6 +8,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use wasm_encoder::{
     BlockType, CodeSection, ConstExpr, CustomSection, DataCountSection, DataSection,
@@ -46,11 +47,15 @@ const TABLE: u32 = 0;
 // Type indices in the type section.
 const TYPE_VOID: u32 = 0; // () -> ()
 const TYPE_I32: u32 = 1; // (i32) -> ()
+const TYPE_TYPED: u32 = 2; // (i32 x p) -> (i32 x q), single-word modules only
 
 // The `emit` callback is the first (and only) imported function, so index 0.
-// The compiled word is the first (and only) defined function, so index 1.
+// The compiled word is the first defined function, so index 1.
 const EMIT_FUNC: u32 = 0;
 const WORD_FUNC: u32 = 1;
+/// Fast entry of a typed word in a single-word module, right after the
+/// `() -> ()` wrapper that keeps the table slot.
+const TYPED_FAST_FUNC: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // DSP caching: local 0 holds a cached copy of the $dsp global.
@@ -100,6 +105,23 @@ pub struct CodegenConfig {
     /// Table index of the `_STACK_FAULT_` host word; `Some` enables
     /// stack under/overflow guards in the emitted code.
     pub stack_guards: Option<u32>,
+    /// Give words with a statically known stack effect a typed entry point
+    /// that passes stack items as WASM values instead of through memory.
+    pub typed_calls: bool,
+}
+
+/// A word compiled with the typed calling convention: its stack items travel
+/// as WASM values instead of through the memory data stack, so cranelift can
+/// keep them in registers across a call the way a native Forth keeps TOS in
+/// one. Reachable only by direct `call` inside the same module.
+#[derive(Debug, Clone, Copy)]
+struct TypedFn {
+    /// WASM function index of the fast entry.
+    fn_index: u32,
+    /// Cells taken from the caller.
+    params: u32,
+    /// Cells handed back.
+    results: u32,
 }
 
 /// Result of compiling a word to WASM.
@@ -1244,13 +1266,28 @@ fn is_promotable(ops: &[IrOp]) -> bool {
     if ops.is_empty() {
         return false;
     }
-    is_promotable_body(ops)
+    is_promotable_body(ops, PromoteMode::Memory)
+}
+
+/// Which promoted code path a body is being checked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromoteMode {
+    /// Classic promotion: the word keeps the memory-stack ABI, so it may not
+    /// call anything (the callee would see a stale stack) and may not `EXIT`
+    /// (the promoted locals have to be written back first).
+    Memory,
+    /// Typed entry: the word takes and returns its stack items as WASM
+    /// values, so calls to other typed words and `EXIT` are both fine.
+    Typed,
 }
 
 /// Recursive check for promotable ops.
-fn is_promotable_body(ops: &[IrOp]) -> bool {
+fn is_promotable_body(ops: &[IrOp], mode: PromoteMode) -> bool {
+    let typed = mode == PromoteMode::Typed;
     for op in ops {
         match op {
+            IrOp::Call(_) | IrOp::TailCall(_) if typed => {}
+            IrOp::Exit if typed => {}
             IrOp::Call(_) | IrOp::TailCall(_) | IrOp::Execute | IrOp::SpFetch | IrOp::RpFetch => {
                 return false;
             }
@@ -1288,31 +1325,46 @@ fn is_promotable_body(ops: &[IrOp]) -> bool {
                 then_body,
                 else_body,
             } => {
-                let Some(eb) = else_body else {
-                    return false;
-                };
-                if !is_promotable_body(then_body) || !is_promotable_body(eb) {
+                // In typed mode a missing ELSE is fine and the depth
+                // agreement is checked by `analyze_stack`, which knows the
+                // call effects and which branches EXIT.
+                if !is_promotable_body(then_body, mode) {
                     return false;
                 }
-                // Both branches must have the same net stack effect
-                let (_, then_net) = compute_stack_needs(then_body);
-                let (_, else_net) = compute_stack_needs(eb);
-                if then_net != else_net {
-                    return false;
+                match else_body {
+                    Some(eb) => {
+                        if !is_promotable_body(eb, mode) {
+                            return false;
+                        }
+                        if !typed {
+                            // Both branches must have the same net stack effect
+                            let (_, then_net) = compute_stack_needs(then_body);
+                            let (_, else_net) = compute_stack_needs(eb);
+                            if then_net != else_net {
+                                return false;
+                            }
+                        }
+                    }
+                    None if typed => {}
+                    None => return false,
                 }
             }
             // DO/LOOP: promotable if body is promotable and stack-neutral
             IrOp::DoLoop { body, is_plus_loop } => {
-                if !is_promotable_body(body) {
+                if !is_promotable_body(body, mode) {
                     return false;
                 }
-                if body.iter().any(|op| matches!(op, IrOp::Exit)) {
+                // An EXIT out of a DO loop would have to unwind the loop
+                // locals; neither path emits that, so leave those words alone.
+                if body_has_exit(body) {
                     return false;
                 }
-                let (_, body_net) = compute_stack_needs(body);
-                let expected = if *is_plus_loop { 1 } else { 0 };
-                if body_net != expected {
-                    return false;
+                if !typed {
+                    let (_, body_net) = compute_stack_needs(body);
+                    let expected = if *is_plus_loop { 1 } else { 0 };
+                    if body_net != expected {
+                        return false;
+                    }
                 }
             }
             // BEGIN loops, BeginDoubleWhileRepeat, flat forward blocks: not promoted
@@ -1328,6 +1380,166 @@ fn is_promotable_body(ops: &[IrOp]) -> bool {
         }
     }
     true
+}
+
+/// Does `ops` contain an `EXIT` at any nesting depth?
+fn body_has_exit(ops: &[IrOp]) -> bool {
+    ops.iter().any(|op| match op {
+        IrOp::Exit => true,
+        IrOp::If {
+            then_body,
+            else_body,
+        } => body_has_exit(then_body) || else_body.as_deref().is_some_and(body_has_exit),
+        IrOp::DoLoop { body, .. } | IrOp::BeginUntil { body } | IrOp::BeginAgain { body } => {
+            body_has_exit(body)
+        }
+        IrOp::BeginWhileRepeat { test, body } => body_has_exit(test) || body_has_exit(body),
+        IrOp::BeginDoubleWhileRepeat {
+            outer_test,
+            inner_test,
+            body,
+            after_repeat,
+            else_body,
+        } => {
+            body_has_exit(outer_test)
+                || body_has_exit(inner_test)
+                || body_has_exit(body)
+                || body_has_exit(after_repeat)
+                || else_body.as_deref().is_some_and(body_has_exit)
+        }
+        _ => false,
+    })
+}
+
+/// Every word `ops` calls, at any nesting depth.
+fn callees_of(ops: &[IrOp], out: &mut Vec<WordId>) {
+    for op in ops {
+        match op {
+            IrOp::Call(id) | IrOp::TailCall(id) => out.push(*id),
+            IrOp::If {
+                then_body,
+                else_body,
+            } => {
+                callees_of(then_body, out);
+                if let Some(eb) = else_body {
+                    callees_of(eb, out);
+                }
+            }
+            IrOp::DoLoop { body, .. } | IrOp::BeginUntil { body } | IrOp::BeginAgain { body } => {
+                callees_of(body, out);
+            }
+            IrOp::BeginWhileRepeat { test, body } => {
+                callees_of(test, out);
+                callees_of(body, out);
+            }
+            IrOp::BeginDoubleWhileRepeat {
+                outer_test,
+                inner_test,
+                body,
+                after_repeat,
+                else_body,
+            } => {
+                callees_of(outer_test, out);
+                callees_of(inner_test, out);
+                callees_of(body, out);
+                callees_of(after_repeat, out);
+                if let Some(eb) = else_body {
+                    callees_of(eb, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Most cells a typed entry may take as WASM parameters. Beyond this the
+/// signature stops fitting in argument registers and the memory stack is the
+/// better deal.
+const MAX_TYPED_PARAMS: u32 = 8;
+
+/// Most cells a typed entry may return. WASM multi-value returns past the
+/// first go through a caller-provided return area, i.e. memory again, so
+/// keep this tight.
+const MAX_TYPED_RESULTS: u32 = 4;
+
+/// How many iterations to give the self-recursion fixpoint before giving up.
+const TYPED_EFFECT_ROUNDS: u32 = 6;
+
+/// Solve a word's stack effect, if it has one.
+///
+/// `known` supplies the effect of every word this one calls; `self_id` names
+/// the word itself, whose effect is what we are solving for. A self-call
+/// makes the equation circular (`d = k + m*d` for m self-calls), so the
+/// analysis is run to a fixpoint: guess, re-derive, stop when the guess
+/// reproduces itself. `: FIB ... RECURSE ... RECURSE ... ;` settles on
+/// `(1, 1)` in two rounds; a word with no fixed effect (`: F 1 RECURSE ;`)
+/// grows without settling and is rejected.
+fn typed_effect(
+    body: &[IrOp],
+    self_id: Option<WordId>,
+    known: &HashMap<WordId, CallEffect>,
+) -> Option<CallEffect> {
+    if body.is_empty() || !is_promotable_body(body, PromoteMode::Typed) {
+        return None;
+    }
+    // Every call target must already have an effect, or be this word.
+    let mut targets = Vec::new();
+    callees_of(body, &mut targets);
+    if targets
+        .iter()
+        .any(|id| Some(*id) != self_id && !known.contains_key(id))
+    {
+        return None;
+    }
+
+    let mut guess: CallEffect = (0, 0);
+    for _ in 0..TYPED_EFFECT_ROUNDS {
+        let lookup = |id: WordId| {
+            if Some(id) == self_id {
+                guess
+            } else {
+                known.get(&id).copied().unwrap_or((0, 0))
+            }
+        };
+        let (preload, net, consistent) = analyze_stack(body, &lookup);
+        if !consistent {
+            return None;
+        }
+        let produced = i32::try_from(preload).ok()? + net;
+        let effect = (preload, u32::try_from(produced).ok()?);
+        if effect == guess {
+            return (effect.0 <= MAX_TYPED_PARAMS && effect.1 <= MAX_TYPED_RESULTS)
+                .then_some(effect);
+        }
+        guess = effect;
+    }
+    None
+}
+
+/// Solve the stack effect of every word in a consolidated module that has
+/// one.
+///
+/// A word can be typed once all the words it calls are, so this grows the
+/// set until it stops growing: leaves first, then their callers. Mutually
+/// recursive words never enter it -- neither can be settled before the
+/// other -- and keep the memory-stack convention.
+fn typed_effects(words: &[(WordId, Vec<IrOp>)]) -> HashMap<WordId, CallEffect> {
+    let mut known: HashMap<WordId, CallEffect> = HashMap::new();
+    loop {
+        let mut changed = false;
+        for (id, body) in words {
+            if known.contains_key(id) {
+                continue;
+            }
+            if let Some(effect) = typed_effect(body, Some(*id), &known) {
+                known.insert(*id, effect);
+                changed = true;
+            }
+        }
+        if !changed {
+            return known;
+        }
+    }
 }
 
 /// Compute the net stack depth change for a single IR operation.
@@ -1392,26 +1604,73 @@ fn stack_delta(op: &IrOp) -> i32 {
 /// them (e.g., `Dup` reads the top). We must track the minimum stack position
 /// that any op reads from, not just the net depth after consumption.
 fn compute_stack_needs(ops: &[IrOp]) -> (u32, i32) {
-    let mut depth: i32 = 0;
-    let mut min_accessed: i32 = 0;
-    compute_stack_needs_rec(ops, &mut depth, &mut min_accessed);
-    let preload = if min_accessed < 0 {
-        (-min_accessed) as u32
+    let (preload, net, _) = analyze_stack(ops, &|_| (0, 0));
+    (preload, net)
+}
+
+/// Run the stack-needs analysis with a stack effect for each called word.
+///
+/// Returns `(preload, net, consistent)`. `consistent` is false when the body
+/// has no static stack effect at all -- branches that disagree on depth, an
+/// `EXIT` at a depth the fall-through path does not reach, a loop body that
+/// is not stack-neutral. The classic memory-stack path ignores it (its
+/// bodies contain no calls and no `EXIT`, so it is always true there); the
+/// typed path refuses to compile a word without it.
+fn analyze_stack(ops: &[IrOp], calls: &CallEffects<'_>) -> (u32, i32, bool) {
+    let mut st = Needs {
+        depth: 0,
+        min_accessed: 0,
+        diverged: false,
+        consistent: true,
+        exit_depth: None,
+        calls,
+    };
+    compute_stack_needs_rec(ops, &mut st);
+    if let Some(d) = st.exit_depth
+        && !st.diverged
+        && d != st.depth
+    {
+        st.consistent = false;
+    }
+    let preload = if st.min_accessed < 0 {
+        (-st.min_accessed) as u32
     } else {
         0
     };
-    (preload, depth)
+    (preload, st.depth, st.consistent)
+}
+
+/// Stack effect of a called word: (cells consumed, cells produced).
+type CallEffect = (u32, u32);
+
+/// Look up the stack effect of a call target. Only ever consulted for words
+/// [`is_promotable_body`] has already accepted in [`PromoteMode::Typed`], so
+/// an unknown target cannot reach it.
+type CallEffects<'a> = dyn Fn(WordId) -> CallEffect + 'a;
+
+/// Abstract-interpretation state for the stack-effect analysis.
+struct Needs<'a> {
+    depth: i32,
+    min_accessed: i32,
+    /// Set once control cannot fall out of the body being walked (`EXIT`).
+    diverged: bool,
+    /// Cleared when the body has no static stack effect.
+    consistent: bool,
+    /// Depth the first `EXIT` left; every other exit must agree.
+    exit_depth: Option<i32>,
+    calls: &'a CallEffects<'a>,
 }
 
 /// Recursive stack-needs analysis that descends into control flow bodies.
-fn compute_stack_needs_rec(ops: &[IrOp], depth: &mut i32, min_accessed: &mut i32) {
+fn compute_stack_needs_rec(ops: &[IrOp], st: &mut Needs<'_>) {
     for op in ops {
+        let depth = st.depth;
         // First: compute the deepest position this op reads from.
         let reads_from = match op {
-            IrOp::Dup => *depth - 1,
-            IrOp::Over | IrOp::TwoDup => *depth - 2,
-            IrOp::Swap | IrOp::Nip | IrOp::Tuck => *depth - 2,
-            IrOp::Rot => *depth - 3,
+            IrOp::Dup => depth - 1,
+            IrOp::Over | IrOp::TwoDup => depth - 2,
+            IrOp::Swap | IrOp::Nip | IrOp::Tuck => depth - 2,
+            IrOp::Rot => depth - 3,
             IrOp::Add
             | IrOp::Sub
             | IrOp::Mul
@@ -1429,7 +1688,7 @@ fn compute_stack_needs_rec(ops: &[IrOp], depth: &mut i32, min_accessed: &mut i32
             | IrOp::DivMod
             | IrOp::Store
             | IrOp::CStore
-            | IrOp::PlusStore => *depth - 2,
+            | IrOp::PlusStore => depth - 2,
             IrOp::Drop
             | IrOp::Negate
             | IrOp::Abs
@@ -1437,15 +1696,17 @@ fn compute_stack_needs_rec(ops: &[IrOp], depth: &mut i32, min_accessed: &mut i32
             | IrOp::ZeroEq
             | IrOp::ZeroLt
             | IrOp::Fetch
-            | IrOp::CFetch => *depth - 1,
-            IrOp::TwoDrop => *depth - 2,
-            IrOp::FetchFloat | IrOp::StoreFloat | IrOp::StoF => *depth - 1,
+            | IrOp::CFetch => depth - 1,
+            IrOp::TwoDrop => depth - 2,
+            IrOp::FetchFloat | IrOp::StoreFloat | IrOp::StoF => depth - 1,
             // Control flow reads are handled by recursion below
-            IrOp::If { .. } => *depth - 1,     // consumes condition
-            IrOp::DoLoop { .. } => *depth - 2, // consumes limit + index
-            _ => *depth,
+            IrOp::If { .. } => depth - 1,     // consumes condition
+            IrOp::DoLoop { .. } => depth - 2, // consumes limit + index
+            // A call reads as deep as its own arguments go.
+            IrOp::Call(id) | IrOp::TailCall(id) => depth - (st.calls)(*id).0 as i32,
+            _ => depth,
         };
-        *min_accessed = (*min_accessed).min(reads_from);
+        st.min_accessed = st.min_accessed.min(reads_from);
 
         // Then: update depth. For control flow, recurse instead of using stack_delta.
         match op {
@@ -1453,48 +1714,67 @@ fn compute_stack_needs_rec(ops: &[IrOp], depth: &mut i32, min_accessed: &mut i32
                 then_body,
                 else_body,
             } => {
-                *depth -= 1; // consume condition
-                let saved = *depth;
-                compute_stack_needs_rec(then_body, depth, min_accessed);
+                st.depth -= 1; // consume condition
+                let saved = st.depth;
+
+                let outer_diverged = st.diverged;
+                st.diverged = false;
+                compute_stack_needs_rec(then_body, st);
+                let then_depth = st.depth;
+                let then_diverged = st.diverged;
+
+                st.depth = saved;
+                st.diverged = false;
                 if let Some(eb) = else_body {
-                    let then_depth = *depth;
-                    *depth = saved;
-                    compute_stack_needs_rec(eb, depth, min_accessed);
-                    // Use the then-branch depth (both should match for well-formed code)
-                    *depth = then_depth;
+                    compute_stack_needs_rec(eb, st);
                 }
+                let else_depth = st.depth;
+                let else_diverged = st.diverged;
+
+                // A branch that always EXITs never reaches the join, so it
+                // does not have to agree on depth with the one that does.
+                st.depth = if then_diverged {
+                    else_depth
+                } else {
+                    then_depth
+                };
+                if !then_diverged && !else_diverged && then_depth != else_depth {
+                    st.consistent = false;
+                }
+                st.diverged = outer_diverged || (then_diverged && else_diverged);
             }
             IrOp::DoLoop { body, is_plus_loop } => {
-                *depth -= 2; // consume limit + index
-                // Loop body is stack-neutral (net 0, or +1 for +LOOP step)
-                // We still recurse to track min_accessed inside the body.
-                let saved = *depth;
-                compute_stack_needs_rec(body, depth, min_accessed);
-                // Restore: body effect is consumed by loop control
-                *depth = saved;
-                if *is_plus_loop {
-                    // +LOOP body pushes 1 step value, consumed by loop control
+                st.depth -= 2; // consume limit + index
+                // Loop body is stack-neutral (net 0, or +1 for +LOOP step:
+                // the step value is consumed by the loop control).
+                let saved = st.depth;
+                compute_stack_needs_rec(body, st);
+                let expected = saved + i32::from(*is_plus_loop);
+                if st.depth != expected {
+                    st.consistent = false;
                 }
+                // Restore: body effect is consumed by loop control
+                st.depth = saved;
             }
             IrOp::BeginUntil { body } => {
-                let saved = *depth;
-                compute_stack_needs_rec(body, depth, min_accessed);
+                let saved = st.depth;
+                compute_stack_needs_rec(body, st);
                 // Body produces flag, consumed by UNTIL: net 0 for the whole construct
-                *depth = saved;
+                st.depth = saved;
             }
             IrOp::BeginAgain { body } => {
-                let saved = *depth;
-                compute_stack_needs_rec(body, depth, min_accessed);
-                *depth = saved;
+                let saved = st.depth;
+                compute_stack_needs_rec(body, st);
+                st.depth = saved;
             }
             IrOp::BeginWhileRepeat { test, body } => {
-                let saved = *depth;
-                compute_stack_needs_rec(test, depth, min_accessed);
+                let saved = st.depth;
+                compute_stack_needs_rec(test, st);
                 // WHILE consumes flag
-                *depth -= 1;
-                compute_stack_needs_rec(body, depth, min_accessed);
+                st.depth -= 1;
+                compute_stack_needs_rec(body, st);
                 // Whole construct is stack-neutral
-                *depth = saved;
+                st.depth = saved;
             }
             IrOp::BeginDoubleWhileRepeat {
                 outer_test,
@@ -1503,21 +1783,35 @@ fn compute_stack_needs_rec(ops: &[IrOp], depth: &mut i32, min_accessed: &mut i32
                 after_repeat,
                 else_body,
             } => {
-                let saved = *depth;
-                compute_stack_needs_rec(outer_test, depth, min_accessed);
-                *depth -= 1;
-                compute_stack_needs_rec(inner_test, depth, min_accessed);
-                *depth -= 1;
-                compute_stack_needs_rec(body, depth, min_accessed);
-                compute_stack_needs_rec(after_repeat, depth, min_accessed);
+                let saved = st.depth;
+                compute_stack_needs_rec(outer_test, st);
+                st.depth -= 1;
+                compute_stack_needs_rec(inner_test, st);
+                st.depth -= 1;
+                compute_stack_needs_rec(body, st);
+                compute_stack_needs_rec(after_repeat, st);
                 if let Some(eb) = else_body {
-                    compute_stack_needs_rec(eb, depth, min_accessed);
+                    compute_stack_needs_rec(eb, st);
                 }
-                *depth = saved;
+                st.depth = saved;
+            }
+            IrOp::Call(id) | IrOp::TailCall(id) => {
+                let (consumed, produced) = (st.calls)(*id);
+                st.depth += produced as i32 - consumed as i32;
+            }
+            IrOp::Exit => {
+                // Every EXIT must leave the same depth, and the fall-through
+                // path has to reach it too (checked by `analyze_stack`).
+                match st.exit_depth {
+                    None => st.exit_depth = Some(st.depth),
+                    Some(d) if d != st.depth => st.consistent = false,
+                    Some(_) => {}
+                }
+                st.diverged = true;
             }
             // All other ops: use stack_delta
             _ => {
-                *depth += stack_delta(op);
+                st.depth += stack_delta(op);
             }
         }
     }
@@ -1594,6 +1888,8 @@ fn count_promoted_locals_body(ops: &[IrOp], count: &mut u32) {
                     count_promoted_locals_body(eb, count);
                 }
             }
+            // Typed path only: a call lands its results in fresh locals.
+            IrOp::Call(_) | IrOp::TailCall(_) => *count += MAX_TYPED_RESULTS,
             IrOp::Dup | IrOp::Over | IrOp::Tuck | IrOp::TwoDup => {
                 // These reuse existing locals via the simulator, no extra needed
             }
@@ -1611,6 +1907,21 @@ struct StackSim {
     next_local: u32,
     /// Stack of (`index_local`, `limit_local`) for nested DO/LOOP in promoted path.
     loop_index_stack: Vec<(u32, u32)>,
+    /// Set when emitting the fast entry of a typed word. `None` is the
+    /// classic memory-stack promotion, where calls and `EXIT` cannot occur.
+    typed: Option<TypedCtx>,
+    /// True once the code emitted so far cannot fall through (an `EXIT` ran).
+    /// The join after an `IF` uses it to take the surviving branch's state.
+    diverged: bool,
+}
+
+/// What the typed emitter needs beyond the simulator itself.
+#[derive(Clone)]
+struct TypedCtx {
+    /// Cells this function returns, i.e. what an `EXIT` has to leave.
+    results: u32,
+    /// Fast entries reachable by direct call from this module.
+    callees: Rc<HashMap<WordId, TypedFn>>,
 }
 
 impl StackSim {
@@ -1619,6 +1930,39 @@ impl StackSim {
             stack: Vec::new(),
             next_local: first_local,
             loop_index_stack: Vec::new(),
+            typed: None,
+            diverged: false,
+        }
+    }
+
+    /// Simulator for a typed fast entry: params occupy locals `0..params`,
+    /// so fresh locals start above them.
+    fn new_typed(params: u32, results: u32, callees: &Rc<HashMap<WordId, TypedFn>>) -> Self {
+        let mut sim = Self::new(params);
+        sim.stack = (0..params).collect();
+        sim.typed = Some(TypedCtx {
+            results,
+            callees: Rc::clone(callees),
+        });
+        sim
+    }
+
+    /// Emit the function's results and return. Used by `EXIT` and at the end
+    /// of a typed body.
+    fn emit_typed_return(&self, f: &mut Function, explicit_return: bool) {
+        let results = self.typed.as_ref().map_or(0, |t| t.results) as usize;
+        let Some(base) = self.stack.len().checked_sub(results) else {
+            // Too few values to return means every path here already
+            // returned, so the validator treats this position as
+            // unreachable and any terminator satisfies it.
+            f.instruction(&Instruction::Unreachable);
+            return;
+        };
+        for &local in &self.stack[base..] {
+            f.instruction(&Instruction::LocalGet(local));
+        }
+        if explicit_return {
+            f.instruction(&Instruction::Return);
         }
     }
 
@@ -1941,34 +2285,47 @@ fn emit_promoted_op(f: &mut Function, op: &IrOp, sim: &mut StackSim) {
 
             let saved_stack = sim.stack.clone();
             let saved_next = sim.next_local;
+            let outer_diverged = sim.diverged;
 
+            sim.diverged = false;
             emit_promoted_body(f, then_body, sim);
 
             let then_stack = sim.stack.clone();
             let then_next = sim.next_local;
+            let then_diverged = sim.diverged;
 
             // Restore to branch-point state for else
             sim.stack = saved_stack;
             sim.next_local = saved_next;
+            sim.diverged = false;
 
             f.instruction(&Instruction::Else);
             if let Some(eb) = else_body {
                 emit_promoted_body(f, eb, sim);
             }
+            let else_diverged = sim.diverged;
 
-            // Copy else results into then's locals at the join point.
-            // Both branches should have the same stack depth for well-formed Forth.
-            let else_stack = &sim.stack;
-            let min_len = then_stack.len().min(else_stack.len());
-            for i in 0..min_len {
-                if then_stack[i] != else_stack[i] {
-                    f.instruction(&Instruction::LocalGet(else_stack[i]));
-                    f.instruction(&Instruction::LocalSet(then_stack[i]));
+            // A branch that returned never reaches the join, so its locals do
+            // not have to be reconciled -- the survivor's state is the join
+            // state. When both fall through, copy the else results into the
+            // then branch's locals (both have the same depth by construction).
+            if then_diverged {
+                // join state is the else state, already in sim.stack
+            } else {
+                if !else_diverged {
+                    let else_stack = &sim.stack;
+                    let min_len = then_stack.len().min(else_stack.len());
+                    for i in 0..min_len {
+                        if then_stack[i] != else_stack[i] {
+                            f.instruction(&Instruction::LocalGet(else_stack[i]));
+                            f.instruction(&Instruction::LocalSet(then_stack[i]));
+                        }
+                    }
                 }
+                sim.stack = then_stack;
             }
-
-            sim.stack = then_stack;
             sim.next_local = sim.next_local.max(then_next);
+            sim.diverged = outer_diverged || (then_diverged && else_diverged);
 
             f.instruction(&Instruction::End);
         }
@@ -2146,11 +2503,50 @@ fn emit_promoted_op(f: &mut Function, op: &IrOp, sim: &mut StackSim) {
             sim.push(result);
         }
 
+        IrOp::Exit if sim.typed.is_some() => {
+            // Typed entry: hand the results back as WASM values.
+            sim.emit_typed_return(f, true);
+            sim.diverged = true;
+        }
+
         IrOp::Exit => {
             // Write remaining promoted locals back to memory stack, then return
             emit_promoted_epilogue(f, sim);
             dsp_writeback(f);
             f.instruction(&Instruction::Return);
+        }
+
+        // A call between typed words: arguments go in WASM parameters and
+        // results come back as WASM results, so nothing touches memory.
+        // `TailCall` is only ever generated in tail position, so emitting it
+        // as a plain call and falling through to the return is equivalent.
+        IrOp::Call(id) | IrOp::TailCall(id) if sim.typed.is_some() => {
+            // Both invariants are established by `typed_effect`, which
+            // refuses a body with an unknown callee and verifies the depth
+            // at every point -- same contract as `StackSim::pop`.
+            let callee = sim
+                .typed
+                .as_ref()
+                .and_then(|t| t.callees.get(id).copied())
+                .expect("typed call to an untyped word");
+            let base = sim
+                .stack
+                .len()
+                .checked_sub(callee.params as usize)
+                .expect("promoted stack underflow at a typed call");
+            for &local in &sim.stack[base..] {
+                f.instruction(&Instruction::LocalGet(local));
+            }
+            sim.stack.truncate(base);
+            f.instruction(&Instruction::Call(callee.fn_index));
+            // Results arrive on the operand stack with the topmost last.
+            let results: Vec<u32> = (0..callee.results).map(|_| sim.alloc()).collect();
+            for &local in results.iter().rev() {
+                f.instruction(&Instruction::LocalSet(local));
+            }
+            for local in results {
+                sim.push(local);
+            }
         }
 
         // Unhandled ops in promoted path — shouldn't reach here if is_promotable is correct
@@ -2163,6 +2559,58 @@ fn emit_promoted_body(f: &mut Function, ops: &[IrOp], sim: &mut StackSim) {
     for op in ops {
         emit_promoted_op(f, op, sim);
     }
+}
+
+/// Build the fast entry of a typed word: stack items in, stack items out,
+/// the memory data stack never touched.
+fn emit_typed_fast(
+    body: &[IrOp],
+    effect: CallEffect,
+    callees: &Rc<HashMap<WordId, TypedFn>>,
+) -> Function {
+    let (params, results) = effect;
+    // Params are locals 0..params; everything the simulator allocates on top
+    // of that has to be declared.
+    let extra = count_promoted_locals(body, 0) + results;
+    let mut f = Function::new(vec![(extra, ValType::I32)]);
+    let mut sim = StackSim::new_typed(params, results, callees);
+    emit_promoted_body(&mut f, body, &mut sim);
+    sim.emit_typed_return(&mut f, false);
+    f.instruction(&Instruction::End);
+    f
+}
+
+/// Build the `() -> ()` wrapper that lets a typed word be reached the normal
+/// way -- from the table, `EXECUTE`, the outer interpreter. It moves the
+/// arguments off the memory data stack into the typed call and the results
+/// back, which is also where the stack guards for the word live.
+fn emit_typed_wrapper(effect: CallEffect, fast_index: u32) -> Function {
+    let (params, results) = effect;
+    let mut f = Function::new(vec![(1 + params + results, ValType::I32)]);
+    f.instruction(&Instruction::GlobalGet(DSP))
+        .instruction(&Instruction::LocalSet(CACHED_DSP_LOCAL));
+
+    let mut sim = StackSim::new(SCRATCH_BASE);
+    emit_promoted_prologue(&mut f, params, &mut sim);
+    for &local in &sim.stack {
+        f.instruction(&Instruction::LocalGet(local));
+    }
+    sim.stack.clear();
+    f.instruction(&Instruction::Call(fast_index));
+
+    let out: Vec<u32> = (0..results).map(|_| sim.alloc()).collect();
+    for &local in out.iter().rev() {
+        f.instruction(&Instruction::LocalSet(local));
+    }
+    for local in out {
+        sim.push(local);
+    }
+    emit_promoted_epilogue(&mut f, &mut sim);
+
+    f.instruction(&Instruction::LocalGet(CACHED_DSP_LOCAL))
+        .instruction(&Instruction::GlobalSet(DSP));
+    f.instruction(&Instruction::End);
+    f
 }
 
 /// At the end of a loop iteration in promoted code, copy modified values
@@ -2541,10 +2989,26 @@ pub fn compile_word(
 
     let mut module = Module::new();
 
+    // A word whose stack effect is statically known gets a second, typed
+    // entry point; the self-recursive case is the one that pays, since the
+    // recursion then runs entirely in WASM values. Cross-word typed calls
+    // need every callee in the same module, which only CONSOLIDATE gives.
+    let self_id = WordId(config.base_fn_index);
+    let typed = config
+        .typed_calls
+        .then(|| typed_effect(body, Some(self_id), &HashMap::new()))
+        .flatten();
+
     // -- Type section --
     let mut types = TypeSection::new();
     types.ty().function([], []); // type 0: () -> ()
     types.ty().function([ValType::I32], []); // type 1: (i32) -> ()
+    if let Some((params, results)) = typed {
+        types.ty().function(
+            std::iter::repeat_n(ValType::I32, params as usize),
+            std::iter::repeat_n(ValType::I32, results as usize),
+        );
+    }
     module.section(&types);
 
     // -- Import section --
@@ -2602,8 +3066,13 @@ pub fn compile_word(
     module.section(&imports);
 
     // -- Function section --
+    // The wrapper stays function WORD_FUNC so the table entry, the export
+    // and every existing caller are unaffected; the fast entry follows it.
     let mut functions = FunctionSection::new();
     functions.function(TYPE_VOID);
+    if typed.is_some() {
+        functions.function(TYPE_TYPED);
+    }
     module.section(&functions);
 
     // -- Export section --
@@ -2623,6 +3092,22 @@ pub fn compile_word(
     module.section(&elements);
 
     // -- Code section --
+    if let Some(effect) = typed {
+        let mut callees = HashMap::new();
+        callees.insert(
+            self_id,
+            TypedFn {
+                fn_index: TYPED_FAST_FUNC,
+                params: effect.0,
+                results: effect.1,
+            },
+        );
+        let mut code = CodeSection::new();
+        code.function(&emit_typed_wrapper(effect, TYPED_FAST_FUNC));
+        code.function(&emit_typed_fast(body, effect, &Rc::new(callees)));
+        return finish_word_module(module, name, &code, config.base_fn_index, true);
+    }
+
     // Determine whether to use stack-to-local promotion
     let promoted = config.stack_to_local_promotion && is_promotable(body);
     let scratch_count = count_scratch_locals(body);
@@ -2697,15 +3182,31 @@ pub fn compile_word(
 
     let mut code = CodeSection::new();
     code.function(&func);
-    module.section(&code);
+    finish_word_module(module, name, &code, config.base_fn_index, false)
+}
 
-    // -- Name section: carries the Forth word name into wasmtime trap
-    // backtraces (best-effort symbolication, WS-008).
+/// Attach the code and name sections, validate, and hand back the bytes.
+///
+/// The name section carries the Forth word name into wasmtime trap
+/// backtraces (best-effort symbolication, WS-008); a typed word names both
+/// of its entries so the innermost frame is the one that reports.
+fn finish_word_module(
+    mut module: Module,
+    name: &str,
+    code: &CodeSection,
+    fn_index: u32,
+    typed: bool,
+) -> WaferResult<CompiledModule> {
+    module.section(code);
+
     let mut names = wasm_encoder::NameSection::new();
     names.module(name);
     let mut fn_names = wasm_encoder::NameMap::new();
     fn_names.append(0, "emit");
     fn_names.append(WORD_FUNC, name);
+    if typed {
+        fn_names.append(TYPED_FAST_FUNC, name);
+    }
     names.functions(&fn_names);
     module.section(&names);
 
@@ -2716,10 +3217,7 @@ pub fn compile_word(
         WaferError::ValidationError(format!("Generated WASM failed validation: {e}"))
     })?;
 
-    Ok(CompiledModule {
-        bytes,
-        fn_index: config.base_fn_index,
-    })
+    Ok(CompiledModule { bytes, fn_index })
 }
 
 // ---------------------------------------------------------------------------
@@ -3014,8 +3512,16 @@ pub fn compile_consolidated_module(
     local_fn_map: &HashMap<WordId, u32>,
     table_size: u32,
     stack_guards: Option<u32>,
+    typed_calls: bool,
 ) -> WaferResult<Vec<u8>> {
-    compile_multi_word_module(words, local_fn_map, table_size, None, stack_guards)
+    compile_multi_word_module(
+        words,
+        local_fn_map,
+        table_size,
+        None,
+        stack_guards,
+        typed_calls,
+    )
 }
 
 /// Compile an exportable WASM module with embedded memory and metadata.
@@ -3029,8 +3535,16 @@ pub fn compile_exportable_module(
     table_size: u32,
     export: &ExportSections<'_>,
     stack_guards: Option<u32>,
+    typed_calls: bool,
 ) -> WaferResult<Vec<u8>> {
-    compile_multi_word_module(words, local_fn_map, table_size, Some(export), stack_guards)
+    compile_multi_word_module(
+        words,
+        local_fn_map,
+        table_size,
+        Some(export),
+        stack_guards,
+        typed_calls,
+    )
 }
 
 /// Internal: build a multi-word WASM module. When `export` is `Some`, adds
@@ -3041,6 +3555,7 @@ fn compile_multi_word_module(
     table_size: u32,
     export: Option<&ExportSections<'_>>,
     stack_guards: Option<u32>,
+    typed_calls: bool,
 ) -> WaferResult<Vec<u8>> {
     // Arm (or disarm) stack-guard emission for this module.
     GUARD_FAULT.set(stack_guards);
@@ -3048,10 +3563,44 @@ fn compile_multi_word_module(
     let has_data = export.is_some_and(|e| !e.memory_snapshot.is_empty());
     let mut module = Module::new();
 
+    // Every word lives in this one module, so a call between two words with
+    // a known stack effect can pass its stack items as WASM values. The
+    // `() -> ()` wrappers keep their function indices and table slots, and
+    // the fast entries are appended after them.
+    let effects = if typed_calls {
+        typed_effects(words)
+    } else {
+        HashMap::new()
+    };
+    let mut typed: HashMap<WordId, TypedFn> = HashMap::new();
+    let mut signatures: Vec<CallEffect> = Vec::new();
+    for (word_id, _) in words {
+        let Some(&effect) = effects.get(word_id) else {
+            continue;
+        };
+        let fn_index = words.len() as u32 + 1 + typed.len() as u32;
+        typed.insert(
+            *word_id,
+            TypedFn {
+                fn_index,
+                params: effect.0,
+                results: effect.1,
+            },
+        );
+        signatures.push(effect);
+    }
+    let typed = Rc::new(typed);
+
     // -- Type section --
     let mut types = TypeSection::new();
     types.ty().function([], []); // type 0: () -> ()
     types.ty().function([ValType::I32], []); // type 1: (i32) -> ()
+    for &(params, results) in &signatures {
+        types.ty().function(
+            std::iter::repeat_n(ValType::I32, params as usize),
+            std::iter::repeat_n(ValType::I32, results as usize),
+        );
+    }
     module.section(&types);
 
     // -- Import section (same as single-word modules) --
@@ -3108,10 +3657,13 @@ fn compile_multi_word_module(
     );
     module.section(&imports);
 
-    // -- Function section: N functions, all type void --
+    // -- Function section: N `() -> ()` entries, then the typed fast ones --
     let mut functions = FunctionSection::new();
     for _ in words {
         functions.function(TYPE_VOID);
+    }
+    for (i, _) in signatures.iter().enumerate() {
+        functions.function(TYPE_TYPED + i as u32);
     }
     module.section(&functions);
 
@@ -3151,7 +3703,13 @@ fn compile_multi_word_module(
 
     // -- Code section: emit each function body --
     let mut code = CodeSection::new();
-    for (_word_id, body) in words {
+    for (word_id, body) in words {
+        // A typed word's `() -> ()` entry is just the bridge from the memory
+        // stack into its fast entry; the body itself is emitted further down.
+        if let Some(t) = typed.get(word_id) {
+            code.function(&emit_typed_wrapper((t.params, t.results), t.fn_index));
+            continue;
+        }
         let promoted = is_promotable(body);
         let scratch_count = count_scratch_locals(body);
         let forth_local_count = count_forth_locals(body);
@@ -3223,6 +3781,12 @@ fn compile_multi_word_module(
         func.instruction(&Instruction::End);
         code.function(&func);
     }
+    // Fast entries, in the same order the function section declared them.
+    for (word_id, body) in words {
+        if let Some(t) = typed.get(word_id) {
+            code.function(&emit_typed_fast(body, (t.params, t.results), &typed));
+        }
+    }
     module.section(&code);
 
     // -- Data section (memory snapshot for exportable modules) --
@@ -3274,6 +3838,7 @@ mod tests {
             table_size: 16,
             stack_to_local_promotion: true,
             stack_guards: None,
+            typed_calls: true,
         }
     }
 
@@ -3499,6 +4064,7 @@ mod tests {
             table_size: 16,
             stack_to_local_promotion: true,
             stack_guards: None,
+            typed_calls: true,
         };
         let m = compile_word("t", &[IrOp::PushI32(1)], &cfg).unwrap();
         assert_eq!(m.fn_index, 7);
@@ -4405,5 +4971,179 @@ mod tests {
             IrOp::FetchFloat,
         ];
         assert_eq!(run_float_word(&ops), vec![pi]);
+    }
+
+    // ===================================================================
+    // Typed calling convention (fast entry + wrapper)
+    // ===================================================================
+
+    /// `: FIB DUP 2 < IF EXIT THEN DUP 1- RECURSE SWAP 2 - RECURSE + ;`
+    fn fib_ir(self_id: WordId) -> Vec<IrOp> {
+        vec![
+            IrOp::Dup,
+            IrOp::PushI32(2),
+            IrOp::Lt,
+            IrOp::If {
+                then_body: vec![IrOp::Exit],
+                else_body: None,
+            },
+            IrOp::Dup,
+            IrOp::PushI32(1),
+            IrOp::Sub,
+            IrOp::Call(self_id),
+            IrOp::Swap,
+            IrOp::PushI32(2),
+            IrOp::Sub,
+            IrOp::Call(self_id),
+            IrOp::Add,
+        ]
+    }
+
+    #[test]
+    fn typed_effect_solves_self_recursion() {
+        // The recursion makes the equation circular (2d = d), so the
+        // fixpoint has to settle it: FIB is ( n -- fib ).
+        let id = WordId(5);
+        assert_eq!(
+            typed_effect(&fib_ir(id), Some(id), &HashMap::new()),
+            Some((1, 1))
+        );
+    }
+
+    #[test]
+    fn typed_effect_rejects_a_word_without_a_fixed_effect() {
+        // `: F 1 RECURSE ;` grows the stack by one more cell per level, so
+        // there is no signature to give it.
+        let id = WordId(5);
+        let body = vec![IrOp::PushI32(1), IrOp::Call(id)];
+        assert_eq!(typed_effect(&body, Some(id), &HashMap::new()), None);
+    }
+
+    #[test]
+    fn typed_effect_rejects_an_unknown_callee() {
+        // Nothing is known about word 9, so its caller cannot be typed
+        // either -- this is what keeps single-word modules to self-calls.
+        let body = vec![IrOp::Dup, IrOp::Call(WordId(9))];
+        assert_eq!(typed_effect(&body, Some(WordId(5)), &HashMap::new()), None);
+
+        let known = HashMap::from([(WordId(9), (1, 1))]);
+        assert_eq!(typed_effect(&body, Some(WordId(5)), &known), Some((1, 2)));
+    }
+
+    #[test]
+    fn typed_effect_rejects_branches_that_disagree_on_depth() {
+        // ( -- ) on one side and ( -- x ) on the other: no static effect.
+        let body = vec![IrOp::If {
+            then_body: vec![IrOp::PushI32(1)],
+            else_body: Some(vec![]),
+        }];
+        assert_eq!(typed_effect(&body, None, &HashMap::new()), None);
+    }
+
+    #[test]
+    fn typed_effect_allows_an_exiting_branch_to_differ() {
+        // `DUP 0= IF DROP EXIT THEN 1+` -- the EXIT branch never reaches the
+        // join, so it does not have to agree with the fall-through.
+        let body = vec![
+            IrOp::Dup,
+            IrOp::ZeroEq,
+            IrOp::If {
+                then_body: vec![IrOp::Exit],
+                else_body: None,
+            },
+            IrOp::PushI32(1),
+            IrOp::Add,
+        ];
+        assert_eq!(typed_effect(&body, None, &HashMap::new()), Some((1, 1)));
+    }
+
+    #[test]
+    fn typed_effect_rejects_exits_at_different_depths() {
+        // One EXIT leaves a cell the other does not.
+        let body = vec![
+            IrOp::If {
+                then_body: vec![IrOp::PushI32(1), IrOp::Exit],
+                else_body: None,
+            },
+            IrOp::Exit,
+        ];
+        assert_eq!(typed_effect(&body, None, &HashMap::new()), None);
+    }
+
+    #[test]
+    fn typed_word_module_has_a_wrapper_and_a_fast_entry() {
+        let cfg = default_config();
+        let id = WordId(cfg.base_fn_index);
+        let m = compile_word("FIB", &fib_ir(id), &cfg).unwrap();
+        // compile_word validates, so reaching here means the two-function
+        // module is well-formed; check the table entry is still the wrapper.
+        let mut funcs = 0;
+        for payload in wasmparser::Parser::new(0).parse_all(&m.bytes) {
+            if let wasmparser::Payload::FunctionSection(s) = payload.unwrap() {
+                funcs = s.count();
+            }
+        }
+        assert_eq!(funcs, 2, "expected wrapper + fast entry");
+    }
+
+    #[test]
+    fn typed_calls_can_be_turned_off() {
+        let cfg = CodegenConfig {
+            typed_calls: false,
+            ..default_config()
+        };
+        let id = WordId(cfg.base_fn_index);
+        let m = compile_word("FIB", &fib_ir(id), &cfg).unwrap();
+        let mut funcs = 0;
+        for payload in wasmparser::Parser::new(0).parse_all(&m.bytes) {
+            if let wasmparser::Payload::FunctionSection(s) = payload.unwrap() {
+                funcs = s.count();
+            }
+        }
+        assert_eq!(funcs, 1, "memory-stack convention emits one function");
+    }
+
+    #[test]
+    fn typed_effects_spread_from_leaves_to_callers() {
+        // SQ is a leaf, SUMSQ calls it twice: the fixpoint has to settle SQ
+        // first, then SUMSQ becomes typeable in the next round.
+        let sq = WordId(1);
+        let sumsq = WordId(2);
+        let words = vec![
+            (sq, vec![IrOp::Dup, IrOp::Mul]),
+            (
+                sumsq,
+                vec![IrOp::Call(sq), IrOp::Swap, IrOp::Call(sq), IrOp::Add],
+            ),
+        ];
+        let effects = typed_effects(&words);
+        assert_eq!(effects.get(&sq), Some(&(1, 1)));
+        assert_eq!(effects.get(&sumsq), Some(&(2, 1)));
+    }
+
+    #[test]
+    fn mutually_recursive_words_stay_untyped() {
+        // Neither can be settled before the other, so both keep the
+        // memory-stack convention rather than looping forever.
+        let a = WordId(1);
+        let b = WordId(2);
+        let words = vec![(a, vec![IrOp::Call(b)]), (b, vec![IrOp::Call(a)])];
+        assert!(typed_effects(&words).is_empty());
+    }
+
+    #[test]
+    fn consolidated_module_with_typed_calls_validates() {
+        let sq = WordId(1);
+        let sumsq = WordId(2);
+        let words = vec![
+            (sq, vec![IrOp::Dup, IrOp::Mul]),
+            (
+                sumsq,
+                vec![IrOp::Call(sq), IrOp::Swap, IrOp::Call(sq), IrOp::Add],
+            ),
+        ];
+        let map = HashMap::from([(sq, 1u32), (sumsq, 2u32)]);
+        // compile_consolidated_module validates internally.
+        compile_consolidated_module(&words, &map, 16, None, true).unwrap();
     }
 }
