@@ -5,6 +5,134 @@ All notable changes to WAFER are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.7] - 2026-08-09
+
+### Added
+
+- **A typed calling convention for words with a known stack effect.** Such a
+  word now compiles to two entry points: a fast one whose signature is
+  `(i32 x p) -> (i32 x q)`, carrying its stack items as WASM values, and the
+  usual `( -- )` wrapper that moves those items on and off the memory data
+  stack. The wrapper keeps the function-table slot, so `EXECUTE`, the outer
+  interpreter, host words and `CATCH` see exactly the ABI they saw before;
+  only direct calls inside a module take the fast entry.
+
+  This is what the SwiftForth gap was made of. sf64 keeps TOS in `RBX` and
+  the stack pointer in `RBP`, and both survive a `CALL` untouched, so its
+  `FIB` is 16 instructions and ~7 memory touches per node. WAFER kept the
+  whole stack in linear memory and flushed its cached `$dsp` to an imported
+  global before every call: ~36 memory touches per node. The stack simulator
+  that already promoted loop and `IF` bodies into WASM locals refused any
+  body containing a call or an `EXIT` -- exactly the words where the
+  convention cost the most. It now handles both.
+
+  Fibonacci(25) goes from 1035 to 366 µs, 4.3x slower than `sf64` to 1.2x.
+  Loop-heavy benchmarks are unchanged by this entry — see the region
+  promotion below for those. Words that keep the memory convention: anything
+  using `SP@`, `DEPTH`, `EXECUTE`, `>R`/`R>`, floats or locals; anything
+  calling a word that is itself untyped, which in the JIT path means every
+  call except `RECURSE`; mutually recursive words; and words whose effect is
+  not static -- branches that disagree on depth, `EXIT` at the wrong depth,
+  a non-neutral loop body, or a recursion that grows the stack per level.
+
+  `CONSOLIDATE` extends this across words, since it puts them all in one
+  module: the effects are solved to a fixpoint from the leaves outward, and
+  105 of 187 words in a booted dictionary end up typed.
+
+  Stack guards get cheap as a side effect -- they hang off the memory-stack
+  push/pop choke points, and a typed word barely has any. The default
+  guards-on configuration that the REPL and the web build use went from 1631
+  to 365 µs on the same benchmark.
+
+  `WAFER_TYPED_CALLS=0` falls back to the memory-stack convention.
+
+- **Promotion is now per region, not per word.** Stack-to-local promotion
+  used to be all-or-nothing: a single `.`, `CR`, `>R` or host call
+  anywhere in a definition put the _entire_ body on the memory data
+  stack, hot loops included. The stack simulator now runs over each
+  stretch of a word that can live in WASM locals, loading what the
+  region reads and writing back what it leaves, with the rest of the
+  word unchanged around it.
+
+  The cliff this removes was steep. The same loop, same build:
+
+  | `: L1 0 5000000 0 DO 1+ LOOP DROP ;` reached as | µs    | ns/iter |
+  | ----------------------------------------------- | ----- | ------- |
+  | its own word                                    | 1571  | 0.31    |
+  | inlined into a caller with a `.` in it (before) | 11100 | 2.22    |
+  | the same, after this change                     | 1572  | 0.31    |
+
+  7x, for one `i32.add`: on the memory path the accumulator is stored to
+  linear memory and reloaded next iteration, so the loop-carried
+  dependency runs through store-to-load forwarding instead of a
+  register.
+
+  A region may only use `I` / `J` when the DO loops naming them are
+  inside the region, since the simulator resolves them against its own
+  loop stack. Straight-line regions have to be at least three operations
+  to be worth the load and store either side; a loop always is.
+
+- **The inliner no longer drags a loop onto the memory stack.** It
+  inlined any callee of eight IR operations or fewer, so a small
+  loop-bearing word inlined into a caller that can never be promoted
+  lost its registers -- an optimisation pass applying the 7x
+  pessimisation above. Loop-bearing callees now stay put in that case:
+  one call is far cheaper than a loop's worth of memory traffic.
+  Straight-line words still inline everywhere.
+
+- **`BEGIN` loops promote as well.** `BEGIN..UNTIL`, `BEGIN..AGAIN` and
+  `BEGIN..WHILE..REPEAT` were rejected outright by the eligibility check,
+  so any word built on the idiomatic Forth loop kept the memory data
+  stack no matter how hot it was. They are promoted now when the
+  construct is stack-neutral: `UNTIL` consumes exactly the flag its body
+  leaves, `AGAIN`'s body is neutral, and for `WHILE..REPEAT` the test and
+  the body balance separately -- `WHILE` leaves the loop between the two,
+  so a net that only added up over the pair would give the two exits
+  different stack shapes. Bodies containing an `EXIT` stay out, the same
+  rule `DO`/`LOOP` follows. `BEGIN..WHILE..WHILE..REPEAT` is still
+  excluded.
+
+  GCD 994 -> 540 µs, Collatz 428 -> 185.
+
+  Together these four entries put four of the five cross-engine
+  benchmarks past SwiftForth `sf64`: Factorial 0.29x, Collatz 0.30x,
+  NestedLoops 0.27x, GCD 0.67x. Fibonacci stays at 1.24x, being pure
+  call overhead with no loop to promote.
+
+### Fixed
+
+- **A promoted loop or `IF` whose branch permutes the stack lost a value.**
+  At the bottom of a promoted loop the body's results are copied back into
+  the loop-top locals, and the join after a promoted `IF` copies one
+  branch's locals into the other's. Both did it one slot at a time in index
+  order, which is wrong as soon as a destination is also a later source:
+  `: C 3 4 2 0 DO SWAP LOOP . . ;` printed `4 4` where gforth and
+  SwiftForth print `4 3`, and `2 0 DO ROT LOOP` over three cells printed
+  `3 2 3` instead of `2 1 3`. The copies are now ordered so every source is
+  read before it is overwritten, with one scratch local to break a cycle.
+  Present since stack-to-local promotion was introduced; reachable from
+  any `DO` loop or `IF` whose body reorders cells it did not create.
+
+- The Forth 2012 Core suite now also runs against consolidated code
+  (`compliance_core_after_consolidate`). `CONSOLIDATE` had no correctness
+  test at all before -- only benchmarks.
+
+### Changed
+
+- **Three cross-engine benchmarks were too small to be measured.** GCD ran
+  in 14 µs, Factorial in 49 and NestedLoops in 51, where per-run scatter is
+  a good fraction of the total and fixed per-invocation costs in the other
+  engines dominate. Scaled to Factorial x100K, GCD-bench(20K) and
+  NestedLoops(50)x1K, all now around 0.5-1 ms.
+
+  This changed a result rather than just steadying it: GCD looked like a
+  win at 0.42x of `sf64` and was in fact a loss at 1.17x. That is what
+  pointed at `BEGIN` loops as the remaining gap -- GCD is the one benchmark
+  whose loop is a `BEGIN ... WHILE ... REPEAT` -- and with those promoted it
+  now reads 0.67x. The regression limits, which had drifted to 3-6x looser
+  than the measurements they guard, were retightened to ~45% above the
+  current ratios.
+
 ## [0.2.6] - 2026-08-07
 
 ### Fixed
@@ -212,6 +340,7 @@ compliance suite, `CONSOLIDATE` whole-program recompilation, `wafer build`
 AOT export (WASM / native / JS loader), browser REPL, SHA-1/256/512 words,
 and cross-engine benchmark lanes against gforth and SwiftForth.
 
+[0.2.7]: https://github.com/ok2/wafer/compare/v0.2.6...v0.2.7
 [0.2.1]: https://github.com/ok2/wafer/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/ok2/wafer/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/ok2/wafer/releases/tag/v0.1.0

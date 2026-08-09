@@ -344,3 +344,32 @@ fn compliance_tools() {
     let errors = run_suite(&mut vm, "toolstest.fth");
     assert_eq!(errors, 0, "Programming-Tools: {errors} test failures");
 }
+
+/// The Forth 2012 Core suite against consolidated code.
+///
+/// `CONSOLIDATE` recompiles the whole dictionary into one WASM module, which
+/// is where cross-word typed calls live: a word with a known stack effect
+/// gets a fast entry taking and returning its stack items as WASM values,
+/// and its `() -> ()` wrapper keeps the table slot. Nothing else covers that
+/// path for correctness, so run the suite on top of it.
+#[test]
+fn compliance_core_after_consolidate() {
+    let mut vm = ForthVM::<NativeRuntime>::new().expect("Failed to create ForthVM");
+    let tester_path = format!("{SUITE_DIR}/tester.fr");
+    let f1 = load_file(&mut vm, &tester_path);
+    assert_load_fails_within_baseline(&tester_path, f1);
+
+    vm.evaluate("CONSOLIDATE").expect("CONSOLIDATE failed");
+    vm.take_output();
+
+    let core_path = format!("{SUITE_DIR}/core.fr");
+    let f2 = load_file(&mut vm, &core_path);
+    assert_load_fails_within_baseline(&core_path, f2);
+
+    let _ = vm.evaluate("DECIMAL #ERRORS @");
+    let errors = vm.data_stack().first().copied().unwrap_or(-1);
+    assert_eq!(
+        errors, 0,
+        "Core word set after CONSOLIDATE: {errors} failures"
+    );
+}
