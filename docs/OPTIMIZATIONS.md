@@ -30,6 +30,7 @@ This document describes every optimization that makes sense for WAFER, why it ma
 | 14 | Self-Recursive Direct Call | Codegen      | Done        | High    |
 | 15 | Float / Double-Cell        | Codegen      | Not started | Future  |
 | 16 | Typed Calling Convention   | Codegen      | Done        | Highest |
+| 17 | Self-Guard Expansion       | IR pass      | Done        | Medium  |
 
 ## 1. Stack-to-Local Promotion
 
@@ -484,33 +485,59 @@ Fibonacci(25) went from 1035 to 366 microseconds, 4.3x slower than `sf64` to 1.2
 
 Untyped by design: anything using `SP@`, `DEPTH`, `EXECUTE`, `>R`/`R>`, floats or locals; anything calling a word that is itself untyped, which in the JIT path means every call except `RECURSE`; mutually recursive words; and words whose effect is not static -- branches that disagree on depth, `EXIT` at the wrong depth, a non-neutral loop body, or a recursion that grows the stack per level.
 
+## 17. Self-Guard Expansion
+
+**Status: Done.** A recursive word's base-case guard is duplicated into its own call sites, so the leaves of the recursion cost a test instead of a call. Implemented in `optimizer.rs::expand_self_guard`, gated on `OptConfig::self_guard`, and applied after inlining so the later passes still run over the result.
+
+### The Shape
+
+A recursive Forth word almost always opens with a guard that returns early:
+
+```forth
+: FIB DUP 2 < IF EXIT THEN DUP 1- RECURSE SWAP 2 - RECURSE + ;
+```
+
+Every leaf of the recursion is then a call whose entire body is `DUP 2 <`. The pass rewrites each `Call(self)` as
+
+```forth
+DUP 2 < IF ( leave it ) ELSE RECURSE THEN
+```
+
+which computes the same thing -- the callee would have run the guard, taken the branch and returned. When the guard returns a value rather than its argument (`IF DROP 0 EXIT THEN`), that value moves into the then-branch with it.
+
+### Why It Is Bounded
+
+The guard runs twice along the recursive path: once at the call site, once inside the callee. So it must be small and free of effects -- `MAX_GUARD_OPS` is six, and the operations are restricted to stack shuffles, arithmetic and comparisons; a call, a memory access or a branch disqualifies it. `MAX_GUARD_SITES` caps the expansion at four call sites, since each one replicates the guard. A `TailCall` is never expanded, which keeps this pass and tail-call detection from having to agree about what tail position means.
+
+### Impact
+
+Fibonacci(25): 356 to 237 microseconds. In fib's tree half of all nodes are leaves, which is where the factor comes from. This is what took the last benchmark past `sf64`.
+
 ## Current Performance vs Gforth
 
 All optimizations enabled, release mode, measured with UTIME:
 
 ```
 Benchmark                   WAFER     CONSOL     gforth       sf64    WAFER/gf   WAFER/sf
-Fibonacci(25)                 356        361       3389        287       0.11x      1.24x
-Factorial(12)x100K            479        495       6249       1650       0.08x      0.29x
-GCD-bench(20K)                540        559       1801        801       0.30x      0.67x
-NestedLoops(50)x1K            509        501       7023       1887       0.07x      0.27x
-Collatz(2K)                   185        213       3873        610       0.05x      0.30x
+Fibonacci(25)                 237        242       3340        287       0.07x      0.83x
+Factorial(12)x100K            480        479       6109       1594       0.08x      0.30x
+GCD-bench(20K)                549        541       1830        797       0.30x      0.68x
+NestedLoops(50)x1K            501        509       7092       1898       0.07x      0.26x
+Collatz(2K)                   196        190       3955        633       0.05x      0.30x
 ```
 
 Times in microseconds. WAFER/gf < 1.0 means WAFER is faster. `sf64` is SwiftForth,
 which compiles to native code; two caveats on that column. The install here is an
 x86-64 binary under Rosetta 2 while WAFER and gforth are native arm64, so it is a
 native-vs-emulated comparison and a native SwiftForth would be faster than these
-numbers; and sf64 uses 64-bit cells to WAFER's 32-bit. WAFER is ahead on the four
-loop-heavy benchmarks and behind on Fibonacci, which is one call per node with no
-loop to promote.
+numbers; and sf64 uses 64-bit cells to WAFER's 32-bit.
 
 ## Remaining Opportunities
 
-| Optimization                     | Status              | Potential Impact                                                                                                                                                                                                                                                                                            |
-| -------------------------------- | ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Bounded self-inlining            | Not started         | Measured 1.33x on Fibonacci, the last benchmark behind sf64. Blocked on `EXIT`: the inliner refuses any body containing one, and a recursive Forth word is `... IF EXIT THEN ... RECURSE`. Needs either a scoped exit (compile an inlined `EXIT` as a branch to the end of a block) or guard-only expansion |
-| BeginDoubleWhileRepeat promotion | Not started         | Rare pattern, low priority. Its promoted emitter exists but has no loop fixup and is unverified                                                                                                                                                                                                             |
-| LEAVE as IR primitive            | Not started         | Would enable fast-path for loops with LEAVE                                                                                                                                                                                                                                                                 |
-| Float stack-to-local             | Not started         | Eliminate float stack memory traffic                                                                                                                                                                                                                                                                        |
-| WASM tail calls proposal         | Waiting on wasmtime | Would eliminate stack growth for tail-recursive words                                                                                                                                                                                                                                                       |
+| Optimization                     | Status              | Potential Impact                                                                                                                                                                                                                                                    |
+| -------------------------------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Scoped exit for the inliner      | Not started         | The inliner still refuses any body containing an `EXIT`, because an inlined one would return from the caller. Compiling it as a branch to the end of a block would unlock inlining for every word with an early return, not just the guard shape section 17 handles |
+| BeginDoubleWhileRepeat promotion | Not started         | Rare pattern, low priority. Its promoted emitter exists but has no loop fixup and is unverified                                                                                                                                                                     |
+| LEAVE as IR primitive            | Not started         | Would enable fast-path for loops with LEAVE                                                                                                                                                                                                                         |
+| Float stack-to-local             | Not started         | Eliminate float stack memory traffic                                                                                                                                                                                                                                |
+| WASM tail calls proposal         | Waiting on wasmtime | Would eliminate stack growth for tail-recursive words                                                                                                                                                                                                               |

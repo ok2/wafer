@@ -5,6 +5,26 @@ All notable changes to WAFER are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **A recursive word tests its base case at the call site.** A recursive Forth
+  word almost always opens with a guard that returns early --
+  `: FIB DUP 2 < IF EXIT THEN ... RECURSE ... ;` -- so every leaf of the
+  recursion costs a call whose entire body is that test. `Call(self)` now
+  compiles as `<guard> IF <what the guard returns> ELSE Call(self) THEN`,
+  which computes the same thing: the callee would have run the guard, taken
+  the branch and returned. In fib's tree the leaves are half of all nodes.
+
+  Fibonacci(25) 356 -> 237 µs, which takes the last benchmark that was behind
+  SwiftForth `sf64` past it: 1.24x -> 0.83x, five of five.
+
+  The guard runs twice along the recursive path, so it has to be small (at
+  most six operations) and free of effects -- no calls, no memory, no
+  branches. Words with more than four self-call sites are left alone to bound
+  the code growth, and a `TailCall` is never expanded.
+
 ## [0.2.7] - 2026-08-09
 
 ### Added

@@ -39,6 +39,7 @@ impl WaferConfig {
                 strength_reduce: true,
                 dce: true,
                 inline: true,
+                self_guard: true,
             },
             codegen: CodegenOpts {
                 stack_to_local_promotion: true,
@@ -58,6 +59,7 @@ impl WaferConfig {
                 strength_reduce: false,
                 dce: false,
                 inline: false,
+                self_guard: false,
             },
             codegen: CodegenOpts {
                 stack_to_local_promotion: false,

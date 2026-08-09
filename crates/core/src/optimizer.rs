@@ -27,6 +27,9 @@ pub struct OptConfig {
     pub dce: bool,
     /// Enable inlining of small word bodies.
     pub inline: bool,
+    /// Expand a recursive word's base-case guard into its own call sites, so
+    /// the leaves of the recursion cost a test instead of a call.
+    pub self_guard: bool,
 }
 
 /// Run all enabled optimization passes.
@@ -34,6 +37,7 @@ pub fn optimize(
     ops: Vec<IrOp>,
     config: &OptConfig,
     bodies: &HashMap<WordId, Vec<IrOp>>,
+    self_id: Option<WordId>,
 ) -> Vec<IrOp> {
     let mut ir = ops;
 
@@ -59,6 +63,11 @@ pub fn optimize(
         // cheaper than a loop's worth of memory traffic.
         let keep_loops_out = !crate::codegen::promotable_modulo_calls(&ir);
         ir = inline(ir, bodies, 8, keep_loops_out);
+    }
+    if config.self_guard
+        && let Some(id) = self_id
+    {
+        ir = expand_self_guard(ir, id);
     }
     if config.peephole {
         ir = peephole(ir);
@@ -585,6 +594,142 @@ fn detailcall(op: IrOp) -> IrOp {
 }
 
 /// Check if an IR body contains a direct call to the given word (recursion guard).
+/// Largest guard the expander is willing to run twice, in IR operations.
+const MAX_GUARD_OPS: usize = 6;
+/// Most self-call sites worth expanding, to bound the code growth.
+const MAX_GUARD_SITES: usize = 4;
+
+/// Expand a recursive word's base-case guard into its own call sites.
+///
+/// A recursive Forth word almost always opens with a guard that returns early
+/// -- `: FIB DUP 2 < IF EXIT THEN ... RECURSE ... ;` -- so every leaf of the
+/// recursion costs a call whose whole body is that test. Testing at the call
+/// site instead removes the call for the leaves, which in fib's tree is half
+/// of all nodes.
+///
+/// `Call(self)` becomes `<guard> IF <what the guard returns> ELSE Call(self)
+/// THEN`, which computes the same thing: the callee would have run the guard,
+/// taken the branch and returned. The price is that the guard runs twice along
+/// the recursive path, which is why it has to be small and free of effects.
+fn expand_self_guard(ops: Vec<IrOp>, self_id: WordId) -> Vec<IrOp> {
+    let Some((cond, base)) = split_guard(&ops) else {
+        return ops;
+    };
+    if count_self_calls(&ops, self_id) > MAX_GUARD_SITES {
+        return ops;
+    }
+    let (cond, base) = (cond.to_vec(), base.to_vec());
+    replace_self_calls(ops, self_id, &cond, &base)
+}
+
+/// Split a body into the condition of its leading base-case guard and what
+/// that guard leaves behind, or `None` if it does not open with one.
+fn split_guard(ops: &[IrOp]) -> Option<(&[IrOp], &[IrOp])> {
+    let at = ops.iter().position(|op| matches!(op, IrOp::If { .. }))?;
+    let cond = &ops[..at];
+    if at > MAX_GUARD_OPS || !cond.iter().all(is_duplicable) {
+        return None;
+    }
+    let IrOp::If {
+        then_body,
+        else_body: None,
+    } = &ops[at]
+    else {
+        return None;
+    };
+    // The guard is only a guard if it returns; what precedes the `EXIT` is
+    // the value it returns, and has to be as harmless as the condition.
+    let (IrOp::Exit, base) = then_body.split_last()? else {
+        return None;
+    };
+    if base.len() > MAX_GUARD_OPS || !base.iter().all(is_duplicable) {
+        return None;
+    }
+    Some((cond, base))
+}
+
+/// Can this operation be duplicated at every call site -- cheap, effect-free,
+/// and not itself a call or a branch?
+fn is_duplicable(op: &IrOp) -> bool {
+    matches!(
+        op,
+        IrOp::PushI32(_)
+            | IrOp::Drop
+            | IrOp::Dup
+            | IrOp::Swap
+            | IrOp::Over
+            | IrOp::Rot
+            | IrOp::Nip
+            | IrOp::Tuck
+            | IrOp::TwoDup
+            | IrOp::TwoDrop
+            | IrOp::Add
+            | IrOp::Sub
+            | IrOp::Mul
+            | IrOp::Negate
+            | IrOp::Abs
+            | IrOp::Eq
+            | IrOp::NotEq
+            | IrOp::Lt
+            | IrOp::Gt
+            | IrOp::LtUnsigned
+            | IrOp::ZeroEq
+            | IrOp::ZeroLt
+            | IrOp::And
+            | IrOp::Or
+            | IrOp::Xor
+            | IrOp::Invert
+            | IrOp::Lshift
+            | IrOp::Rshift
+            | IrOp::ArithRshift
+    )
+}
+
+fn count_self_calls(ops: &[IrOp], self_id: WordId) -> usize {
+    ops.iter()
+        .map(|op| match op {
+            IrOp::Call(id) if *id == self_id => 1,
+            IrOp::If {
+                then_body,
+                else_body,
+            } => {
+                count_self_calls(then_body, self_id)
+                    + else_body
+                        .as_deref()
+                        .map_or(0, |eb| count_self_calls(eb, self_id))
+            }
+            _ => 0,
+        })
+        .sum()
+}
+
+/// Wrap every `Call(self_id)` in the guard. Only plain calls: a `TailCall` is
+/// followed by a return, and leaving those alone keeps tail-call detection and
+/// this pass from having to agree about what tail position means.
+fn replace_self_calls(ops: Vec<IrOp>, self_id: WordId, cond: &[IrOp], base: &[IrOp]) -> Vec<IrOp> {
+    let mut out = Vec::with_capacity(ops.len());
+    for op in ops {
+        match op {
+            IrOp::Call(id) if id == self_id => {
+                out.extend_from_slice(cond);
+                out.push(IrOp::If {
+                    then_body: base.to_vec(),
+                    else_body: Some(vec![IrOp::Call(id)]),
+                });
+            }
+            IrOp::If {
+                then_body,
+                else_body,
+            } => out.push(IrOp::If {
+                then_body: replace_self_calls(then_body, self_id, cond, base),
+                else_body: else_body.map(|eb| replace_self_calls(eb, self_id, cond, base)),
+            }),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 fn contains_call_to(ops: &[IrOp], target: WordId) -> bool {
     for op in ops {
         match op {
@@ -746,8 +891,130 @@ mod tests {
             strength_reduce: true,
             dce: true,
             inline: false,
+            self_guard: false,
         };
-        optimize(ops, &config, &HashMap::new())
+        optimize(ops, &config, &HashMap::new(), None)
+    }
+
+    /// A body shaped like a recursive Forth word: a base-case guard, then the
+    /// recursive step. `SELF` is the word being compiled.
+    const SELF: WordId = WordId(9);
+
+    fn guarded_body(step: Vec<IrOp>) -> Vec<IrOp> {
+        let mut ops = vec![
+            IrOp::Dup,
+            IrOp::PushI32(2),
+            IrOp::Lt,
+            IrOp::If {
+                then_body: vec![IrOp::Exit],
+                else_body: None,
+            },
+        ];
+        ops.extend(step);
+        ops
+    }
+
+    #[test]
+    fn self_guard_moves_the_base_case_to_the_call_site() {
+        let out = expand_self_guard(guarded_body(vec![IrOp::Call(SELF)]), SELF);
+        assert_eq!(
+            out,
+            guarded_body(vec![
+                IrOp::Dup,
+                IrOp::PushI32(2),
+                IrOp::Lt,
+                IrOp::If {
+                    then_body: vec![],
+                    else_body: Some(vec![IrOp::Call(SELF)]),
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn self_guard_carries_the_value_the_guard_returns() {
+        // `: F DUP 2 < IF DROP 0 EXIT THEN RECURSE ;` -- the base case is not
+        // "leave the argument", it is "replace it with 0".
+        let body = vec![
+            IrOp::Dup,
+            IrOp::PushI32(2),
+            IrOp::Lt,
+            IrOp::If {
+                then_body: vec![IrOp::Drop, IrOp::PushI32(0), IrOp::Exit],
+                else_body: None,
+            },
+            IrOp::Call(SELF),
+        ];
+        let out = expand_self_guard(body, SELF);
+        let IrOp::If { then_body, .. } = &out[7] else {
+            panic!("expected the expanded guard at index 7, got {:?}", out);
+        };
+        assert_eq!(then_body, &vec![IrOp::Drop, IrOp::PushI32(0)]);
+    }
+
+    #[test]
+    fn self_guard_leaves_a_body_without_a_guard_alone() {
+        // An `IF` with an `ELSE` is a branch, not an early return.
+        let body = vec![
+            IrOp::Dup,
+            IrOp::If {
+                then_body: vec![IrOp::Drop],
+                else_body: Some(vec![IrOp::Call(SELF)]),
+            },
+        ];
+        assert_eq!(expand_self_guard(body.clone(), SELF), body);
+
+        // No `EXIT` in the then-branch: also not a guard.
+        let body = guarded_body(vec![IrOp::Call(SELF)])
+            .into_iter()
+            .map(|op| match op {
+                IrOp::If { .. } => IrOp::If {
+                    then_body: vec![IrOp::Drop],
+                    else_body: None,
+                },
+                other => other,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(expand_self_guard(body.clone(), SELF), body);
+    }
+
+    #[test]
+    fn self_guard_refuses_a_condition_it_cannot_run_twice() {
+        // A guard reached through a call or a memory write would be evaluated
+        // once at the call site and again inside the callee.
+        let body = vec![
+            IrOp::Call(WordId(3)),
+            IrOp::If {
+                then_body: vec![IrOp::Exit],
+                else_body: None,
+            },
+            IrOp::Call(SELF),
+        ];
+        assert_eq!(expand_self_guard(body.clone(), SELF), body);
+
+        let body = vec![
+            IrOp::Dup,
+            IrOp::Fetch,
+            IrOp::If {
+                then_body: vec![IrOp::Exit],
+                else_body: None,
+            },
+            IrOp::Call(SELF),
+        ];
+        assert_eq!(expand_self_guard(body.clone(), SELF), body);
+    }
+
+    #[test]
+    fn self_guard_stops_at_the_call_site_budget() {
+        let step = std::iter::repeat_n(IrOp::Call(SELF), MAX_GUARD_SITES + 1).collect();
+        let body = guarded_body(step);
+        assert_eq!(expand_self_guard(body.clone(), SELF), body);
+    }
+
+    #[test]
+    fn self_guard_leaves_tail_calls_alone() {
+        let body = guarded_body(vec![IrOp::TailCall(SELF)]);
+        assert_eq!(expand_self_guard(body.clone(), SELF), body);
     }
 
     fn opt_with_inline(ops: Vec<IrOp>, bodies: &HashMap<WordId, Vec<IrOp>>) -> Vec<IrOp> {
@@ -758,8 +1025,9 @@ mod tests {
             strength_reduce: true,
             dce: true,
             inline: true,
+            self_guard: false,
         };
-        optimize(ops, &config, bodies)
+        optimize(ops, &config, bodies, None)
     }
 
     // Peephole tests
@@ -1019,8 +1287,9 @@ mod tests {
             strength_reduce: false,
             dce: false,
             inline: true,
+            self_guard: false,
         };
-        let result = optimize(vec![IrOp::Call(WordId(5))], &config, &bodies);
+        let result = optimize(vec![IrOp::Call(WordId(5))], &config, &bodies, None);
         assert_eq!(result, vec![IrOp::Call(WordId(5))]);
     }
 

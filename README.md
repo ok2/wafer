@@ -8,7 +8,7 @@ An optimizing Forth 2012 compiler targeting WebAssembly. WAFER JIT-compiles each
 
 - **200+ words** across 12 Forth 2012 word sets, all at **100% compliance**
 - **Optimizing compiler** with 6 IR passes + stack-to-local promotion (per region, so a hot loop keeps its registers even inside a word that does I/O; `DO` and `BEGIN` loops alike) + consolidation
-- **Faster than gforth** on all benchmarks in release mode (2-10x faster)
+- **Faster than gforth** on all benchmarks in release mode (3-20x), and past SwiftForth `sf64` on all five
 - **JIT compilation** — each `:` definition compiles to its own WASM module
 - **Self-recursive direct calls** — RECURSE compiles to native `call` instead of `call_indirect`
 - **Typed calling convention** — a word with a statically known stack effect passes its stack items as WASM values, so a call keeps them in registers instead of round-tripping through memory
@@ -80,24 +80,23 @@ git submodule update --init
 
 ## Performance
 
-WAFER beats gforth (the GNU Forth reference implementation) on all benchmarks in release mode, and is within
-reach of SwiftForth `sf64`, which compiles to native code:
+WAFER beats gforth (the GNU Forth reference implementation) on all benchmarks in release mode, and
+SwiftForth `sf64`, which compiles to native code, on all five:
 
 ```
 Benchmark                   WAFER     CONSOL     gforth       sf64    WAFER/gf   WAFER/sf
-Fibonacci(25)                 356        361       3389        287       0.11x      1.24x
-Factorial(12)x100K            479        495       6249       1650       0.08x      0.29x
-GCD-bench(20K)                540        559       1801        801       0.30x      0.67x
-NestedLoops(50)x1K            509        501       7023       1887       0.07x      0.27x
-Collatz(2K)                   185        213       3873        610       0.05x      0.30x
+Fibonacci(25)                 237        242       3340        287       0.07x      0.83x
+Factorial(12)x100K            480        479       6109       1594       0.08x      0.30x
+GCD-bench(20K)                549        541       1830        797       0.30x      0.68x
+NestedLoops(50)x1K            501        509       7092       1898       0.07x      0.26x
+Collatz(2K)                   196        190       3955        633       0.05x      0.30x
 ```
 
 Times in microseconds. WAFER/gf < 1.0 means WAFER is faster. CONSOL = after `CONSOLIDATE`.
 
 Two caveats on the `sf64` column. The SwiftForth build here is x86-64 running under Rosetta 2
 while WAFER and gforth are native arm64, so it is a native-vs-emulated comparison; and sf64
-uses 64-bit cells to WAFER's 32-bit. WAFER is ahead on the four loop-heavy benchmarks and
-behind on Fibonacci, which is one call per node with no loop to promote.
+uses 64-bit cells to WAFER's 32-bit.
 
 A word whose stack effect is statically known gets a **typed entry point**: its stack items travel in and out
 as WASM values instead of through the memory data stack, so cranelift keeps them in registers across a call
@@ -106,10 +105,15 @@ table, `EXECUTE` and the outer interpreter reach, so nothing about the memory AB
 Call-heavy code is what this pays for -- Fibonacci went from 4.3x slower than `sf64` to 1.2x. Set
 `WAFER_TYPED_CALLS=0` to fall back to the memory-stack convention.
 
+Recursive words then get one more thing: their base-case guard is tested at the **call site**, so a
+leaf of the recursion costs a comparison instead of a call. `: FIB DUP 2 < IF EXIT THEN ... RECURSE`
+compiles its `RECURSE` as `DUP 2 < IF ELSE RECURSE THEN`, which is what the callee would have done
+on entry anyway. Half of fib's nodes are leaves, and that is the last 1.4x.
+
 ## Testing
 
 ```bash
-# All tests (~628 currently passing)
+# All tests (~635 currently passing)
 cargo test --workspace
 
 # Forth 2012 compliance suite
@@ -142,7 +146,7 @@ Forth Source -> Outer Interpreter -> IR -> [Optimize] -> WASM Codegen (wasm-enco
   - `WebRuntime` — browser WebAssembly API via js-sys, for the browser REPL
 - **Subroutine threading** via WASM function tables (`call_indirect` for cross-word, direct `call` for self-recursion)
 - **JIT mode**: each new word compiles to a separate WASM module linked to shared memory/globals/table
-- **IR-based pipeline** with 6 optimization passes (peephole, constant folding, strength reduction, DCE, tail call detection, inlining) plus per-region stack-to-local promotion (DO and BEGIN loops, IF/ELSE), DO/LOOP index locals, typed entry points for words with a known stack effect, and consolidation
+- **IR-based pipeline** with 6 optimization passes (peephole, constant folding, strength reduction, DCE, tail call detection, inlining) plus per-region stack-to-local promotion (DO and BEGIN loops, IF/ELSE), DO/LOOP index locals, typed entry points for words with a known stack effect, self-guard expansion, and consolidation
 - **Dictionary**: linked-list word headers in simulated linear memory
 
 ## Project Structure

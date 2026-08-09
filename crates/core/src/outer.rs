@@ -2463,8 +2463,13 @@ impl<R: Runtime> ForthVM<R> {
     }
 
     /// Run all enabled optimization passes on an IR sequence.
-    fn optimize_ir(&self, ir: Vec<IrOp>, bodies: &HashMap<WordId, Vec<IrOp>>) -> Vec<IrOp> {
-        optimize(ir, &self.config.opt, bodies)
+    fn optimize_ir(
+        &self,
+        ir: Vec<IrOp>,
+        bodies: &HashMap<WordId, Vec<IrOp>>,
+        self_id: Option<WordId>,
+    ) -> Vec<IrOp> {
+        optimize(ir, &self.config.opt, bodies, self_id)
     }
 
     /// Parse a `{: args | locals -- comment :}` block and compile local
@@ -2576,7 +2581,7 @@ impl<R: Runtime> ForthVM<R> {
 
         let ir = std::mem::take(&mut self.compiling_ir);
         let bodies = self.ir_bodies.clone();
-        let ir = self.optimize_ir(ir, &bodies);
+        let ir = self.optimize_ir(ir, &bodies, Some(word_id));
         self.ir_bodies.insert(word_id, ir.clone());
 
         // Compile to WASM
@@ -2992,7 +2997,7 @@ impl<R: Runtime> ForthVM<R> {
         ir_body: Vec<IrOp>,
     ) -> anyhow::Result<WordId> {
         let bodies = self.ir_bodies.clone();
-        let ir_body = self.optimize_ir(ir_body, &bodies);
+        let ir_body = self.optimize_ir(ir_body, &bodies, None);
         let word_id = self
             .dictionary
             .create(name, immediate)
@@ -8288,6 +8293,36 @@ mod tests {
         // printed "4 4" and "3 2 3" before. gforth: "4 3" and "2 1 3".
         assert_eq!(eval_output(": C 3 4 2 0 DO SWAP LOOP . . ; C"), "4 3 ");
         assert_eq!(eval_output(": D 1 2 3 2 0 DO ROT LOOP . . . ; D"), "2 1 3 ");
+    }
+
+    #[test]
+    fn test_self_guard_expansion_keeps_the_answers() {
+        // The base-case guard is tested at the call site, so a leaf never
+        // costs a call. All four verified against gforth.
+        assert_eq!(
+            eval_output(
+                ": FIB DUP 2 < IF EXIT THEN DUP 1- RECURSE SWAP 2 - RECURSE + ; \
+                 25 FIB . 0 FIB . 1 FIB . 2 FIB . 10 FIB ."
+            ),
+            "75025 0 1 1 55 "
+        );
+        // A guard that replaces its argument rather than leaving it.
+        assert_eq!(
+            eval_output(": G DUP 0= IF DROP 0 EXIT THEN DUP 1- RECURSE + ; 5 G . 0 G . 100 G ."),
+            "15 0 5050 "
+        );
+        assert_eq!(
+            eval_output(": H DUP 3 < IF DROP 7 EXIT THEN 1- RECURSE 2 * ; 5 H . 2 H . 8 H ."),
+            "56 7 448 "
+        );
+        // Two guards and three call sites, one of them behind the second guard.
+        assert_eq!(
+            eval_output(
+                ": ACK OVER 0= IF SWAP DROP 1+ EXIT THEN DUP 0= IF DROP 1- 1 RECURSE EXIT THEN \
+                 OVER SWAP 1- RECURSE SWAP 1- SWAP RECURSE ; 2 3 ACK . 1 2 ACK ."
+            ),
+            "9 4 "
+        );
     }
 
     #[test]

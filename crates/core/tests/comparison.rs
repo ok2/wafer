@@ -746,7 +746,7 @@ fn perf_benchmarks() -> Vec<PerfBenchmark> {
             verify: "25 FIB",
             expected: 75025,
             samples: 5,
-            max_ratio: 0.17,
+            max_ratio: 0.10,
         },
         PerfBenchmark {
             name: "Factorial(12)x100K",
