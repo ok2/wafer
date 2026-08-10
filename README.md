@@ -8,7 +8,7 @@ An optimizing Forth 2012 compiler targeting WebAssembly. WAFER JIT-compiles each
 
 - **200+ words** across 12 Forth 2012 word sets, all at **100% compliance**
 - **Optimizing compiler** with 6 IR passes + stack-to-local promotion (per region, so a hot loop keeps its registers even inside a word that does I/O; `DO` and `BEGIN` loops alike) + consolidation
-- **Faster than gforth** on all benchmarks in release mode (3-20x), and past SwiftForth `sf64` on all five
+- **Faster than gforth** on every benchmark, and past SwiftForth `sf64` -- a native-code compiler -- on four of five
 - **JIT compilation** — each `:` definition compiles to its own WASM module
 - **Self-recursive direct calls** — RECURSE compiles to native `call` instead of `call_indirect`
 - **Typed calling convention** — a word with a statically known stack effect passes its stack items as WASM values, so a call keeps them in registers instead of round-tripping through memory
@@ -80,8 +80,29 @@ git submodule update --init
 
 ## Performance
 
-WAFER beats gforth (the GNU Forth reference implementation) on all benchmarks in release mode, and
-SwiftForth `sf64`, which compiles to native code, on all five:
+WAFER beats gforth (the GNU Forth reference implementation) on every benchmark, and SwiftForth
+`sf64` -- which compiles to native code -- on four of the five.
+
+Measured with all three engines running **native x86-64**, on an idle 16-vCPU Xeon Platinum 8124M
+@ 3.0 GHz (median of three runs):
+
+```
+Benchmark                   WAFER     gforth       sf64    WAFER/gf   WAFER/sf
+Fibonacci(25)                 411       3221        355       0.13x      1.16x
+Factorial(12)x100K            994       7141       3058       0.14x      0.33x
+GCD-bench(20K)               1591       3211       2423       0.50x      0.66x
+NestedLoops(50)x1K            889       6824       2342       0.13x      0.38x
+Collatz(2K)                   391       3981       1659       0.10x      0.24x
+```
+
+Times in microseconds; WAFER is the better of the JIT and `CONSOLIDATE` runs. Below 1.0 means WAFER
+is faster. Fibonacci is the one WAFER loses: it is one call per node with no loop to promote, and
+`sf64` keeps its stack in registers across a call the way only a native code generator can.
+Fibonacci, GCD and Collatz held to within 2% across the three runs; Factorial and NestedLoops are
+softer, since `sf64` varied by half there, but they are wide wins either way.
+
+`just bench-compare` on the development machine (M1 Ultra, arm64) reports different numbers, and
+they flatter WAFER:
 
 ```
 Benchmark                   WAFER     CONSOL     gforth       sf64    WAFER/gf   WAFER/sf
@@ -92,11 +113,14 @@ NestedLoops(50)x1K            501        509       7092       1898       0.07x  
 Collatz(2K)                   196        190       3955        633       0.05x      0.30x
 ```
 
-Times in microseconds. WAFER/gf < 1.0 means WAFER is faster. CONSOL = after `CONSOLIDATE`.
+The only SwiftForth build for macOS is x86-64 under Rosetta 2, while WAFER and gforth are native
+arm64 -- so that `sf64` column is native against emulated. The gap is not small, and it lands
+exactly where it matters: Fibonacci reads 0.83x there and 1.16x when neither engine is emulated.
+Treat the arm64 table as what the regression limits in `comparison.rs` are calibrated against, and
+the x86-64 table as what to believe about the engines.
 
-Two caveats on the `sf64` column. The SwiftForth build here is x86-64 running under Rosetta 2
-while WAFER and gforth are native arm64, so it is a native-vs-emulated comparison; and sf64
-uses 64-bit cells to WAFER's 32-bit.
+A caveat applies to both: `sf64` uses 64-bit cells to WAFER's 32-bit, so WAFER does less work per
+operation.
 
 A word whose stack effect is statically known gets a **typed entry point**: its stack items travel in and out
 as WASM values instead of through the memory data stack, so cranelift keeps them in registers across a call
@@ -108,7 +132,7 @@ Call-heavy code is what this pays for -- Fibonacci went from 4.3x slower than `s
 Recursive words then get one more thing: their base-case guard is tested at the **call site**, so a
 leaf of the recursion costs a comparison instead of a call. `: FIB DUP 2 < IF EXIT THEN ... RECURSE`
 compiles its `RECURSE` as `DUP 2 < IF ELSE RECURSE THEN`, which is what the callee would have done
-on entry anyway. Half of fib's nodes are leaves, and that is the last 1.4x.
+on entry anyway. Half of fib's nodes are leaves, and that is worth 1.4x.
 
 ## Testing
 

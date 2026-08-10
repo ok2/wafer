@@ -5,7 +5,7 @@ All notable changes to WAFER are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.8] - 2026-08-10
 
 ### Added
 
@@ -17,8 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which computes the same thing: the callee would have run the guard, taken
   the branch and returned. In fib's tree the leaves are half of all nodes.
 
-  Fibonacci(25) 356 -> 237 µs, which takes the last benchmark that was behind
-  SwiftForth `sf64` past it: 1.24x -> 0.83x, five of five.
+  Fibonacci(25) 356 -> 237 µs on the arm64 development machine, where that
+  reads 1.24x -> 0.83x of SwiftForth `sf64`. Measured again with **both
+  engines native on x86-64** -- the macOS `sf64` build runs under Rosetta 2,
+  which flatters WAFER -- Fibonacci is 1.16x, so it remains the one benchmark
+  of the five that `sf64` wins. See the two tables in the README.
 
   The guard runs twice along the recursive path, so it has to be small (at
   most six operations) and free of effects -- no calls, no memory, no
@@ -360,6 +363,7 @@ compliance suite, `CONSOLIDATE` whole-program recompilation, `wafer build`
 AOT export (WASM / native / JS loader), browser REPL, SHA-1/256/512 words,
 and cross-engine benchmark lanes against gforth and SwiftForth.
 
+[0.2.8]: https://github.com/ok2/wafer/compare/v0.2.7...v0.2.8
 [0.2.7]: https://github.com/ok2/wafer/compare/v0.2.6...v0.2.7
 [0.2.1]: https://github.com/ok2/wafer/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/ok2/wafer/compare/v0.1.0...v0.2.0

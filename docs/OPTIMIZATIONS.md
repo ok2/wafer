@@ -511,11 +511,26 @@ The guard runs twice along the recursive path: once at the call site, once insid
 
 ### Impact
 
-Fibonacci(25): 356 to 237 microseconds. In fib's tree half of all nodes are leaves, which is where the factor comes from. This is what took the last benchmark past `sf64`.
+Fibonacci(25): 356 to 237 microseconds on the arm64 development machine. In fib's tree half of all nodes are leaves, which is where the factor comes from. It does not take Fibonacci past `sf64`, though the arm64 table below says otherwise: with both engines native on x86-64, Fibonacci reads 1.16x and stays the one benchmark `sf64` wins.
 
 ## Current Performance vs Gforth
 
 All optimizations enabled, release mode, measured with UTIME:
+
+All three engines **native x86-64**, idle 16-vCPU Xeon Platinum 8124M @ 3.0 GHz,
+median of three runs:
+
+```
+Benchmark                   WAFER     gforth       sf64    WAFER/gf   WAFER/sf
+Fibonacci(25)                 411       3221        355       0.13x      1.16x
+Factorial(12)x100K            994       7141       3058       0.14x      0.33x
+GCD-bench(20K)               1591       3211       2423       0.50x      0.66x
+NestedLoops(50)x1K            889       6824       2342       0.13x      0.38x
+Collatz(2K)                   391       3981       1659       0.10x      0.24x
+```
+
+The same suite on the arm64 development machine (M1 Ultra), which is what the
+regression limits in `comparison.rs` are calibrated against:
 
 ```
 Benchmark                   WAFER     CONSOL     gforth       sf64    WAFER/gf   WAFER/sf
@@ -526,11 +541,12 @@ NestedLoops(50)x1K            501        509       7092       1898       0.07x  
 Collatz(2K)                   196        190       3955        633       0.05x      0.30x
 ```
 
-Times in microseconds. WAFER/gf < 1.0 means WAFER is faster. `sf64` is SwiftForth,
-which compiles to native code; two caveats on that column. The install here is an
-x86-64 binary under Rosetta 2 while WAFER and gforth are native arm64, so it is a
-native-vs-emulated comparison and a native SwiftForth would be faster than these
-numbers; and sf64 uses 64-bit cells to WAFER's 32-bit.
+Times in microseconds. WAFER/gf < 1.0 means WAFER is faster. The two tables
+disagree because the only SwiftForth build for macOS is x86-64 under Rosetta 2
+while WAFER and gforth are native arm64 -- and the emulation penalty lands
+hardest on the call-heavy benchmark, so Fibonacci reads 0.83x on arm64 and 1.16x
+when neither engine is emulated. Believe the x86-64 table about the engines. One
+caveat holds for both: sf64 uses 64-bit cells to WAFER's 32-bit.
 
 ## Remaining Opportunities
 
