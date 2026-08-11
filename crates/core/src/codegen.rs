@@ -1584,6 +1584,48 @@ fn is_promotable_body(ops: &[IrOp], mode: PromoteMode) -> bool {
     true
 }
 
+/// Does `ops` call `target` at any nesting depth?
+///
+/// In the JIT path this decides whether a typed entry is worth emitting at
+/// all: the table slot holds the `( -- )` wrapper, so the only caller that can
+/// reach the fast entry is the word itself.
+fn body_calls(ops: &[IrOp], target: WordId) -> bool {
+    ops.iter().any(|op| match op {
+        IrOp::Call(id) | IrOp::TailCall(id) => *id == target,
+        IrOp::If {
+            then_body,
+            else_body,
+        } => {
+            body_calls(then_body, target)
+                || else_body
+                    .as_deref()
+                    .is_some_and(|eb| body_calls(eb, target))
+        }
+        IrOp::DoLoop { body, .. } | IrOp::BeginUntil { body } | IrOp::BeginAgain { body } => {
+            body_calls(body, target)
+        }
+        IrOp::BeginWhileRepeat { test, body } => {
+            body_calls(test, target) || body_calls(body, target)
+        }
+        IrOp::BeginDoubleWhileRepeat {
+            outer_test,
+            inner_test,
+            body,
+            after_repeat,
+            else_body,
+        } => {
+            body_calls(outer_test, target)
+                || body_calls(inner_test, target)
+                || body_calls(body, target)
+                || body_calls(after_repeat, target)
+                || else_body
+                    .as_deref()
+                    .is_some_and(|eb| body_calls(eb, target))
+        }
+        _ => false,
+    })
+}
+
 /// Does `ops` contain an `EXIT` at any nesting depth?
 fn body_has_exit(ops: &[IrOp]) -> bool {
     ops.iter().any(|op| match op {
@@ -3274,12 +3316,16 @@ pub fn compile_word(
     let mut module = Module::new();
 
     // A word whose stack effect is statically known gets a second, typed
-    // entry point; the self-recursive case is the one that pays, since the
-    // recursion then runs entirely in WASM values. Cross-word typed calls
-    // need every callee in the same module, which only CONSOLIDATE gives.
+    // entry point -- but only if it calls itself. Cross-word typed calls need
+    // every callee in the same module, which only CONSOLIDATE gives, so here
+    // the table slot holds the `( -- )` wrapper and no other word can reach
+    // the fast entry. Emitting the pair anyway just puts a wrapper hop in
+    // front of every call through the table, for the same memory traffic:
+    // measured at +47% on a 300k-iteration loop over a callee too big to
+    // inline. `RECURSE` is the one caller that does reach it, and there the
+    // convention is worth 4x.
     let self_id = WordId(config.base_fn_index);
-    let typed = config
-        .typed_calls
+    let typed = (config.typed_calls && body_calls(body, self_id))
         .then(|| typed_effect(body, Some(self_id), &HashMap::new()))
         .flatten();
 
@@ -3483,6 +3529,23 @@ pub fn compile_word(
 /// The name section carries the Forth word name into wasmtime trap
 /// backtraces (best-effort symbolication, WS-008); a typed word names both
 /// of its entries so the innermost frame is the one that reports.
+/// Write a compiled module to `$WAFER_DUMP_WASM/<name>.wasm` when that
+/// variable is set.
+///
+/// Reading the emitted code is the only way some questions get answered --
+/// three separate investigations have needed this and re-added it by hand each
+/// time, so it lives here now. `wasm-tools print` turns the output into wat.
+fn maybe_dump(name: &str, bytes: &[u8]) {
+    let Ok(dir) = std::env::var("WAFER_DUMP_WASM") else {
+        return;
+    };
+    let safe: String = name
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+        .collect();
+    let _ = std::fs::write(format!("{dir}/{safe}.wasm"), bytes);
+}
+
 fn finish_word_module(
     mut module: Module,
     name: &str,
@@ -3504,6 +3567,7 @@ fn finish_word_module(
     module.section(&names);
 
     let bytes = module.finish();
+    maybe_dump(name, &bytes);
 
     // Validate
     wasmparser::validate(&bytes).map_err(|e| {
@@ -4113,6 +4177,7 @@ fn compile_multi_word_module(
     }
 
     let bytes = module.finish();
+    maybe_dump("CONSOLIDATED", &bytes);
 
     // Validate
     wasmparser::validate(&bytes)
@@ -5297,6 +5362,77 @@ mod tests {
             IrOp::Call(self_id),
             IrOp::Add,
         ]
+    }
+
+    #[test]
+    fn body_calls_finds_the_word_at_any_depth() {
+        let me = WordId(5);
+        assert!(body_calls(&fib_ir(me), me));
+        assert!(!body_calls(&fib_ir(me), WordId(6)));
+        assert!(!body_calls(&[IrOp::Dup, IrOp::Mul], me));
+
+        // Nested in every body-bearing op, since the JIT gate reads this to
+        // decide whether a typed entry can ever be reached.
+        assert!(body_calls(
+            &[IrOp::DoLoop {
+                body: vec![IrOp::Call(me)],
+                is_plus_loop: false,
+            }],
+            me
+        ));
+        assert!(body_calls(
+            &[IrOp::If {
+                then_body: vec![IrOp::Dup],
+                else_body: Some(vec![IrOp::TailCall(me)]),
+            }],
+            me
+        ));
+        assert!(body_calls(
+            &[IrOp::BeginWhileRepeat {
+                test: vec![IrOp::Dup],
+                body: vec![IrOp::Call(me)],
+            }],
+            me
+        ));
+        assert!(body_calls(
+            &[IrOp::BeginUntil {
+                body: vec![IrOp::Call(me)],
+            }],
+            me
+        ));
+    }
+
+    #[test]
+    fn jit_gives_a_typed_entry_only_to_a_self_recursive_word() {
+        // The table slot holds the `( -- )` wrapper, so nothing but the word
+        // itself can reach the fast entry. Emitting it for a word that never
+        // recurses just adds a wrapper hop to every call through the table --
+        // measured at +47% on a hot cross-word call.
+        let id = 5;
+        let cfg = |typed| CodegenConfig {
+            base_fn_index: id,
+            table_size: 256,
+            stack_to_local_promotion: true,
+            stack_guards: None,
+            typed_calls: typed,
+        };
+        // `DUP *` has a perfectly good effect ( n -- n ) and no self-call.
+        let square = [IrOp::Dup, IrOp::Mul];
+        let plain = compile_word("SQ", &square, &cfg(true)).expect("compiles");
+        let untyped = compile_word("SQ", &square, &cfg(false)).expect("compiles");
+        assert_eq!(
+            plain.bytes, untyped.bytes,
+            "a word that never calls itself must compile the same with typed calls on or off"
+        );
+
+        // FIB does recurse, so it keeps the pair and must differ.
+        let fib = fib_ir(WordId(id));
+        let typed = compile_word("FIB", &fib, &cfg(true)).expect("compiles");
+        let memory = compile_word("FIB", &fib, &cfg(false)).expect("compiles");
+        assert_ne!(
+            typed.bytes, memory.bytes,
+            "self-recursion should still get a fast entry"
+        );
     }
 
     #[test]
