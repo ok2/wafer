@@ -731,7 +731,6 @@ struct PerfBenchmark {
     run_code: &'static str,
     verify: &'static str,
     expected: i32,
-    samples: u32, // Number of runs for WAFER median
     /// Maximum acceptable WAFER/gforth ratio (< 1.0 = WAFER faster).
     /// Test fails if ratio exceeds this. Set ~40-50% above measured baseline.
     max_ratio: f64,
@@ -740,54 +739,67 @@ struct PerfBenchmark {
 fn perf_benchmarks() -> Vec<PerfBenchmark> {
     vec![
         PerfBenchmark {
-            name: "Fibonacci(25)",
+            name: "Fibonacci(33)",
             define: ": FIB DUP 2 < IF EXIT THEN DUP 1- RECURSE SWAP 2 - RECURSE + ;",
-            run_code: "25 FIB DROP",
-            verify: "25 FIB",
-            expected: 75025,
-            samples: 5,
+            run_code: "33 FIB DROP",
+            verify: "33 FIB",
+            expected: 3524578,
             max_ratio: 0.10,
         },
         PerfBenchmark {
-            name: "Factorial(12)x100K",
+            name: "Factorial(12)x2M",
             define: ": FACT 1 SWAP 1+ 1 ?DO I * LOOP ; \
-                     : FACT-BENCH 100000 0 DO 12 FACT DROP LOOP ;",
+                     : FACT-BENCH 2000000 0 DO 12 FACT DROP LOOP ;",
             run_code: "FACT-BENCH",
             verify: "12 FACT",
             expected: 479001600,
-            samples: 5,
             max_ratio: 0.12,
         },
         PerfBenchmark {
-            name: "GCD-bench(20K)",
+            name: "GCD-bench(400K)",
             define: ": GCD BEGIN DUP WHILE TUCK MOD REPEAT DROP ; \
                      : GCD-BENCH 0 DO 10000 I 1+ GCD DROP LOOP ;",
-            run_code: "20000 GCD-BENCH",
+            run_code: "400000 GCD-BENCH",
             verify: "48 36 GCD",
             expected: 12,
-            samples: 5,
             max_ratio: 0.45,
         },
         PerfBenchmark {
-            name: "NestedLoops(50)x1K",
+            name: "NestedLoops(50)x20K",
             define: ": NESTED 0 SWAP 0 DO I 0 ?DO I J + DROP LOOP LOOP ; \
-                     : NESTED-BENCH 1000 0 DO 50 NESTED DROP LOOP ;",
+                     : NESTED-BENCH 20000 0 DO 50 NESTED DROP LOOP ;",
             run_code: "NESTED-BENCH",
             verify: "5 NESTED",
             expected: 0,
-            samples: 5,
             max_ratio: 0.11,
         },
         PerfBenchmark {
-            name: "Collatz(2K)",
+            // The only benchmark with a cross-word call left in its hot loop:
+            // WORK is over the inliner's eight-operation budget, so it stays a
+            // real call. That is what CONSOLIDATE exists to turn into a direct
+            // one, and without this the CONSOL column measures nothing -- every
+            // other benchmark has its callee inlined away or self-recursive.
+            name: "CrossCalls(3M)",
+            define: ": WORK DUP 3 * OVER XOR SWAP 2 / XOR DUP 7 AND XOR DUP 1 AND XOR ; \
+                     : CROSS-BENCH 0 SWAP 0 DO I WORK XOR LOOP ;",
+            run_code: "3000000 CROSS-BENCH DROP",
+            verify: "1000 CROSS-BENCH",
+            expected: 3176,
+            // Guards CONSOLIDATE as much as the engine: the ratio uses the
+            // better of the two columns, so a consolidation regression here
+            // pushes it from 0.04 to 0.12 and trips the limit.
+            max_ratio: 0.08,
+        },
+        PerfBenchmark {
+            name: "Collatz(2K)x50",
             define: ": COLLATZ 0 SWAP BEGIN DUP 1 > WHILE \
                      DUP 1 AND IF 3 * 1+ ELSE 2 / THEN \
                      SWAP 1+ SWAP REPEAT DROP ; \
-                     : COLLATZ-BENCH 0 DO I 1+ COLLATZ DROP LOOP ;",
-            run_code: "2000 COLLATZ-BENCH",
+                     : COLLATZ-BENCH 0 DO I 1+ COLLATZ DROP LOOP ; \
+                     : COLLATZ-REPEAT 50 0 DO 2000 COLLATZ-BENCH LOOP ;",
+            run_code: "COLLATZ-REPEAT",
             verify: "27 COLLATZ",
             expected: 111,
-            samples: 3,
             max_ratio: 0.08,
         },
     ]
@@ -833,15 +845,16 @@ fn measure_wafer_release(wafer: &str, bench: &PerfBenchmark) -> Option<u64> {
     let code = format!(
         "{define} {run} \
          : TIMED-BENCH UTIME {run} UTIME 2SWAP D- DROP . CR ; \
-         TIMED-BENCH TIMED-BENCH TIMED-BENCH",
+         {reps}",
         define = bench.define,
         run = bench.run_code,
+        reps = repeat_timed(" "),
     );
     let output = run_via_stdin(wafer, &code)?;
     if !output.status.success() {
         return None;
     }
-    median_printed_time(&output.stdout)
+    best_of_printed_times(&output.stdout)
 }
 
 /// Measure WAFER execution time after CONSOLIDATE (direct calls between all words).
@@ -849,31 +862,70 @@ fn measure_wafer_consolidated(wafer: &str, bench: &PerfBenchmark) -> Option<u64>
     let code = format!(
         "{define} CONSOLIDATE {run} \
          : TIMED-BENCH UTIME {run} UTIME 2SWAP D- DROP . CR ; \
-         TIMED-BENCH TIMED-BENCH TIMED-BENCH",
+         {reps}",
         define = bench.define,
         run = bench.run_code,
+        reps = repeat_timed(" "),
     );
     let output = run_via_stdin(wafer, &code)?;
     if !output.status.success() {
         return None;
     }
-    median_printed_time(&output.stdout)
+    best_of_printed_times(&output.stdout)
 }
 
-/// Parse the microsecond values printed by TIMED-BENCH (one per line) and
-/// return the median.
-fn median_printed_time(stdout: &[u8]) -> Option<u64> {
+/// How many separate process invocations each measurement takes the best of.
+///
+/// `REPS`/`BEST_OF` deal with noise *inside* one process. They do not touch
+/// the rest: whether a process lands on a core whose SMT sibling is busy, and
+/// where its code ends up in memory, are fixed for its lifetime, and they make
+/// some benchmarks frankly bimodal -- Fibonacci after CONSOLIDATE measured
+/// 413-419 us in three runs of the report and 712-770 in the other two, with
+/// nothing in between. Only a fresh process resamples that.
+const PROCESS_RUNS: usize = 3;
+/// How many timed repetitions each engine runs per benchmark.
+const REPS: usize = 7;
+/// How many of the fastest repetitions the reported time averages over.
+const BEST_OF: usize = 3;
+
+/// Run `measure` in `PROCESS_RUNS` fresh processes and keep the fastest.
+///
+/// The minimum, not a mean: process-level noise is one-sided too, so the
+/// fastest process is the one that ran closest to undisturbed.
+fn best_of_processes(mut measure: impl FnMut() -> Option<u64>) -> Option<u64> {
+    (0..PROCESS_RUNS).filter_map(|_| measure()).min()
+}
+
+/// `TIMED-BENCH` repeated `REPS` times, separated by `sep`.
+///
+/// sf64 needs one statement per line (it truncates input at ~256 characters);
+/// the others do not care.
+fn repeat_timed(sep: &str) -> String {
+    vec!["TIMED-BENCH"; REPS].join(sep)
+}
+
+/// Parse the microsecond values printed by `TIMED-BENCH` and reduce them to
+/// one number: the mean of the fastest `BEST_OF`.
+///
+/// Not the median, and not the mean of all of them. Benchmark noise on a
+/// shared machine is one-sided -- a scheduling hiccup, an SMT sibling or a
+/// migration can only ever make a run slower, never faster -- so the fastest
+/// repetitions are the ones closest to the cost we are trying to measure.
+/// Averaging a few of them rather than taking the single minimum keeps one
+/// lucky run from setting the result on its own.
+fn best_of_printed_times(stdout: &[u8]) -> Option<u64> {
     let stdout = String::from_utf8_lossy(stdout);
     let mut times: Vec<u64> = stdout
         .trim()
         .lines()
         .filter_map(|l| l.trim().parse::<u64>().ok())
         .collect();
-    times.sort();
     if times.is_empty() {
         return None;
     }
-    Some(times[times.len() / 2])
+    times.sort_unstable();
+    let n = times.len().min(BEST_OF);
+    Some(times[..n].iter().sum::<u64>() / n as u64)
 }
 
 /// Measure gforth execution time using Forth-level `utime` (excludes startup).
@@ -881,19 +933,19 @@ fn median_printed_time(stdout: &[u8]) -> Option<u64> {
 /// Returns microseconds, or None if gforth is unavailable.
 fn measure_gforth(gforth: &str, bench: &PerfBenchmark) -> Option<u64> {
     // The timing wrapper must be inside a word (DO/LOOP is compile-only in gforth).
-    // We take the median of 3 runs.
     let code = format!(
         "{define} {run} \
          : TIMED-BENCH utime {run} utime 2swap d- drop . CR ; \
-         TIMED-BENCH TIMED-BENCH TIMED-BENCH bye",
+         {reps} bye",
         define = bench.define,
         run = bench.run_code,
+        reps = repeat_timed(" "),
     );
     let output = Command::new(gforth).arg("-e").arg(&code).output().ok()?;
     if !output.status.success() {
         return None;
     }
-    median_printed_time(&output.stdout)
+    best_of_printed_times(&output.stdout)
 }
 
 /// Measure `SwiftForth` (`sf64`) execution time using Forth-level `ucounter`
@@ -906,15 +958,16 @@ fn measure_sf64(sf64: &str, bench: &PerfBenchmark) -> Option<u64> {
     let code = format!(
         "{define}\n{run}\n\
          : TIMED-BENCH ucounter {run} ucounter 2swap d- drop . cr ;\n\
-         TIMED-BENCH\nTIMED-BENCH\nTIMED-BENCH\nbye\n",
+         {reps}\nbye\n",
         define = bench.define,
         run = bench.run_code,
+        reps = repeat_timed("\n"),
     );
     let output = run_via_stdin(sf64, &code)?;
     if !output.status.success() {
         return None;
     }
-    median_printed_time(&output.stdout)
+    best_of_printed_times(&output.stdout)
 }
 
 #[test]
@@ -987,14 +1040,14 @@ fn performance_report() {
 
     for bench in &benchmarks {
         let wafer = wafer_release
-            .and_then(|w| measure_wafer_release(w, bench))
+            .and_then(|w| best_of_processes(|| measure_wafer_release(w, bench)))
             .unwrap_or(0);
         let consol = wafer_release
-            .and_then(|w| measure_wafer_consolidated(w, bench))
+            .and_then(|w| best_of_processes(|| measure_wafer_consolidated(w, bench)))
             .unwrap_or(0);
-        let gf = gforth.and_then(|g| measure_gforth(g, bench));
-        let gf_fast = gforth_fast.and_then(|g| measure_gforth(g, bench));
-        let sf = sf64.and_then(|s| measure_sf64(s, bench));
+        let gf = gforth.and_then(|g| best_of_processes(|| measure_gforth(g, bench)));
+        let gf_fast = gforth_fast.and_then(|g| best_of_processes(|| measure_gforth(g, bench)));
+        let sf = sf64.and_then(|s| best_of_processes(|| measure_sf64(s, bench)));
 
         let gf_str = gf.map_or_else(|| "-".to_string(), |v| format!("{v}"));
         let gf_fast_str = gf_fast.map_or_else(|| "-".to_string(), |v| format!("{v}"));
