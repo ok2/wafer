@@ -61,6 +61,14 @@ pub fn optimize(
         // inlined loop down with it, so leave those callees where they are:
         // as their own word the loop keeps its registers, and one call is far
         // cheaper than a loop's worth of memory traffic.
+        //
+        // This takes two passes, because before the primitives are substituted
+        // the caller is nothing but `Call`s -- `DROP` and `CR` included -- and
+        // the promotability check deliberately looks through calls. Asked too
+        // early it says "promotable" about almost anything, which is how this
+        // guard managed to be a no-op. Inline the loop-free callees first, then
+        // ask, then let the loop-bearing ones in if the answer was yes.
+        ir = inline(ir, bodies, 8, true);
         let keep_loops_out = !crate::codegen::promotable_modulo_calls(&ir);
         ir = inline(ir, bodies, 8, keep_loops_out);
     }
@@ -1015,6 +1023,49 @@ mod tests {
     fn self_guard_leaves_tail_calls_alone() {
         let body = guarded_body(vec![IrOp::TailCall(SELF)]);
         assert_eq!(expand_self_guard(body.clone(), SELF), body);
+    }
+
+    #[test]
+    fn a_loop_stays_out_of_a_caller_that_is_only_unpromotable_through_a_call() {
+        // The shape the benchmark harness uses, and the one that made this
+        // guard a no-op for its whole life: at the moment the guard runs, the
+        // caller's `CR` is still `Call(cr_word)`, not `IrOp::Cr`. A test built
+        // from `IrOp::Cr` directly passes even with the bug.
+        let cross = WordId(7);
+        let cr = WordId(9);
+        let mut bodies = HashMap::new();
+        bodies.insert(cr, vec![IrOp::Cr]);
+        bodies.insert(
+            cross,
+            vec![
+                IrOp::PushI32(0),
+                IrOp::Swap,
+                IrOp::PushI32(0),
+                IrOp::DoLoop {
+                    body: vec![IrOp::RFetch, IrOp::Call(WordId(8)), IrOp::Xor],
+                    is_plus_loop: false,
+                },
+            ],
+        );
+        let out = opt_with_inline(
+            vec![
+                IrOp::PushI32(300000),
+                IrOp::Call(cross),
+                IrOp::Drop,
+                IrOp::Call(cr),
+            ],
+            &bodies,
+        );
+        assert!(
+            out.iter()
+                .any(|op| matches!(op, IrOp::Call(id) if *id == cross)),
+            "a loop-bearing callee must not be inlined into a caller that cannot \
+             be promoted -- it would lose its registers: {out:?}"
+        );
+        assert!(
+            out.iter().any(|op| matches!(op, IrOp::Cr)),
+            "the loop-free callee should still have been inlined: {out:?}"
+        );
     }
 
     fn opt_with_inline(ops: Vec<IrOp>, bodies: &HashMap<WordId, Vec<IrOp>>) -> Vec<IrOp> {
