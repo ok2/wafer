@@ -1589,7 +1589,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "wafer"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "anyhow",
  "clap",
@@ -1600,7 +1600,7 @@ dependencies = [
 
 [[package]]
 name = "wafer-core"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "anyhow",
  "insta",
@@ -1615,7 +1615,7 @@ dependencies = [
 
 [[package]]
 name = "wafer-web"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "anyhow",
  "js-sys",

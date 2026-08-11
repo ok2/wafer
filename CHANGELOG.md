@@ -5,6 +5,83 @@ All notable changes to WAFER are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.9] - 2026-08-10
+
+### Fixed
+
+- **A word that never recurses no longer gets a typed entry it cannot use.**
+  Every word with a statically known stack effect was given the typed
+  wrapper + fast-entry pair. In the JIT path the function-table slot holds
+  the wrapper and the only caller that can reach the fast entry is
+  `RECURSE`, so for any other word a cross-word call went
+  `call_indirect` -> wrapper -> fast entry: one hop more for exactly the
+  same memory traffic. On a 300k-iteration loop over a callee too big to
+  inline that cost **1569 µs against 1067 with the convention off** -- an
+  optimisation making things worse. It is now emitted only when the body
+  calls itself, which is where it is worth 4x (Fibonacci 242 µs typed
+  against 636 untyped). `CONSOLIDATE` and the AOT export are unaffected;
+  they solve their effects separately. Present in 0.2.7 and 0.2.8.
+
+- **The inliner's loop guard has never actually fired.** 0.2.7 added a rule
+  that a loop-bearing callee must not be inlined into a caller that can
+  never be promoted, since the loop then loses its registers -- a 7x
+  pessimisation applied by an optimisation pass. The check ran _before_
+  inlining, where the caller is nothing but calls: `DROP` is
+  `Call(WordId(2))`, `CR` is `Call(WordId(38))`. Since the check looks
+  through calls by design, it called nearly every caller promotable and
+  the guard did nothing. Inlining now happens in two passes -- loop-free
+  callees first, then the question, then the rest.
+
+### Added
+
+- **A sixth benchmark, `CrossCalls(300K)`, that measures what `CONSOLIDATE`
+  does.** The other five have no cross-word call left in their hot loop:
+  four have their callee inlined away and Fibonacci is self-recursive. So
+  the `CONSOL` column measured nothing, which is how both bugs above stayed
+  hidden. With a real call in the loop, consolidation is worth 2.8-4x.
+
+### Changed
+
+- **The benchmark harness stops reporting noise.** It took the median of three
+  timed repetitions inside one process, and a `samples` field that was never
+  read. Each measurement is now the mean of the three fastest of seven
+  repetitions, and that whole process runs three times with the fastest kept.
+  Benchmark noise is one-sided -- a scheduling hiccup or a busy SMT sibling can
+  only make a run slower -- so the fastest runs are the honest ones, and only a
+  fresh process resamples core placement and code layout. On a shared 16-vCPU
+  box the run-to-run spread went from 20-79% to 1-6%, and Fibonacci after
+  `CONSOLIDATE` stopped being bimodal (413-419 µs on three reports and 712-770
+  on two, with nothing in between; now 412-426 across four).
+
+- **Every benchmark is now sized to run about 10 ms**, from the 0.2-2 ms most
+  of them took. Not for the usual reason -- the timing wrapper already excludes
+  start-up and compilation, and in the measurements shorter benchmarks were if
+  anything the _steadier_ ones -- but it buys a comfortable margin over timer
+  resolution and first-iteration effects for nothing: the report still finishes
+  in under a minute, and gforth, 3-20x slower than WAFER, is what sets that
+  clock. Fibonacci went from 25 to 33 rather than into a loop, so it stays pure
+  recursion; Collatz repeats its 2000-value round 50 times instead of counting
+  higher, because past ~100000 the sequence peaks near 1.5 billion and `3 * 1+`
+  overflows WAFER's 32-bit cells while sf64's 64-bit cells carry on -- the two
+  engines would stop doing the same work. All three engines agree on the results
+  at the new sizes.
+
+### Explained
+
+- **Why `CONSOLIDATE` makes some promoted loops slower** (NestedLoops
+  1.7x on x86-64, 1.1x on arm64): not worse code -- the WASM is
+  byte-identical and the machine code instruction-identical modulo
+  registers -- but worse placement. A tight loop pays for straddling an
+  instruction-fetch window (16 bytes on the M1 at ~9%; 32 bytes on
+  Skylake at up to ~65%, where a fused `cmp+jcc` crossing the boundary
+  drops the loop out of the uop cache every iteration -- the JCC
+  erratum). Cranelift never aligns loop headers, and the per-word JIT
+  module's dead dsp-prologue bytes happen to shift its loops onto
+  luckier offsets. Verified by a padding sweep that reproduces the full
+  penalty range on both hosts, including placements where consolidated
+  code beats the JIT. Details in docs/OPTIMIZATIONS.md; native x86-64
+  reference numbers in the README re-taken at the new workload sizes.
+
 ## [0.2.8] - 2026-08-10
 
 ### Added
@@ -363,6 +440,7 @@ compliance suite, `CONSOLIDATE` whole-program recompilation, `wafer build`
 AOT export (WASM / native / JS loader), browser REPL, SHA-1/256/512 words,
 and cross-engine benchmark lanes against gforth and SwiftForth.
 
+[0.2.9]: https://github.com/ok2/wafer/compare/v0.2.8...v0.2.9
 [0.2.8]: https://github.com/ok2/wafer/compare/v0.2.7...v0.2.8
 [0.2.7]: https://github.com/ok2/wafer/compare/v0.2.6...v0.2.7
 [0.2.1]: https://github.com/ok2/wafer/compare/v0.2.0...v0.2.1

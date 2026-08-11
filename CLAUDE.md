@@ -2,7 +2,7 @@
 
 ## What is WAFER?
 
-WAFER (WebAssembly Forth Engine in Rust) is an optimizing Forth 2012 compiler targeting WebAssembly. Currently a working Forth system with 200+ words, JIT compilation, 12 word sets at 100% compliance, and a full optimization pipeline (peephole, constant folding, inlining, strength reduction, DCE, tail calls, per-region stack-to-local promotion with DO/BEGIN loop and IF support, self-recursive direct calls, a typed calling convention for words with a known stack effect, self-guard expansion for recursive words, consolidation). Beats gforth on every benchmark, and SwiftForth `sf64` on four of five (measured native-vs-native on x86-64; the macOS sf64 build is x86-64 under Rosetta and flatters WAFER). Includes a browser-based REPL via wasm-pack.
+WAFER (WebAssembly Forth Engine in Rust) is an optimizing Forth 2012 compiler targeting WebAssembly. Currently a working Forth system with 200+ words, JIT compilation, 12 word sets at 100% compliance, and a full optimization pipeline (peephole, constant folding, inlining, strength reduction, DCE, tail calls, per-region stack-to-local promotion with DO/BEGIN loop and IF support, self-recursive direct calls, a typed calling convention for words with a known stack effect, self-guard expansion for recursive words, consolidation). Beats gforth on every benchmark, and SwiftForth `sf64` on five of six (measured native-vs-native on x86-64; the macOS sf64 build is x86-64 under Rosetta and flatters WAFER). Includes a browser-based REPL via wasm-pack.
 
 ## Architecture
 
@@ -79,7 +79,7 @@ Handle in `interpret_token_immediate()` or `compile_token()` as a special case.
 
 ## Testing
 
-- Run `cargo test --workspace` before committing (currently 608 unit + 1 benchmark + 12 compliance + 9 comparison + 5 crypto)
+- Run `cargo test --workspace` before committing (currently 611 unit + 1 benchmark + 12 compliance + 9 comparison + 5 crypto)
 - Forth 2012 compliance: `cargo test -p wafer-core --test compliance`
 - Cross-engine comparison (vs gforth): `cargo test -p wafer-core --test comparison`
 - Performance benchmarks (release mode): `cargo test -p wafer-core --test comparison -- --nocapture --ignored`

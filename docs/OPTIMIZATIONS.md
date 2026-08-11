@@ -308,6 +308,28 @@ After interactive development, `CONSOLIDATE` recompiles all defined words into a
 | JIT (current) | Interactive development | Per-word modules, `call_indirect`, fast redefine |
 | Consolidated  | After `CONSOLIDATE`     | Single module, direct `call`, no redefine        |
 
+### Why the CONSOL column can lose to the JIT column
+
+`NestedLoops` runs 1.1x slower after `CONSOLIDATE` on the M1 and 1.7x slower on a Skylake Xeon,
+with **byte-identical WASM** for the hot word in both modes (verified via `WAFER_DUMP_WASM` +
+`wasm-tools print`) and instruction-identical machine code modulo register names (verified via
+`Engine::precompile_module` + objdump). The whole delta is code placement:
+
+- A tight loop pays for straddling an instruction-fetch window: ~9% for a 16-byte window on the
+  M1, up to ~65% on Skylake when the fused `cmp+jcc` crosses a 32-byte boundary and the loop
+  falls out of the uop cache every iteration (the JCC erratum, post-microcode).
+- Cranelift never aligns loop headers (`align_basic_block` is an identity default, no ISA
+  overrides it), so where a loop lands is whatever the code before it leaves behind.
+- The per-word JIT module keeps a dead dsp load in its prologue (the store-back is DCE'd, the
+  load survives), which happens to shift its loops onto luckier offsets than the consolidated
+  module's cleaner function bodies. A padding experiment that moves the same loop across offsets
+  reproduces the full penalty range on both hosts, including placements where the consolidated
+  code **beats** the JIT code.
+
+So the column difference on loop-only benchmarks is an alignment lottery, not an emitter defect;
+divider-bound benchmarks (`GCD`) mask it entirely. Fixing it for real means loop-header alignment
+upstream in Cranelift.
+
 ## 9. Compound IR Operations
 
 **Status: Done.** `TwoDup` and `TwoDrop` IrOp variants with optimized codegen. Peephole converts `Over, Over -> TwoDup` and `Drop, Drop -> TwoDrop`.
@@ -469,7 +491,7 @@ The float stack lives in its own memory region (0x2540--0x2D40). Float operation
 
 ## 16. Typed Calling Convention
 
-**Status: Done.** A word whose stack effect is statically known compiles to two entry points: a fast one with signature `(i32 x p) -> (i32 x q)`, carrying its stack items as WASM values, and the usual `( -- )` wrapper that moves those items on and off the memory data stack. The wrapper keeps the function-table slot, so `EXECUTE`, the outer interpreter, host words and `CATCH` see exactly the ABI they saw before; only direct calls inside a module take the fast entry. `WAFER_TYPED_CALLS=0` falls back.
+**Status: Done.** A word that calls itself and whose stack effect is statically known compiles to two entry points: a fast one with signature `(i32 x p) -> (i32 x q)`, carrying its stack items as WASM values, and the usual `( -- )` wrapper that moves those items on and off the memory data stack. The wrapper keeps the function-table slot, so `EXECUTE`, the outer interpreter, host words and `CATCH` see exactly the ABI they saw before; only direct calls inside a module take the fast entry. `WAFER_TYPED_CALLS=0` falls back. The self-recursion condition matters: the table slot holds the wrapper, so in the JIT path nothing but `RECURSE` can reach the fast entry, and emitting it for any other word just puts a wrapper hop in front of every call through the table -- measured at +47% before that was fixed in 0.2.9.
 
 ### The Problem
 
@@ -517,43 +539,39 @@ Fibonacci(25): 356 to 237 microseconds on the arm64 development machine. In fib'
 
 All optimizations enabled, release mode, measured with UTIME:
 
-All three engines **native x86-64**, idle 16-vCPU Xeon Platinum 8124M @ 3.0 GHz,
-median of three runs:
-
-```
-Benchmark                   WAFER     gforth       sf64    WAFER/gf   WAFER/sf
-Fibonacci(25)                 411       3221        355       0.13x      1.16x
-Factorial(12)x100K            994       7141       3058       0.14x      0.33x
-GCD-bench(20K)               1591       3211       2423       0.50x      0.66x
-NestedLoops(50)x1K            889       6824       2342       0.13x      0.38x
-Collatz(2K)                   391       3981       1659       0.10x      0.24x
-```
-
-The same suite on the arm64 development machine (M1 Ultra), which is what the
-regression limits in `comparison.rs` are calibrated against:
+Development machine (M1 Ultra, arm64), median of three reports, every
+benchmark sized to about 10 ms:
 
 ```
 Benchmark                   WAFER     CONSOL     gforth       sf64    WAFER/gf   WAFER/sf
-Fibonacci(25)                 237        242       3340        287       0.07x      0.83x
-Factorial(12)x100K            480        479       6109       1594       0.08x      0.30x
-GCD-bench(20K)                549        541       1830        797       0.30x      0.68x
-NestedLoops(50)x1K            501        509       7092       1898       0.07x      0.26x
-Collatz(2K)                   196        190       3955        633       0.05x      0.30x
+Fibonacci(33)               11307      11407     157001      13053       0.07x      0.87x
+Factorial(12)x2M             9639       9599     123950      32091       0.08x      0.30x
+GCD-bench(400K)             11662      11580      38580      17001       0.30x      0.68x
+NestedLoops(50)x20K          8920       9852     140518      36828       0.06x      0.24x
+CrossCalls(3M)              10883       3769      87691       8240       0.04x      0.46x
+Collatz(2K)x50               8838       8715     189903      28657       0.05x      0.30x
 ```
 
-Times in microseconds. WAFER/gf < 1.0 means WAFER is faster. The two tables
-disagree because the only SwiftForth build for macOS is x86-64 under Rosetta 2
-while WAFER and gforth are native arm64 -- and the emulation penalty lands
-hardest on the call-heavy benchmark, so Fibonacci reads 0.83x on arm64 and 1.16x
-when neither engine is emulated. Believe the x86-64 table about the engines. One
-caveat holds for both: sf64 uses 64-bit cells to WAFER's 32-bit.
+Times in microseconds; ratios take the better of WAFER and CONSOL. The `sf64`
+column flatters WAFER: the only SwiftForth build for macOS is x86-64 under
+Rosetta 2 while WAFER and gforth are native arm64. Measured with all three
+native on x86-64, Fibonacci reads 1.23x rather than 0.87x -- the emulation
+penalty lands hardest on the call-heavy benchmark -- while the other five keep
+their ratios. One caveat holds on both: sf64 uses 64-bit cells to WAFER's
+32-bit. (The native table is being re-taken at these workload sizes.)
+
+`CrossCalls` is the only benchmark with a cross-word call left in its hot loop,
+so it is the only one that measures section 8 at all -- the other five have
+their callee inlined away or are self-recursive. Note that `CONSOLIDATE` makes
+NestedLoops and Collatz _slower_; see the open item below.
 
 ## Remaining Opportunities
 
-| Optimization                     | Status              | Potential Impact                                                                                                                                                                                                                                                    |
-| -------------------------------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Scoped exit for the inliner      | Not started         | The inliner still refuses any body containing an `EXIT`, because an inlined one would return from the caller. Compiling it as a branch to the end of a block would unlock inlining for every word with an early return, not just the guard shape section 17 handles |
-| BeginDoubleWhileRepeat promotion | Not started         | Rare pattern, low priority. Its promoted emitter exists but has no loop fixup and is unverified                                                                                                                                                                     |
-| LEAVE as IR primitive            | Not started         | Would enable fast-path for loops with LEAVE                                                                                                                                                                                                                         |
-| Float stack-to-local             | Not started         | Eliminate float stack memory traffic                                                                                                                                                                                                                                |
-| WASM tail calls proposal         | Waiting on wasmtime | Would eliminate stack growth for tail-recursive words                                                                                                                                                                                                               |
+| Optimization                      | Status              | Potential Impact                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| --------------------------------- | ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Explain CONSOLIDATE on pure loops | Open defect         | Isolated on an idle box: NestedLoops 540 -> 905 us (1.68x) and Collatz 310 -> 360 (1.16x) on x86-64, against 1.07x and 1.05x for the same probes on arm64 -- so the magnitude is strongly architecture-dependent, which points at code size or branch density rather than a gross codegen error. Not the promotion logic (same code path), not inlining (no call left), not the harness (CONSOLIDATE is outside the timed window). Next step is to diff the emitted wat for NESTED-BENCH between the two paths |
+| Scoped exit for the inliner       | Not started         | The inliner still refuses any body containing an `EXIT`, because an inlined one would return from the caller. Compiling it as a branch to the end of a block would unlock inlining for every word with an early return, not just the guard shape section 17 handles                                                                                                                                                                                                                                            |
+| BeginDoubleWhileRepeat promotion  | Not started         | Rare pattern, low priority. Its promoted emitter exists but has no loop fixup and is unverified                                                                                                                                                                                                                                                                                                                                                                                                                |
+| LEAVE as IR primitive             | Not started         | Would enable fast-path for loops with LEAVE                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| Float stack-to-local              | Not started         | Eliminate float stack memory traffic                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| WASM tail calls proposal          | Waiting on wasmtime | Would eliminate stack growth for tail-recursive words                                                                                                                                                                                                                                                                                                                                                                                                                                                          |

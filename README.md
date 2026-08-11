@@ -8,7 +8,7 @@ An optimizing Forth 2012 compiler targeting WebAssembly. WAFER JIT-compiles each
 
 - **200+ words** across 12 Forth 2012 word sets, all at **100% compliance**
 - **Optimizing compiler** with 6 IR passes + stack-to-local promotion (per region, so a hot loop keeps its registers even inside a word that does I/O; `DO` and `BEGIN` loops alike) + consolidation
-- **Faster than gforth** on every benchmark, and past SwiftForth `sf64` -- a native-code compiler -- on four of five
+- **Faster than gforth** on every benchmark, and past SwiftForth `sf64` -- a native-code compiler -- on five of six
 - **JIT compilation** — each `:` definition compiles to its own WASM module
 - **Self-recursive direct calls** — RECURSE compiles to native `call` instead of `call_indirect`
 - **Typed calling convention** — a word with a statically known stack effect passes its stack items as WASM values, so a call keeps them in registers instead of round-tripping through memory
@@ -80,54 +80,69 @@ git submodule update --init
 
 ## Performance
 
-WAFER beats gforth (the GNU Forth reference implementation) on every benchmark, and SwiftForth
-`sf64` -- which compiles to native code -- on four of the five.
+WAFER beats gforth (the GNU Forth reference implementation) on every benchmark by 3-20x, and
+SwiftForth `sf64` -- which compiles to native code -- on five of the six. Fibonacci is the one it
+loses: one call per node, no loop to promote, and `sf64` keeps its stack in registers across a call
+the way only a native code generator can.
 
-Measured with all three engines running **native x86-64**, on an idle 16-vCPU Xeon Platinum 8124M
-@ 3.0 GHz (median of three runs):
-
-```
-Benchmark                   WAFER     gforth       sf64    WAFER/gf   WAFER/sf
-Fibonacci(25)                 411       3221        355       0.13x      1.16x
-Factorial(12)x100K            994       7141       3058       0.14x      0.33x
-GCD-bench(20K)               1591       3211       2423       0.50x      0.66x
-NestedLoops(50)x1K            889       6824       2342       0.13x      0.38x
-Collatz(2K)                   391       3981       1659       0.10x      0.24x
-```
-
-Times in microseconds; WAFER is the better of the JIT and `CONSOLIDATE` runs. Below 1.0 means WAFER
-is faster. Fibonacci is the one WAFER loses: it is one call per node with no loop to promote, and
-`sf64` keeps its stack in registers across a call the way only a native code generator can.
-Fibonacci, GCD and Collatz held to within 2% across the three runs; Factorial and NestedLoops are
-softer, since `sf64` varied by half there, but they are wide wins either way.
-
-`just bench-compare` on the development machine (M1 Ultra, arm64) reports different numbers, and
-they flatter WAFER:
+Measured on the development machine (M1 Ultra, arm64), median of three reports:
 
 ```
 Benchmark                   WAFER     CONSOL     gforth       sf64    WAFER/gf   WAFER/sf
-Fibonacci(25)                 237        242       3340        287       0.07x      0.83x
-Factorial(12)x100K            480        479       6109       1594       0.08x      0.30x
-GCD-bench(20K)                549        541       1830        797       0.30x      0.68x
-NestedLoops(50)x1K            501        509       7092       1898       0.07x      0.26x
-Collatz(2K)                   196        190       3955        633       0.05x      0.30x
+Fibonacci(33)               11307      11407     157001      13053       0.07x      0.87x
+Factorial(12)x2M             9639       9599     123950      32091       0.08x      0.30x
+GCD-bench(400K)             11662      11580      38580      17001       0.30x      0.68x
+NestedLoops(50)x20K          8920       9852     140518      36828       0.06x      0.24x
+CrossCalls(3M)              10883       3769      87691       8240       0.04x      0.46x
+Collatz(2K)x50               8838       8715     189903      28657       0.05x      0.30x
 ```
 
-The only SwiftForth build for macOS is x86-64 under Rosetta 2, while WAFER and gforth are native
-arm64 -- so that `sf64` column is native against emulated. The gap is not small, and it lands
-exactly where it matters: Fibonacci reads 0.83x there and 1.16x when neither engine is emulated.
-Treat the arm64 table as what the regression limits in `comparison.rs` are calibrated against, and
-the x86-64 table as what to believe about the engines.
+Times in microseconds; the ratios use the better of `WAFER` and `CONSOL`. Below 1.0 means WAFER is
+faster.
 
-A caveat applies to both: `sf64` uses 64-bit cells to WAFER's 32-bit, so WAFER does less work per
-operation.
+**The `sf64` column here flatters WAFER, and by enough to change an answer.** The only SwiftForth
+build for macOS is x86-64 running under Rosetta 2, while WAFER and gforth are native arm64 -- so
+that column compares native code against emulated code, and the penalty falls hardest on the
+call-heavy benchmark. Measured with all three engines native on x86-64 (Xeon Platinum 8124M,
+Ubuntu 22.04; two reports agreed within 1%), Fibonacci reads **1.21x** where the table above says
+0.87x; the other five keep their wins. That native comparison is what the "five of six" above
+rests on:
+
+```
+Benchmark                   WAFER     CONSOL     gforth       sf64    WAFER/gf   WAFER/sf
+Fibonacci(33)               19512      19511     129784      16076       0.15x      1.21x
+Factorial(12)x2M            22532      16601     137168      57986       0.12x      0.29x
+GCD-bench(400K)             34216      34089      66595      51680       0.51x      0.66x
+NestedLoops(50)x20K         10729      17827     126687      40469       0.08x      0.27x
+CrossCalls(3M)              20457       7412      81303      29264       0.09x      0.25x
+Collatz(2K)x50              18686      17328     188592      80857       0.09x      0.21x
+```
+
+A second caveat holds on any host: `sf64` uses 64-bit cells to WAFER's 32-bit, so WAFER does less
+work per operation.
+
+`CrossCalls` is the only benchmark with a cross-word call left in its hot loop -- the other five
+have their callee inlined away or are self-recursive -- so it is the only one that measures what
+`CONSOLIDATE` does, and there it is worth 2.9x. `NestedLoops` goes the other way: `CONSOLIDATE`
+makes it 1.1x _slower_ on the M1 and 1.7x on x86-64 -- not worse code but worse luck. Both paths
+emit identical WASM for the hot word; the delta is where the machine code lands. A tight loop
+pays for straddling an instruction-fetch window (16 bytes on the M1, 32 on Skylake, where a fused
+branch crossing the boundary drops the loop out of the uop cache -- the JCC erratum), Cranelift
+does not align loop headers, and dead prologue bytes in the per-word JIT module happen to shift
+its loops into luckier spots. Details in
+[docs/OPTIMIZATIONS.md](docs/OPTIMIZATIONS.md#8-consolidation).
+
+Every benchmark is sized to run about 10 ms. Not for the usual reason -- the timing wrapper already
+excludes start-up and compilation -- but to keep a comfortable margin over timer resolution and
+first-iteration effects without pushing the report past a minute. gforth is 3-20x slower than
+WAFER, so it sets the wall clock.
 
 A word whose stack effect is statically known gets a **typed entry point**: its stack items travel in and out
 as WASM values instead of through the memory data stack, so cranelift keeps them in registers across a call
 the way a native Forth keeps TOS in one. The word also keeps a `( -- )` wrapper, which is what the function
 table, `EXECUTE` and the outer interpreter reach, so nothing about the memory ABI changes from the outside.
-Call-heavy code is what this pays for -- Fibonacci went from 4.3x slower than `sf64` to 1.2x. Set
-`WAFER_TYPED_CALLS=0` to fall back to the memory-stack convention.
+Only a caller inside the same module can use the fast entry -- `RECURSE` in the JIT path, every resolvable
+call after `CONSOLIDATE` -- so that is exactly when it is emitted. Set `WAFER_TYPED_CALLS=0` to fall back.
 
 Recursive words then get one more thing: their base-case guard is tested at the **call site**, so a
 leaf of the recursion costs a comparison instead of a call. `: FIB DUP 2 < IF EXIT THEN ... RECURSE`
@@ -136,22 +151,34 @@ on entry anyway. Half of fib's nodes are leaves, and that is worth 1.4x.
 
 ## Testing
 
+Everything below has a `just` target; the raw command is given where it is worth
+knowing what the target does.
+
 ```bash
-# All tests (~635 currently passing)
-cargo test --workspace
-
-# Forth 2012 compliance suite
-cargo test -p wafer-core --test compliance
-
-# Cross-engine comparison (WAFER vs gforth, requires gforth)
-cargo test -p wafer-core --test comparison -- --nocapture --ignored
-
-# Optimization benchmark report (WAFER-internal)
-cargo test -p wafer-core --test benchmark_report -- --nocapture --ignored
-
-# Lints
-cargo clippy --workspace
+just test            # all tests (~638 currently passing)
+just compliance      # Forth 2012 compliance suite
+just clippy          # lints
+just fmt             # formatting check (Rust + Markdown)
+just ci              # everything CI runs
 ```
+
+Benchmarks are separate, because they are `#[ignore]`d -- they take minutes, and
+a debug build would measure nothing useful:
+
+```bash
+just bench-compare       # WAFER vs gforth vs SwiftForth, the table in Performance
+just bench-opts          # WAFER against its own optimization settings
+just bench               # criterion micro-benchmarks
+just compare-correctness # same three engines, compared on output instead of time
+```
+
+`bench-compare` needs `gforth` and `sf64` on `PATH` -- a missing engine drops its
+column rather than failing. Each number in it is the best of three processes, and
+each process reports the mean of its three fastest of seven timed repetitions:
+benchmark noise is one-sided, so the fastest runs are the honest ones, and only a
+fresh process resamples core placement and code layout. Run it on an idle
+machine; a busy one produced 20-79% run-to-run spread where an idle one gives
+1-6%.
 
 ## Architecture
 
