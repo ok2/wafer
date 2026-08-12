@@ -901,7 +901,7 @@ fn best_of_processes(mut measure: impl FnMut() -> Option<u64>) -> Option<u64> {
 /// sf64 needs one statement per line (it truncates input at ~256 characters);
 /// the others do not care.
 fn repeat_timed(sep: &str) -> String {
-    vec!["TIMED-BENCH"; REPS].join(sep)
+    ["TIMED-BENCH"; REPS].join(sep)
 }
 
 /// Parse the microsecond values printed by `TIMED-BENCH` and reduce them to

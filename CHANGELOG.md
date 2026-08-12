@@ -5,6 +5,24 @@ All notable changes to WAFER are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Search-order conveniences from common practice** (none are Forth 2012;
+  all three exist in gforth and friends, and the semantics were checked
+  against gforth 0.7.3):
+  - `>ORDER ( wid -- )` pushes a wordlist on top of the search order --
+    the word the standard forgot when ANS replaced named vocabularies
+    with anonymous wid handles and left `ALSO` with nothing to name.
+  - `-ORDER ( wid -- )` removes a wordlist from the search order wherever
+    it sits (VFX/MPE extension, the inverse of `>ORDER`).
+  - `VOCABULARY <name>` creates a named wordlist; executing the name
+    replaces the top of the search order, the same semantics the standard
+    gives `FORTH`. `ORDER` and `WORDS ALL` now print vocabulary names
+    instead of `wid#N`, and `MARKER` rollback forgets them along with
+    the words.
+
 ## [0.2.9] - 2026-08-10
 
 ### Fixed

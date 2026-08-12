@@ -1004,6 +1004,21 @@ pub const WORD_DOCS: &[(&str, &str, &str)] = &[
         "New definitions go to the top wordlist.",
     ),
     ("ALSO", "( -- )", "Duplicate the top of the search order."),
+    (
+        ">ORDER",
+        "( wid -- )",
+        "Push wid on top of the search order (gforth extension).",
+    ),
+    (
+        "-ORDER",
+        "( wid -- )",
+        "Remove wid from the search order (VFX extension).",
+    ),
+    (
+        "VOCABULARY",
+        "( \"name\" -- )",
+        "Create a named wordlist; executing name replaces the top of the search order.",
+    ),
     ("ONLY", "( -- )", "Reset the search order to the minimum."),
     ("PREVIOUS", "( -- )", "Drop the top of the search order."),
     (

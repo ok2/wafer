@@ -270,6 +270,7 @@ pub(crate) const INTERPRETER_TOKENS: &[&str] = &[
     "GILD",
     "EMPTY",
     "SYNONYM",
+    "VOCABULARY",
     "CONSOLIDATE",
     // Parsing words
     "'",
@@ -348,6 +349,7 @@ struct MarkerState {
     // REPLACES table, ABORT" texts
     search_order: Vec<u32>,
     next_wid: u32,
+    wid_names: HashMap<u32, String>,
     current_wid: u32,
     substitutions: HashMap<String, Vec<u8>>,
     abort_messages_len: usize,
@@ -484,6 +486,8 @@ pub struct ForthVM<R: Runtime> {
     search_order: Arc<Mutex<Vec<u32>>>,
     /// Next wordlist ID to allocate (shared).
     next_wid: Arc<Mutex<u32>>,
+    /// Names of wordlists created by VOCABULARY, for ORDER/WORDS display.
+    wid_names: HashMap<u32, String>,
     /// xorshift64 PRNG state for RANDOM / RND-SEED.
     rng_state: Arc<Mutex<u64>>,
     /// Stacked compile state for nested definitions (quotations `[: ;]`).
@@ -712,6 +716,7 @@ impl<R: Runtime> ForthVM<R> {
             substitutions: Arc::new(Mutex::new(HashMap::new())),
             search_order: Arc::new(Mutex::new(vec![1])),
             next_wid: Arc::new(Mutex::new(2)),
+            wid_names: HashMap::new(),
             // SystemTime::now() PANICS on wasm32-unknown-unknown (no time
             // source), which turned VM construction into an `unreachable`
             // trap in the browser. Seed from the wall clock only where one
@@ -1236,21 +1241,14 @@ impl<R: Runtime> ForthVM<R> {
             "FVALUE" => return self.define_fvalue(),
             "CONSOLIDATE" => return self.consolidate(),
             "SYNONYM" => return self.define_synonym(),
+            "VOCABULARY" => return self.define_vocabulary(),
             "ORDER" => {
-                // wid 1 is FORTH-WORDLIST; other wids are anonymous.
-                let wid_name = |wid: u32| {
-                    if wid == 1 {
-                        "FORTH".to_string()
-                    } else {
-                        format!("wid#{wid}")
-                    }
-                };
-                let so = self.search_order.lock().unwrap();
-                let names: Vec<String> = so.iter().map(|&w| wid_name(w)).collect();
+                let order = self.search_order.lock().unwrap().clone();
+                let names: Vec<String> = order.iter().map(|&w| self.wid_name(w)).collect();
                 let output = format!(
                     "Search order: {}  Compilation: {}\n",
                     names.join(" "),
-                    wid_name(self.dictionary.current_wid())
+                    self.wid_name(self.dictionary.current_wid())
                 );
                 self.output.lock().unwrap().push_str(&output);
                 return Ok(());
@@ -3742,6 +3740,47 @@ impl<R: Runtime> ForthVM<R> {
         Ok(())
     }
 
+    /// VOCABULARY <name> -- create a named wordlist (fig-Forth heritage;
+    /// gforth/SwiftForth extension, not Forth 2012). Executing the created
+    /// word replaces the top of the search order with its wordlist, the
+    /// same semantics the standard gives the word FORTH. The name is
+    /// remembered so ORDER and WORDS ALL display it instead of wid#N.
+    fn define_vocabulary(&mut self) -> anyhow::Result<()> {
+        let name = self
+            .next_token()
+            .ok_or_else(|| anyhow::anyhow!("VOCABULARY: expected name"))?;
+
+        let set_context_id = self
+            .dictionary
+            .find("_SET_CONTEXT_")
+            .map(|(_, id, _)| id)
+            .ok_or_else(|| anyhow::anyhow!("_SET_CONTEXT_ not found"))?;
+
+        let wid = {
+            let mut nw = self.next_wid.lock().unwrap();
+            let wid = *nw;
+            *nw += 1;
+            wid
+        };
+        self.wid_names.insert(wid, name.to_uppercase());
+
+        let word_id = self
+            .dictionary
+            .create(&name, false)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let ir_body = vec![IrOp::PushI32(wid as i32), IrOp::Call(set_context_id)];
+        self.ir_bodies.insert(word_id, ir_body.clone());
+        self.word_sources
+            .insert(word_id, format!("VOCABULARY {name}"));
+        let config = self.codegen_config(word_id.0);
+        let compiled = compile_word(&name, &ir_body, &config)
+            .map_err(|e| anyhow::anyhow!("codegen error for VOCABULARY: {e}"))?;
+        self.instantiate_and_install(&compiled, word_id)?;
+        self.dictionary.reveal();
+        self.next_table_index = self.next_table_index.max(word_id.0 + 1);
+        Ok(())
+    }
+
     /// IMMEDIATE -- toggle the immediate flag on the most recently defined word.
     /// Called via `pending_define` when IMMEDIATE is executed from compiled code.
     fn set_immediate(&mut self) -> anyhow::Result<()> {
@@ -3811,6 +3850,7 @@ impl<R: Runtime> ForthVM<R> {
             fvalue_words: self.fvalue_words.clone(),
             search_order: self.search_order.lock().unwrap().clone(),
             next_wid: *self.next_wid.lock().unwrap(),
+            wid_names: self.wid_names.clone(),
             current_wid: self.dictionary.current_wid(),
             substitutions: self.substitutions.lock().unwrap().clone(),
             abort_messages_len: self.abort_messages.lock().unwrap().len(),
@@ -3834,6 +3874,7 @@ impl<R: Runtime> ForthVM<R> {
         self.fvalue_words = state.fvalue_words;
         *self.search_order.lock().unwrap() = state.search_order;
         *self.next_wid.lock().unwrap() = state.next_wid;
+        self.wid_names = state.wid_names;
         *self.substitutions.lock().unwrap() = state.substitutions;
         self.abort_messages
             .lock()
@@ -6522,6 +6563,17 @@ impl<R: Runtime> ForthVM<R> {
 
     /// `WORDS ALL` -- grouped full view: one section per wordlist (search
     /// order first, then any other populated wids), then internal words.
+    /// Display name for a wordlist: FORTH, a VOCABULARY name, or wid#N.
+    fn wid_name(&self, wid: u32) -> String {
+        if wid == 1 {
+            return "FORTH".to_string();
+        }
+        self.wid_names
+            .get(&wid)
+            .cloned()
+            .unwrap_or_else(|| format!("wid#{wid}"))
+    }
+
     fn do_words_all(&mut self) {
         let entries = self.dictionary.visible_entries();
         let mut wids: Vec<u32> = self.search_order.lock().unwrap().clone();
@@ -6530,15 +6582,9 @@ impl<R: Runtime> ForthVM<R> {
                 wids.push(*wid);
             }
         }
-        let wid_name = |wid: u32| {
-            if wid == 1 {
-                "FORTH".to_string()
-            } else {
-                format!("wid#{wid}")
-            }
-        };
+        let wid_names: Vec<String> = wids.iter().map(|&w| self.wid_name(w)).collect();
         let mut out = self.output.lock().unwrap();
-        for wid in wids {
+        for (wid, wid_name) in wids.iter().copied().zip(wid_names) {
             let names: Vec<&str> = entries
                 .iter()
                 .filter(|(_, w, internal)| *w == wid && !internal)
@@ -6547,7 +6593,7 @@ impl<R: Runtime> ForthVM<R> {
             if names.is_empty() {
                 continue;
             }
-            out.push_str(&format!("-- {} ({} words)\n", wid_name(wid), names.len()));
+            out.push_str(&format!("-- {} ({} words)\n", wid_name, names.len()));
             push_wrapped(&mut out, &names);
         }
         let internals: Vec<&str> = entries
@@ -6851,6 +6897,56 @@ impl<R: Runtime> ForthVM<R> {
                 Ok(())
             });
             self.register_host_primitive("ALSO", false, func)?;
+        }
+
+        // >ORDER ( wid -- ) — push wid on top of the search order.
+        // Not in Forth 2012; a widely used gforth extension.
+        {
+            let so = Arc::clone(&self.search_order);
+            let func: HostFn = Box::new(move |ctx: &mut dyn HostAccess| {
+                let sp = host_need(ctx, 1)?;
+                let wid = ctx.mem_read_i32(sp) as u32;
+                so.lock().unwrap().insert(0, wid);
+                ctx.set_dsp(sp + CELL_SIZE);
+                Ok(())
+            });
+            self.register_host_primitive(">ORDER", false, func)?;
+        }
+
+        // -ORDER ( wid -- ) — remove wid from the search order wherever it
+        // sits (no-op if absent). VFX/MPE extension, the inverse of >ORDER.
+        {
+            let so = Arc::clone(&self.search_order);
+            let func: HostFn = Box::new(move |ctx: &mut dyn HostAccess| {
+                let sp = host_need(ctx, 1)?;
+                let wid = ctx.mem_read_i32(sp) as u32;
+                so.lock().unwrap().retain(|&w| w != wid);
+                ctx.set_dsp(sp + CELL_SIZE);
+                Ok(())
+            });
+            self.register_host_primitive("-ORDER", false, func)?;
+        }
+
+        // _SET_CONTEXT_ ( wid -- ) — replace the top of the search order.
+        // Internal carrier for words created by VOCABULARY (same pattern as
+        // _MARKER_RESTORE_): a vocabulary word compiles to
+        // `PushI32(wid) Call(_SET_CONTEXT_)`.
+        {
+            let so = Arc::clone(&self.search_order);
+            let func: HostFn = Box::new(move |ctx: &mut dyn HostAccess| {
+                let sp = host_need(ctx, 1)?;
+                let wid = ctx.mem_read_i32(sp) as u32;
+                let mut order = so.lock().unwrap();
+                if order.is_empty() {
+                    order.push(wid);
+                } else {
+                    order[0] = wid;
+                }
+                drop(order);
+                ctx.set_dsp(sp + CELL_SIZE);
+                Ok(())
+            });
+            self.register_host_primitive("_SET_CONTEXT_", false, func)?;
         }
 
         // PREVIOUS ( -- ) remove top of search order
@@ -10725,6 +10821,45 @@ mod tests {
         let output = eval_output("ORDER");
         assert!(output.contains("FORTH"));
         assert!(!output.contains('['));
+    }
+
+    #[test]
+    fn test_to_order_pushes_on_top() {
+        let output = eval_output("WORDLIST >ORDER ORDER");
+        assert!(output.contains("Search order: wid#2 FORTH"), "{output}");
+    }
+
+    #[test]
+    fn test_minus_order_removes_wid() {
+        let output = eval_output("WORDLIST DUP >ORDER -ORDER ORDER");
+        assert!(output.contains("Search order: FORTH "), "{output}");
+        assert!(!output.contains("wid#"), "{output}");
+    }
+
+    #[test]
+    fn test_vocabulary_replaces_top_and_names_order() {
+        // Vocabulary execution has FORTH-word semantics: replace the top
+        // of the search order. ALSO first, so FORTH stays underneath.
+        let output = eval_output("VOCABULARY EDITOR ALSO EDITOR ORDER");
+        assert!(output.contains("Search order: EDITOR FORTH"), "{output}");
+    }
+
+    #[test]
+    fn test_vocabulary_definitions_land_in_it_and_words_groups_by_name() {
+        let output = eval_output("VOCABULARY EDITOR ALSO EDITOR DEFINITIONS : E1 1 ; WORDS ALL");
+        assert!(output.contains("-- EDITOR (1 words)"), "{output}");
+        // and the word is findable through the search order
+        let output = eval_output("VOCABULARY EDITOR ALSO EDITOR DEFINITIONS : E1 42 ; E1 .");
+        assert!(output.contains("42"), "{output}");
+    }
+
+    #[test]
+    fn test_marker_rolls_back_vocabulary_name() {
+        // After rollback the vocabulary is gone; a freshly allocated wid
+        // with the same number must not inherit its stale name.
+        let output = eval_output("MARKER M VOCABULARY V0 M WORDLIST >ORDER ORDER");
+        assert!(!output.contains("V0"), "{output}");
+        assert!(output.contains("wid#2"), "{output}");
     }
 
     // ===================================================================

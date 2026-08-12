@@ -955,7 +955,7 @@ mod tests {
         ];
         let out = expand_self_guard(body, SELF);
         let IrOp::If { then_body, .. } = &out[7] else {
-            panic!("expected the expanded guard at index 7, got {:?}", out);
+            panic!("expected the expanded guard at index 7, got {out:?}");
         };
         assert_eq!(then_body, &vec![IrOp::Drop, IrOp::PushI32(0)]);
     }
