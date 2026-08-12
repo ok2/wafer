@@ -9,7 +9,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-wafer-core = { path = "../core", version = "0.2.9" }
+wafer-core = { path = "../core", version = "0.3.0" }
 wasmtime = { workspace = true }
 anyhow = { workspace = true }
 clap = { version = "4", features = ["derive"] }
